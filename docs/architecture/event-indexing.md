@@ -122,3 +122,14 @@ approach above, with a Postgres store rather than Supabase, and adds:
 
 Supabase profile updates and webhooks, described above, can consume the
 indexer's API or tables. See the [deployment guide](../indexer.md).
+
+## Generated sequence diagrams
+
+Key flows (attest, enroll-with-credential, claim, revoke-attestation, upgrade) are
+rendered in [sequence-diagrams.md](sequence-diagrams.md) from the recorded call
+traces in `docs/architecture/traces/*.json`. A trace lists the actors and the
+ordered `call` / `auth` / `event` steps observed in an integration run.
+
+- Regenerate: `python3 scripts/gen_sequence_diagrams.py`
+- Freshness check (CI, `Docs`): `python3 scripts/gen_sequence_diagrams.py --check`
+- Add a flow: drop a new `<flow>.json` next to the others and regenerate.

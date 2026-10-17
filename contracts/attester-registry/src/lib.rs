@@ -3,6 +3,7 @@
 #![no_std]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
     String, Symbol, Vec,
@@ -100,6 +101,29 @@ enum DataKey {
     RegionalRegistrarCount(Address),
     /// Registrar responsible for an attester's regional enrollment.
     RegionalAttester(Address),
+    /// Whether a licensing-authority issuer (ed25519 public key) is trusted.
+    /// `true` = active, `false` = revoked.
+    CredentialIssuer(BytesN<32>),
+    /// Issuer that vouched for an attester enrolled with a credential.
+    AttesterIssuer(Address),
+}
+
+/// Signed licence credential envelope. The issuer signs the XDR encoding of
+/// this struct. Personal licensing data stays off chain: only the SHA-256
+/// digest of the envelope and the issuer id are stored.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LicenseCredential {
+    /// Issuer id: the licensing body's ed25519 public key.
+    pub issuer: BytesN<32>,
+    /// The attester address the licence was issued to.
+    pub subject: Address,
+    /// Licence class, for example `chw`, `nurse` or `physician`.
+    pub license_class: Symbol,
+    /// Ledger timestamp from which the credential is valid, inclusive.
+    pub valid_from: u64,
+    /// Ledger timestamp at which the credential expires, exclusive.
+    pub valid_until: u64,
 }
 
 /// Operational capabilities managed by the owner.
@@ -277,6 +301,10 @@ pub enum Error {
     RegionalAttestersRemain = 15,
     /// The region is not a valid ISO 3166-2 style code such as `NG-LA`.
     InvalidRegion = 16,
+    /// The credential issuer is not in the issuer registry, or was revoked.
+    UnknownIssuer = 17,
+    /// The credential is expired, not yet valid, or issued to another subject.
+    InvalidCredential = 18,
 }
 
 /// Emitted when admin ownership finishes transferring to a new address.
@@ -1299,9 +1327,106 @@ impl AttesterRegistry {
         Ok(())
     }
 
+    /// Trust a licensing-authority issuer key. Only the owner may call this.
+    /// Re-adding a revoked issuer restores trust in it.
+    pub fn add_credential_issuer(env: Env, issuer: BytesN<32>) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialIssuer(issuer), &true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    /// Revoke an issuer. Cascade policy: every attester enrolled through this
+    /// issuer stops passing `is_attester` immediately (their record is kept);
+    /// restoring the issuer, or re-enrolling via another issuer, reverses it.
+    pub fn revoke_credential_issuer(env: Env, issuer: BytesN<32>) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::CredentialIssuer(issuer.clone()))
+        {
+            return Err(Error::UnknownIssuer);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CredentialIssuer(issuer), &false);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    /// Whether `issuer` is a currently trusted credential issuer.
+    pub fn is_credential_issuer(env: Env, issuer: BytesN<32>) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::CredentialIssuer(issuer))
+            .unwrap_or(false)
+    }
+
+    /// The issuer that vouched for `attester`, if enrolled with a credential.
+    pub fn get_attester_issuer(env: Env, attester: Address) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AttesterIssuer(attester))
+    }
+
+    /// Enroll `attester` after verifying a licensing authority's signature
+    /// over `credential`. Traps if the ed25519 signature is invalid. Stores
+    /// the envelope's SHA-256 digest as the licence hash and the issuer id;
+    /// the credential's validity window becomes the attester's.
+    pub fn enroll_with_credential(
+        env: Env,
+        registrar: Address,
+        attester: Address,
+        credential: LicenseCredential,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        if !Self::is_credential_issuer(env.clone(), credential.issuer.clone()) {
+            return Err(Error::UnknownIssuer);
+        }
+        let now = env.ledger().timestamp();
+        if credential.subject != attester
+            || now < credential.valid_from
+            || now >= credential.valid_until
+        {
+            return Err(Error::InvalidCredential);
+        }
+        let message = credential.clone().to_xdr(&env);
+        env.crypto()
+            .ed25519_verify(&credential.issuer, &message, &signature);
+        let digest = env.crypto().sha256(&message).to_bytes();
+        Self::add_attester_with_info(
+            env.clone(),
+            registrar,
+            attester.clone(),
+            Some(digest),
+            None,
+            Some(credential.valid_from),
+            Some(credential.valid_until),
+        )?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::AttesterIssuer(attester), &credential.issuer);
+        Ok(())
+    }
+
     /// Whether `attester` is allowlisted, not suspended, and within its validity
     /// window. Callable by anyone, including other contracts.
     pub fn is_attester(env: Env, attester: Address) -> bool {
+        let issuer_revoked = env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&DataKey::AttesterIssuer(attester.clone()))
+            .is_some_and(|issuer| !Self::is_credential_issuer(env.clone(), issuer));
+        if issuer_revoked {
+            return false;
+        }
         let active = env
             .storage()
             .persistent()

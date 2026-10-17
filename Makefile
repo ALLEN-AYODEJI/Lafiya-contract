@@ -1,4 +1,4 @@
-.PHONY: build test fmt fmt-check clippy wasm wasm-contracts check clean config-check config-list deploy bench conformance conformance-update audit-env
+.PHONY: build test fmt fmt-check clippy wasm wasm-contracts check clean config-check config-list deploy bench conformance conformance-update audit-env first-run
 
 # Compatibility shim: these targets delegate to `cargo xtask` (CONTRIBUTING.md)
 # and will be removed after the next release.
@@ -41,6 +41,9 @@ wasm-reproducible:
 
 test-integration: wasm-contracts
 	./tests/integration/run.sh
+
+first-run:
+	./scripts/first-run.sh
 
 check: fmt-check clippy test wasm-contracts
 

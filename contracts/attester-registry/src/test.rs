@@ -1149,3 +1149,108 @@ fn get_interface_works_before_initialize() {
     let (_, client, _) = setup();
     assert_eq!(client.get_interface().interface_version, INTERFACE_VERSION);
 }
+
+mod credential {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use soroban_sdk::xdr::ToXdr;
+    use soroban_sdk::{testutils::Ledger as _, BytesN, Symbol};
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn cred(env: &Env, subject: &Address, until: u64) -> LicenseCredential {
+        LicenseCredential {
+            issuer: BytesN::from_array(env, &key().verifying_key().to_bytes()),
+            subject: subject.clone(),
+            license_class: Symbol::new(env, "nurse"),
+            valid_from: 0,
+            valid_until: until,
+        }
+    }
+
+    fn sign(env: &Env, c: &LicenseCredential) -> BytesN<64> {
+        let xdr = c.clone().to_xdr(env);
+        let mut msg = std::vec![0u8; xdr.len() as usize];
+        xdr.copy_into_slice(&mut msg);
+        BytesN::from_array(env, &key().sign(&msg).to_bytes())
+    }
+
+    fn ready() -> (Env, AttesterRegistryClient<'static>, Address) {
+        let (env, client, admin) = setup();
+        initialize_for_tests(&client, &admin);
+        env.ledger().set_timestamp(100);
+        let c = cred(&env, &admin, 1000);
+        client.add_credential_issuer(&c.issuer);
+        (env, client, admin)
+    }
+
+    #[test]
+    fn valid_credential_enrolls_with_digest_and_issuer() {
+        let (env, client, admin) = ready();
+        let who = Address::generate(&env);
+        let c = cred(&env, &who, 1000);
+        client.enroll_with_credential(&admin, &who, &c, &sign(&env, &c));
+        assert!(client.is_attester(&who));
+        assert_eq!(client.get_attester_issuer(&who), Some(c.issuer.clone()));
+        let digest = env.crypto().sha256(&c.to_xdr(&env)).to_bytes();
+        assert_eq!(
+            client.get_attester_info(&who).unwrap().license_hash,
+            Some(digest)
+        );
+    }
+
+    #[test]
+    fn expired_credential_rejected() {
+        let (env, client, admin) = ready();
+        let who = Address::generate(&env);
+        let c = cred(&env, &who, 100);
+        let r = client.try_enroll_with_credential(&admin, &who, &c, &sign(&env, &c));
+        assert_eq!(r, Err(Ok(Error::InvalidCredential)));
+    }
+
+    #[test]
+    fn wrong_subject_rejected() {
+        let (env, client, admin) = ready();
+        let (who, other) = (Address::generate(&env), Address::generate(&env));
+        let c = cred(&env, &other, 1000);
+        let r = client.try_enroll_with_credential(&admin, &who, &c, &sign(&env, &c));
+        assert_eq!(r, Err(Ok(Error::InvalidCredential)));
+    }
+
+    #[test]
+    fn bad_signature_traps() {
+        let (env, client, admin) = ready();
+        let who = Address::generate(&env);
+        let c = cred(&env, &who, 1000);
+        let bad = BytesN::from_array(&env, &[0u8; 64]);
+        assert!(client
+            .try_enroll_with_credential(&admin, &who, &c, &bad)
+            .is_err());
+    }
+
+    #[test]
+    fn unknown_issuer_rejected() {
+        let (env, client, admin) = setup();
+        initialize_for_tests(&client, &admin);
+        let who = Address::generate(&env);
+        let c = cred(&env, &who, 1000);
+        let r = client.try_enroll_with_credential(&admin, &who, &c, &sign(&env, &c));
+        assert_eq!(r, Err(Ok(Error::UnknownIssuer)));
+    }
+
+    #[test]
+    fn revoked_issuer_cascades_to_attesters() {
+        let (env, client, admin) = ready();
+        let who = Address::generate(&env);
+        let c = cred(&env, &who, 1000);
+        client.enroll_with_credential(&admin, &who, &c, &sign(&env, &c));
+        client.revoke_credential_issuer(&c.issuer);
+        assert!(!client.is_attester(&who));
+        let again = client.try_enroll_with_credential(&admin, &who, &c, &sign(&env, &c));
+        assert_eq!(again, Err(Ok(Error::UnknownIssuer)));
+        client.add_credential_issuer(&c.issuer);
+        assert!(client.is_attester(&who));
+    }
+}

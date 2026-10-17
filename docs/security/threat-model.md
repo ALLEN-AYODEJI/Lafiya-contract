@@ -110,6 +110,9 @@ Everything else relies on off-chain controls.
 | D | Instance or entry TTL expiry makes `is_attester` fail | mitigated (by TTL extension on writes, [`contract-upgrade.md`](../runbooks/contract-upgrade.md)) |
 | D | Batch operations exceed per-transaction limits | open ([#321](https://github.com/Lafiya-xyz/Lafiya-contract/issues/321)) |
 | E | Malicious `upgrade()` replaces the code | accepted (ADR-0003/0007: admin is fully trusted); open ([#368](https://github.com/Lafiya-xyz/Lafiya-contract/issues/368), [#369](https://github.com/Lafiya-xyz/Lafiya-contract/issues/369)) |
+| S | Forged licence credential enrols an attester | mitigated (`enroll_with_credential` verifies the issuer's ed25519 signature over the credential XDR, subject, and validity window; issuer must be in the admin-managed issuer registry) |
+| E | Issuer key compromise lets an attacker enrol arbitrary attesters | mitigated by `revoke_credential_issuer`: every attester enrolled through that issuer immediately fails `is_attester` (cascade), and re-enrolment through the issuer is refused; the admin then re-enrols legitimate attesters via another issuer or `add_attester_with_info`. Residual: attesters enrolled before the compromise is noticed were trusted in the interim. |
+| I | Credential envelope leaks licensing data | mitigated (only the SHA-256 digest and issuer id are stored; the envelope is supplied per call and never persisted) |
 
 ### `attestation-registry`
 

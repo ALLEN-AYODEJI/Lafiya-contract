@@ -27,6 +27,8 @@ For programmatic decoding, use the generated [`catalog/errors.json`](../catalog/
 | `14` | `RegionalQuotaExceeded` | The registrar's concurrent enrollment quota has been reached. |
 | `15` | `RegionalAttestersRemain` | The registrar's region cannot change while its attesters remain enrolled. |
 | `16` | `InvalidRegion` | The region is not a valid ISO 3166-2 style code such as `NG-LA`. |
+| `17` | `UnknownIssuer` | The credential issuer is not in the issuer registry, or was revoked. |
+| `18` | `InvalidCredential` | The credential is expired, not yet valid, or issued to another subject. |
 
 ## `attestation-registry`
 
