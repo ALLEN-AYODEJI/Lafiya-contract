@@ -1817,6 +1817,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lafiya-verification-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lafiya-watchdog"
 version = "0.1.0"
 dependencies = [

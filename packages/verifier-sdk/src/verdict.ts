@@ -20,7 +20,10 @@ export const VERDICTS = [
 
 export type Verdict = (typeof VERDICTS)[number];
 
-/** One-line meaning of each verdict, suitable for a UI. */
+/**
+ * One-line technical meaning of each verdict. For responder-facing,
+ * localized, plain-language text use `localizeVerdict` (./i18n.ts).
+ */
 export const VERDICT_DESCRIPTIONS: Record<Verdict, string> = {
   invalid_payload: "The QR code is not a valid Lafiya card payload.",
   untrusted_contract:

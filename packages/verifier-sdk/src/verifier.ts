@@ -1,5 +1,6 @@
 import type { AttesterState, ChainReader, OnChainAttestation } from "./chain.js";
 import { commitV1, type FieldValue } from "./commitment.js";
+import { classifyError, type TransportError } from "./errors.js";
 import { parseQrPayload, QrPayloadError, type QrPayload } from "./qr.js";
 import { BindingsChainReader } from "./rpc.js";
 import type { TrustAnchors } from "./trust.js";
@@ -24,6 +25,10 @@ export interface VerifyOptions {
   disclosedFields?: readonly FieldValue[];
   /** Reject attestations older than this many days. */
   maxAgeDays?: number;
+  /** Cancels outstanding chain reads; the result is then `unavailable`. */
+  signal?: AbortSignal;
+  /** Per-read deadline in milliseconds (overrides the reader's default). */
+  timeoutMs?: number;
 }
 
 export interface VerificationResult {
@@ -35,6 +40,8 @@ export interface VerificationResult {
   attester?: { address: string; status: "active" | "suspended" | "removed"; region?: string };
   checkedAt: Date;
   source: "rpc" | "offline";
+  /** The classified failure behind an `unavailable` verdict. */
+  transportError?: TransportError;
 }
 
 const DAY_SECONDS = 86_400n;
@@ -111,19 +118,24 @@ export class LafiyaVerifier {
     let latest: OnChainAttestation | null;
     let revoked = false;
     let attesterState: AttesterState | null = null;
+    const call = { signal: opts.signal, timeoutMs: opts.timeoutMs };
     try {
       [latest, history] = await Promise.all([
-        this.chain.getAttestation(trust, payload.recordHash),
-        this.chain.getAttestationHistory(trust, payload.recordHash),
+        this.chain.getAttestation(trust, payload.recordHash, call),
+        this.chain.getAttestationHistory(trust, payload.recordHash, call),
       ]);
       if (!latest) {
-        revoked = (await this.chain.isRevoked?.(trust, payload.recordHash)) ?? false;
+        revoked = (await this.chain.isRevoked?.(trust, payload.recordHash, call)) ?? false;
       } else {
-        attesterState = await this.chain.getAttesterStatus(trust, latest.attester);
+        attesterState = await this.chain.getAttesterStatus(trust, latest.attester, call);
       }
     } catch (err) {
-      reasons.push({ code: "unavailable", message: `chain read failed: ${String(err)}` });
-      return done({ payload });
+      const transportError = classifyError(err);
+      reasons.push({
+        code: "unavailable",
+        message: `chain read failed (${transportError.kind}): ${transportError.message}`,
+      });
+      return done({ payload, transportError });
     }
 
     if (!latest) {

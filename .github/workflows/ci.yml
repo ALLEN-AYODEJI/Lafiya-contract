@@ -221,12 +221,97 @@ jobs:
       - name: Run the verification-model truth table
         run: python3 scripts/verification_model.py
 
+  # @lafiya/verifier: type-aware lint (no floating promises), unit tests
+  # (fake-timer timeout/abort paths, i18n fallback, model truth table), the
+  # i18n catalog lint, the size budget, and publint + attw on the packed
+  # tarball. Part of ci-success, so failures block merge.
+  verifier-sdk:
+    name: Verifier SDK checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/verifier-sdk
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: pnpm
+          cache-dependency-path: packages/verifier-sdk/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm size
+      - name: i18n catalog coverage (every verdict x locale, or a waiver)
+        run: pnpm lint:i18n
+      - name: publint + are-the-types-wrong (packed tarball)
+        run: pnpm check:package
+
+  # Installs the packed tarball into a scratch consumer and imports it from
+  # Node ESM, Node CJS, a bundler, and a worker runtime. The node versions
+  # are the minimums in packages/verifier-sdk/README.md.
+  verifier-sdk-smoke:
+    name: Verifier SDK packed smoke (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20.19.0", "22.12.0"]
+    defaults:
+      run:
+        working-directory: packages/verifier-sdk
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+          cache-dependency-path: packages/verifier-sdk/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm smoke
+
+  # Rust vs TypeScript vs Python reference over generated verification-model
+  # scenarios with a fixed seed set. Any discrepancy fails with a minimal
+  # reproducing scenario; verdict coverage goes to the job summary. The
+  # nightly random sweep is differential-nightly.yml.
+  differential:
+    name: Differential verification (Rust vs TS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: pnpm
+          cache-dependency-path: packages/verifier-sdk/pnpm-lock.yaml
+      - name: Build the TypeScript SDK
+        working-directory: packages/verifier-sdk
+        run: pnpm install --frozen-lockfile && pnpm build
+      - name: Build the Rust model
+        run: cargo build --locked -p lafiya-verification-model
+      - name: Diff verdicts (fixed seeds)
+        run: python3 scripts/differential_verification.py
+
   # Single required check for branch protection. Jobs skipped by the path
   # filter count as success; any failure or cancellation fails this job.
   ci-success:
     name: ci-success
     if: always()
-    needs: [shell-lint, changes, fmt, clippy, build-tests, test, test-report, build-wasm, docs-checks]
+    needs: [shell-lint, changes, fmt, clippy, build-tests, test, test-report, build-wasm, docs-checks, verifier-sdk, verifier-sdk-smoke, differential]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate results

@@ -1,2 +1,8 @@
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
+
+# The published manifest depends on the bindings by version; in this repo
+# they resolve to the committed sources instead.
+overrides:
+  "@lafiya/attestation-registry": "file:../../bindings/attestation-registry"
+  "@lafiya/attester-registry": "file:../../bindings/attester-registry"

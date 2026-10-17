@@ -48,11 +48,13 @@ known-first-party = [
     "check_readme_contracts",
     "check_snapshot",
     "contracts",
+    "differential_verification",
     "extract_interface",
     "gen_events_doc",
     "generate_release_manifest",
     "spec_types",
     "validate_release_manifest",
+    "verification_model",
 ]
 
 [tool.mypy]

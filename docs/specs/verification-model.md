@@ -89,9 +89,9 @@ implementation **MUST** run the whole table in CI and fail on any mismatch.
 | Implementation | Runs the table in CI |
 |---|---|
 | Reference (`scripts/verification_model.py`) | Yes (`ci.yml`, `docs-checks` job) |
-| TypeScript SDK | Pending |
+| TypeScript SDK (`packages/verifier-sdk/src/model.ts`) | Yes (`ci.yml`, `verifier-sdk` job: `test/model.test.ts`) |
 | `attestation-registry` `verify()` view | Pending (view not yet implemented) |
-| Rust verifier | Pending |
+| Rust (`crates/lafiya-verification-model`) | Yes (`cargo test`) |
 
 ## 6. Versioning
 
@@ -103,3 +103,46 @@ implementation **MUST** run the whole table in CI and fail on any mismatch.
 - **Patch:** wording and clarifications only.
 
 Implementations **SHOULD** report the model version they implement.
+
+## 7. Differential testing
+
+The truth table pins chosen cases; it cannot show that two implementations agree
+everywhere else. `scripts/differential_verification.py` runs the reference, the
+Rust crate (`lafiya-verification-model`, JSON lines on stdin/stdout), and the
+TypeScript SDK (`packages/verifier-sdk/scripts/model-eval.mjs`) over generated
+scenarios and compares verdict, `reason` (the precedence rule that matched), and
+qualifier:
+
+- **Generator.** Input domains come from this model: booleans take both values,
+  enum inputs take every value appearing in `default_input` or any case. Every
+  case, the whole input space (while it has at most 65,536 points), and 500
+  seeded random samples per seed are evaluated.
+- **On every PR** (`ci.yml`, `differential` job) with the fixed seeds `1..5`;
+  **nightly** (`differential-nightly.yml`) with a fresh random seed printed in
+  the log and job summary.
+- **Failure.** Any discrepancy fails the job and prints a minimal reproducing
+  scenario: the inputs are greedily reset to `default_input` while the
+  implementations still disagree, leaving only the overrides that matter, in
+  the shape of a `cases[].input` entry.
+- **Coverage.** The number of scenarios per verdict and per reason is printed
+  (and written to the GitHub job summary); a verdict that is never reached fails
+  the run.
+
+### Extending the model
+
+When adding an input, an enum value, or a verdict:
+
+1. Update `verification-model.json` (`default_input`, `verdicts`, and at least
+   one case exercising each new value, which is also what puts a new enum
+   value into the generator's domain) and bump `model_version` (section 6).
+2. Update `explain()` in `scripts/verification_model.py`, then mirror it in
+   `crates/lafiya-verification-model/src/lib.rs` (`Input`, `Verdict`,
+   `Reason`, `evaluate`) and `packages/verifier-sdk/src/model.ts`
+   (`ModelInput`, `MODEL_VERDICTS`, `ModelReason`, `evaluateModel`), and the
+   `MODEL_VERSION` constants. The Rust `Input` rejects unknown fields, so a
+   forgotten input fails loudly.
+3. Run `python3 scripts/verification_model.py`, `cargo test -p
+   lafiya-verification-model`, `pnpm test` in `packages/verifier-sdk`, then
+   `pnpm build` there and `python3 scripts/differential_verification.py`.
+4. If the input space grows past `--max-exhaustive`, the run falls back to
+   seeded sampling; raise `--samples` in CI so every verdict stays covered.

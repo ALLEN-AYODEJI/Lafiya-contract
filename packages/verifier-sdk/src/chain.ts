@@ -1,3 +1,4 @@
+import type { CallOptions } from "./transport.js";
 import type { NetworkTrust } from "./trust.js";
 
 /** An attestation as stored by attestation-registry. */
@@ -17,20 +18,36 @@ export interface AttesterState {
  * The reads verification needs. {@link BindingsChainReader} implements it
  * over Soroban RPC; {@link OfflineChainReader} over a signed-off snapshot;
  * tests use fakes.
+ *
+ * Every read takes optional {@link CallOptions} (`signal`, `timeoutMs`);
+ * implementations that do I/O must honour them and should reject with a
+ * `TransportError`.
  */
 export interface ChainReader {
   readonly source: "rpc" | "offline";
-  getAttestation(trust: NetworkTrust, recordHash: string): Promise<OnChainAttestation | null>;
+  getAttestation(
+    trust: NetworkTrust,
+    recordHash: string,
+    opts?: CallOptions,
+  ): Promise<OnChainAttestation | null>;
   /** Oldest first, as `get_attestation_history` returns it. */
-  getAttestationHistory(trust: NetworkTrust, recordHash: string): Promise<OnChainAttestation[]>;
+  getAttestationHistory(
+    trust: NetworkTrust,
+    recordHash: string,
+    opts?: CallOptions,
+  ): Promise<OnChainAttestation[]>;
   /** `null` when the attester is not (or no longer) on the allowlist. */
-  getAttesterStatus(trust: NetworkTrust, attester: string): Promise<AttesterState | null>;
+  getAttesterStatus(
+    trust: NetworkTrust,
+    attester: string,
+    opts?: CallOptions,
+  ): Promise<AttesterState | null>;
   /**
    * Whether `recordHash` was explicitly revoked. `revoke_attestation`
    * deletes storage, so on-chain reads alone cannot tell "revoked" from
    * "never attested"; a reader backed by events or an indexer can.
    */
-  isRevoked?(trust: NetworkTrust, recordHash: string): Promise<boolean>;
+  isRevoked?(trust: NetworkTrust, recordHash: string, opts?: CallOptions): Promise<boolean>;
 }
 
 /** A snapshot of the chain state for offline verification. */

@@ -34,6 +34,52 @@ const result = await verifier.verifyCard(qrPayload, { disclosedFields, maxAgeDay
 
 `verifyCard` never throws: RPC and parsing failures become verdicts.
 
+### Cancellation, timeouts, and retries
+
+Every chain read accepts an `AbortSignal` and a per-call deadline:
+
+```ts
+const controller = new AbortController();
+const result = await verifier.verifyCard(qrPayload, {
+  signal: controller.signal, // e.g. aborted when the user leaves the screen
+  timeoutMs: 5_000,          // per read attempt
+});
+if (result.verdict === "unavailable") console.log(result.transportError?.kind);
+```
+
+`BindingsChainReader` defaults to a 10 s per-attempt deadline and retries
+**reads** (all of its calls are idempotent simulations) at most twice, with
+full-jitter exponential backoff (`random() * min(maxDelayMs, baseDelayMs * 2^n)`,
+200 ms base, 2 s cap). Configure both with
+`new BindingsChainReader({ timeoutMs, retry: { retries, baseDelayMs, maxDelayMs } })`.
+An abort cancels the in-flight attempt and any pending backoff; it is never
+retried. `callWithPolicy` is exported for integrators' own calls: it only
+retries when `idempotent: true` is passed, so ambiguous writes (where the
+first attempt may have landed) are never retried.
+
+Custom `ChainReader` implementations receive the same `{ signal, timeoutMs }`
+as the last argument of each read and should honour it.
+
+### Transport error taxonomy
+
+Failed reads reject with a `TransportError` (exported, with
+`isTransportError(err, kind?)` and `classifyError(err)`); narrow on `kind`:
+
+| `kind` | Meaning | Retried (idempotent reads) |
+|---|---|---|
+| `network` | No usable answer: connection refused/reset, DNS, HTTP 5xx or 429. | Yes |
+| `timeout` | No answer within `timeoutMs`. | Yes |
+| `aborted` | The caller's `AbortSignal` fired. | No |
+| `protocol` | The server answered with something unusable: malformed response, simulation/contract error, HTTP 4xx. | No |
+| `not_found` | The RPC endpoint or contract does not exist (HTTP 404). A missing *attestation* is not an error; it is `null`. | No |
+| `untrusted` | Refused before sending because the transport is not trusted (plain HTTP without `allowHttp`). | No |
+
+`error.attempts` is the number of attempts made. In `verifyCard` any of these
+becomes the `unavailable` verdict, with the error on `result.transportError`.
+The SDK's lint (`pnpm lint`, `@typescript-eslint/no-floating-promises` and
+`no-misused-promises`) keeps failure paths free of unhandled rejections, and
+the fake-timer tests in `test/transport.test.ts` assert none occur.
+
 ### Trust anchors
 
 `loadTrustAnchors` accepts either explicit configuration
@@ -69,6 +115,62 @@ apply, the highest-precedence one wins. All reasons are still returned.
 
 Only `verified` should be shown to a user as a pass.
 
+## Localized responder strings
+
+Reason codes such as `attester_suspended` mean nothing to a nurse at 3 a.m.
+`localizeVerdict(verdict, locale)` (and `localizeReason(reason, locale)`;
+reason codes share the verdict keys) returns plain-language text for
+responders in English (`en`), Hausa (`ha`), Yoruba (`yo`), Igbo (`ig`), and
+Nigerian Pidgin (`pcm`):
+
+```ts
+const text = await localizeVerdict(result.verdict, "ha-NG");
+// { title, guidance, action, severity: "ok" | "caution" | "stop",
+//   locale, requested, fallback, provenance }
+```
+
+- **Lazy loading.** Each locale catalog is its own module under
+  `dist/*/locales/`, imported on first use, so the core bundle (and its size
+  budget) carries none of them.
+- **Deterministic fallback.** An unsupported locale, a missing entry, or (by
+  default) an entry without clinical review returns the English text with
+  `fallback: true`, so a UI can say so. Pass `{ requireReviewed: false }` only
+  for review tooling; never in production clinical screens.
+- **Provenance.** Every entry records `status` (`reviewed` /
+  `pending_review`), `author`, `reviewer`, and `date`.
+- **Coverage lint.** `pnpm lint:i18n` (CI) fails unless every verdict has an
+  entry in every locale or an explicit waiver in `i18n/waivers.json`
+  (`{ "<locale>": { "<verdict>": "<why>" } }`), flags stale waivers, checks
+  provenance, and rejects reason codes leaking into text.
+
+### Review process
+
+The Hausa, Yoruba, Igbo, and Pidgin catalogs ship as **drafts**
+(`pending_review`) and are therefore not shown by default. To approve an
+entry, a native speaker of the language with clinical experience (nurse,
+CHW supervisor, or physician):
+
+1. Checks the text against the English source *and* the verdict definition
+   above, for meaning, not word-for-word, and for the action it implies.
+2. Reads it aloud: it must be understood at first hearing.
+3. Commits the change in `src/locales/<locale>.ts` with the entry's
+   `provenance` set to `status: "reviewed"`, their name or handle as
+   `reviewer`, and the review date. The lint rejects `reviewed` without a
+   reviewer. Any later text change resets the entry to `pending_review`.
+
+### Accessibility
+
+- **Reading level.** Target CEFR A2 / US grade 5: short, common words, one
+  idea per sentence, and the next action stated as a command. The lint
+  enforces proxies on the English source (titles of at most 5 words,
+  sentences of at most 15 words, words of at most 12 letters); translations
+  follow the same rules in review.
+- **Icon independence.** The text carries the whole meaning: never rely on a
+  colour, icon, or sound alone. `severity` (`ok`, `caution`, `stop`) is there
+  for screen readers, haptics, and monochrome displays. Only `verified` is
+  `ok`. Always show `title` and `action` together.
+- **No codes.** Do not show `verdict` or reason codes to responders; log them.
+
 ## Example app
 
 `packages/verifier-sdk/example/index.html` is a minimal page that scans a QR
@@ -82,8 +184,15 @@ resolves the bindings from `/bindings/`), and open
 ```sh
 cd packages/verifier-sdk
 pnpm install
-pnpm typecheck && pnpm test && pnpm build && pnpm size
+pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm size
+pnpm lint:i18n       # catalog coverage, provenance, reading level (after build)
+pnpm check:package   # publint + are-the-types-wrong on the packed tarball
+pnpm smoke           # install the packed tarball; import from ESM, CJS, bundler, worker
 ```
+
+Supported runtimes and minimum versions are in the package
+[README](../packages/verifier-sdk/README.md#compatibility); `pnpm smoke`
+fails if that table and the tested targets drift apart.
 
 - Unit tests use a mocked chain reader; `test/verifier.test.ts` includes a
   truth table covering every verdict.
@@ -91,4 +200,5 @@ pnpm typecheck && pnpm test && pnpm build && pnpm size
   contracts when `LAFIYA_IT_RPC_URL`, `LAFIYA_IT_ATTESTATION_REGISTRY`,
   `LAFIYA_IT_ATTESTER_REGISTRY`, and `LAFIYA_IT_RECORD_HASH` are set, and is
   skipped otherwise.
-- `pnpm size` enforces the gzipped bundle budget (8 KiB) in CI.
+- `pnpm size` enforces the gzipped core bundle budget (12 KiB, locale
+  catalogs excluded) in CI.
