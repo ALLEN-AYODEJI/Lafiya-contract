@@ -1,6 +1,7 @@
 //! Rules engine: turns events (and wasm-hash observations) into alerts.
 
 use crate::config::{Config, EventRule, RateRule};
+use crate::state::{AlertFingerprint, EngineState, StateStore};
 use crate::{Alert, Event, Severity};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -20,6 +21,11 @@ pub struct Engine {
     /// Wasm hash each contract is expected to run, from `upgraded` events or
     /// the first observation.
     expected_wasm: BTreeMap<String, String>,
+    /// Durable store for window state and alert fingerprints. When present,
+    /// state is loaded on construction and persisted after every evaluation.
+    store: Option<StateStore>,
+    /// Fingerprints of alerts already emitted, keyed by rule+dedup key.
+    seen: BTreeMap<String, AlertFingerprint>,
 }
 
 /// Default rules from the issue: privileged changes are critical, pause
@@ -61,7 +67,15 @@ fn matches(pattern: &str, name: &str) -> bool {
 
 impl Engine {
     pub fn new(cfg: &Config) -> Engine {
-        Engine {
+        Engine::with_store(cfg, None)
+    }
+
+    /// Build an engine backed by a durable state store. Any previously
+    /// persisted window state and alert fingerprints are restored so a
+    /// restart (including kill -9) neither re-alerts nor loses in-flight
+    /// windows.
+    pub fn with_store(cfg: &Config, store: Option<StateStore>) -> Engine {
+        let mut engine = Engine {
             rules: if cfg.rules.is_empty() {
                 default_rules()
             } else {
@@ -76,7 +90,62 @@ impl Engine {
             explorer_tx_url: cfg.explorer_tx_url.clone(),
             rate_window: VecDeque::new(),
             expected_wasm: BTreeMap::new(),
+            store,
+            seen: BTreeMap::new(),
+        };
+        engine.restore();
+        engine
+    }
+
+    /// Load persisted state, if any, into the in-memory engine.
+    fn restore(&mut self) {
+        let Some(store) = &self.store else { return };
+        let state = match store.load() {
+            Ok(state) => state,
+            Err(err) => {
+                eprintln!("watchdog: failed to load state: {err}");
+                return;
+            }
+        };
+        self.apply_state(state);
+    }
+
+    fn apply_state(&mut self, state: EngineState) {
+        self.rate_window = state.rate_window.into_iter().collect();
+        self.expected_wasm = state.expected_wasm;
+        self.seen = state.alert_fingerprints;
+    }
+
+    fn snapshot(&self) -> EngineState {
+        EngineState {
+            rate_window: self.rate_window.iter().copied().collect(),
+            expected_wasm: self.expected_wasm.clone(),
+            alert_fingerprints: self.seen.clone(),
         }
+    }
+
+    /// Persist current state. Called after every evaluation so a crash cannot
+    /// lose in-flight windows or re-emit an alert.
+    pub fn persist(&self) {
+        let Some(store) = &self.store else { return };
+        if let Err(err) = store.save(&self.snapshot()) {
+            eprintln!("watchdog: failed to persist state: {err}");
+        }
+    }
+
+    /// Deduplicate alerts by fingerprint. Returns only alerts not previously
+    /// seen and records them so a restart will not re-alert.
+    fn dedup(&mut self, alerts: Vec<Alert>) -> Vec<Alert> {
+        let mut fresh = Vec::new();
+        for alert in alerts {
+            let fp = AlertFingerprint::of(&alert);
+            if self.seen.contains_key(&fp.key) {
+                continue;
+            }
+            self.seen.insert(fp.key.clone(), fp);
+            fresh.push(alert);
+        }
+        fresh
     }
 
     fn alert(&self, kind: &str, severity: Severity, summary: String, e: &Event) -> Alert {
@@ -106,6 +175,13 @@ impl Engine {
 
     /// Evaluate one event. Events must be fed in ledger order.
     pub fn evaluate(&mut self, e: &Event) -> Vec<Alert> {
+        let alerts = self.evaluate_raw(e);
+        let fresh = self.dedup(alerts);
+        self.persist();
+        fresh
+    }
+
+    fn evaluate_raw(&mut self, e: &Event) -> Vec<Alert> {
         let mut alerts = Vec::new();
 
         for rule in &self.rules {
@@ -167,7 +243,7 @@ impl Engine {
     /// against the hash implied by the events seen so far.
     pub fn observe_wasm(&mut self, contract: &str, hash: &str, ledger: u32) -> Option<Alert> {
         let hash = hash.to_ascii_lowercase();
-        match self.expected_wasm.get(contract) {
+        let alert = match self.expected_wasm.get(contract) {
             None => {
                 self.expected_wasm.insert(contract.into(), hash);
                 None
@@ -188,7 +264,10 @@ impl Engine {
                 self.expected_wasm.insert(contract.into(), hash);
                 Some(alert)
             }
-        }
+        };
+        let fresh = self.dedup(alert.into_iter().collect());
+        self.persist();
+        fresh.into_iter().next()
     }
 }
 
@@ -421,5 +500,41 @@ mod tests {
         assert!(Engine::new(&cfg())
             .evaluate(&ev("attestation_recorded", 1, &[]))
             .is_empty());
+    }
+
+    #[test]
+    fn dedup_suppresses_repeat_alerts() {
+        let mut e = Engine::new(&cfg());
+        let first = e.evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]));
+        assert_eq!(first.len(), 1);
+        // Same event replayed (e.g. after a restart) must not re-alert.
+        let again = e.evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]));
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn state_roundtrips_through_store() {
+        let dir = std::env::temp_dir().join(format!("lafiya-wd-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let _ = std::fs::remove_file(&path);
+        let store = StateStore::new(&path);
+
+        let mut e = Engine::with_store(&cfg(), Some(store.clone()));
+        e.evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]));
+        e.evaluate(&ev("attester_added", 2, &[]));
+        e.persist();
+
+        // Simulate a kill -9 restart: fresh engine from the same store.
+        let mut restarted = Engine::with_store(&cfg(), Some(store));
+        assert!(restarted
+            .evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]))
+            .is_empty());
+        // In-flight rate window survived: two more events reach the burst.
+        assert!(restarted.evaluate(&ev("attester_added", 3, &[])).is_empty());
+        assert!(restarted.evaluate(&ev("attester_added", 4, &[])).is_empty());
+        let burst = restarted.evaluate(&ev("attester_added", 5, &[]));
+        assert!(burst.iter().any(|a| a.kind == MASS_ENROLLMENT));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

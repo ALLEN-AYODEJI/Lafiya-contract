@@ -28,6 +28,15 @@ pub struct Config {
     pub heartbeat: Heartbeat,
     #[serde(default)]
     pub sinks: Vec<SinkConfig>,
+    /// Persistent rule-window / dedup state (#532).
+    #[serde(default)]
+    pub state: StateConfig,
+    /// Escalation policy by severity (#532).
+    #[serde(default)]
+    pub escalation: Escalation,
+    /// Guarded auto-response proposals (#533).
+    #[serde(default)]
+    pub auto_response: AutoResponse,
 }
 
 fn default_poll() -> u64 {
@@ -72,8 +81,17 @@ pub struct Heartbeat {
     pub max_consecutive_failures: u32,
     /// Dead-man's switch: pinged (HTTP GET) after every healthy poll, so an
     /// external monitor (healthchecks.io, Cronitor, ...) pages when pings stop.
+    /// See `docs/runbooks/watchdog.md` for healthchecks.io / Cronitor setup.
     #[serde(default)]
     pub ping_url: Option<String>,
+    /// Minimum seconds between heartbeat pings. Defaults to the poll interval
+    /// when unset; a value of `0` pings after every healthy poll.
+    #[serde(default)]
+    pub ping_interval_secs: Option<u64>,
+    /// Optional HTTP method for the ping (`GET` by default). Some monitors
+    /// (e.g. Cronitor) accept `POST`.
+    #[serde(default)]
+    pub ping_method: Option<String>,
 }
 
 impl Default for Heartbeat {
@@ -82,6 +100,8 @@ impl Default for Heartbeat {
             max_lag_ledgers: default_lag(),
             max_consecutive_failures: default_failures(),
             ping_url: None,
+            ping_interval_secs: None,
+            ping_method: None,
         }
     }
 }
@@ -92,6 +112,117 @@ fn default_lag() -> u32 {
 
 fn default_failures() -> u32 {
     5
+}
+
+/// Where rule-window and last-alert fingerprints are persisted so a restart
+/// neither re-alerts nor loses in-flight windows (#532).
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateConfig {
+    /// Path to the state file. `None` disables persistence (in-memory only).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Flush the state file after every poll rather than only on shutdown.
+    #[serde(default = "default_true")]
+    pub flush_every_poll: bool,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        StateConfig {
+            path: None,
+            flush_every_poll: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Escalation policy: how long to wait for an ack before re-notifying and
+/// which sinks to target per severity (#532).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Escalation {
+    /// Seconds to wait for an acknowledgement before escalating. `0` disables.
+    #[serde(default = "default_ack_timeout")]
+    pub ack_timeout_secs: u64,
+    /// Seconds between re-notifications while unacknowledged. `0` disables.
+    #[serde(default = "default_renotify")]
+    pub renotify_interval_secs: u64,
+    /// Per-severity escalation targets, keyed by `info`/`low`/`medium`/`high`/`critical`.
+    #[serde(default)]
+    pub targets: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl Default for Escalation {
+    fn default() -> Self {
+        Escalation {
+            ack_timeout_secs: default_ack_timeout(),
+            renotify_interval_secs: default_renotify(),
+            targets: Default::default(),
+        }
+    }
+}
+
+fn default_ack_timeout() -> u64 {
+    900
+}
+
+fn default_renotify() -> u64 {
+    1800
+}
+
+/// Guarded auto-response: build (never execute) pause proposals on critical
+/// alerts, gated by rate limiting and alert authenticity checks (#533).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoResponse {
+    /// Master switch. Disabled by default; proposals are never executed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Rule kinds (e.g. `event`, `mass_enrollment`) that may trigger a proposal.
+    #[serde(default = "default_critical_kinds")]
+    pub critical_kinds: Vec<String>,
+    /// Maximum proposals generated per `rate_limit_window_secs`.
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit: usize,
+    /// Window for `rate_limit`, in seconds.
+    #[serde(default = "default_rate_window")]
+    pub rate_limit_window_secs: u64,
+    /// HMAC key (hex) used to verify signed alerts before proposing a pause.
+    #[serde(default)]
+    pub alert_signing_key: Option<String>,
+    /// Public key (hex) for asymmetric alert verification, if used instead of HMAC.
+    #[serde(default)]
+    pub alert_public_key: Option<String>,
+    /// Path to the pause-policy matrix (see `docs/PAUSE-POLICY.md`).
+    #[serde(default)]
+    pub pause_policy_path: Option<String>,
+}
+
+impl Default for AutoResponse {
+    fn default() -> Self {
+        AutoResponse {
+            enabled: false,
+            critical_kinds: default_critical_kinds(),
+            rate_limit: default_rate_limit(),
+            rate_limit_window_secs: default_rate_window(),
+            alert_signing_key: None,
+            alert_public_key: None,
+            pause_policy_path: None,
+        }
+    }
+}
+
+fn default_critical_kinds() -> Vec<String> {
+    vec!["event".into(), "mass_enrollment".into()]
+}
+
+fn default_rate_limit() -> usize {
+    3
+}
+
+fn default_rate_window() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize)]

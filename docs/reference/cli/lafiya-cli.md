@@ -3,3 +3,120 @@
 # `lafiya-cli`
 
 > **Not generated:** `lafiya-cli` did not build when this page was generated. Fix the build and rerun `cargo xtask docs`.
+
+## Air-gapped signing (`tx prepare`, `tx sign --offline`, `tx submit`)
+
+High-value admin and multisig keys can be kept on a device that never touches the
+network. Signing is split into three commands so that only the middle one needs
+access to the private key.
+
+### `lafiya-cli tx prepare`
+
+Builds an unsigned transaction and emits a **self-describing envelope**. The
+envelope contains everything an offline signer needs to verify what it is about
+to sign:
+
+- `network_passphrase` — the Stellar network the transaction targets.
+- `contract_id` — the contract the transaction invokes.
+- `expiry` — the ledger/time after which the envelope must not be signed.
+- `decode` — a human-readable rendering of the operation(s).
+- `xdr` — the unsigned transaction envelope (base64 XDR).
+- `checksum` — a digest over the fields above, used for tamper detection.
+
+```sh
+lafiya-cli tx prepare --contract <CONTRACT_ID> --out unsigned.envelope.json
+```
+
+The envelope is written to `--out` (or stdout). It is safe to move across an air
+gap by file copy or QR transport.
+
+### `lafiya-cli tx sign --offline`
+
+Re-decodes and verifies the envelope **before** signing, then produces a
+**detached signature bundle** rather than a fully-signed transaction. The
+offline host performs no network access.
+
+```sh
+lafiya-cli tx sign --offline --in unsigned.envelope.json --out signed.bundle.json
+```
+
+Verification performed on the offline device before any signature is produced:
+
+1. The envelope `checksum` is recomputed and compared; any mismatch aborts.
+2. The `network_passphrase` is checked against the signer's expected network.
+3. The `expiry` is checked against the signer's local clock.
+4. The `decode` rendering is shown for operator confirmation.
+
+If any check fails, no signature is emitted and the command exits non-zero.
+
+### `lafiya-cli tx submit`
+
+Assembles the unsigned envelope and the detached signature bundle, then submits
+the resulting transaction to the network.
+
+```sh
+lafiya-cli tx submit --envelope unsigned.envelope.json --bundle signed.bundle.json
+```
+
+`tx submit` re-verifies the envelope checksum and that the signatures in the
+bundle match the envelope before sending.
+
+### QR / frame transport
+
+For payloads larger than a single QR code, `tx prepare` and `tx sign --offline`
+accept `--qr` to emit the envelope or bundle as a sequence of animated frames
+instead of a single file. The receiving side reassembles the frames and then
+runs the same verification described above.
+
+```sh
+lafiya-cli tx prepare --contract <CONTRACT_ID> --qr
+lafiya-cli tx sign --offline --in unsigned.envelope.json --qr
+```
+
+## `lafiya-cli doctor`
+
+A single preflight command that validates everything an operator depends on
+before running a mutating action. It is safe to run in CI.
+
+```sh
+lafiya-cli doctor [--json]
+```
+
+### Checks
+
+- **Config schema** — the local configuration parses and matches the expected schema.
+- **RPC health** — the RPC endpoint is reachable and reports a supported protocol version.
+- **Network passphrase** — the configured passphrase matches the target network.
+- **Contract hash vs deployment ledger** — the deployed contract hash matches the recorded deployment ledger (detects stale contract ids after a testnet reset).
+- **Signer balance** — the signer account holds enough balance to cover fees.
+- **Instance TTL** — the contract instance entry has sufficient TTL remaining (detects unarchived instance entries).
+
+### Output
+
+Each check reports a name, a **severity** (`ok`, `warn`, `error`), a message,
+and a **remediation hint** when the check does not pass. With `--json` the
+output is machine-readable:
+
+```json
+{
+  "checks": [
+    {
+      "name": "rpc_health",
+      "severity": "ok",
+      "message": "RPC reachable, protocol version 22"
+    },
+    {
+      "name": "contract_hash",
+      "severity": "error",
+      "message": "contract hash mismatch: expected abc123, found def456",
+      "remediation": "Re-run deployment or update the configured contract id."
+    }
+  ]
+}
+```
+
+### Exit status
+
+`doctor` exits **non-zero** when any check reports a blocking (`error`)
+severity, making it usable as a CI gate. `warn` severities do not fail the
+command.

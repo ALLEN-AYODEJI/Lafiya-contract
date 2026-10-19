@@ -13,7 +13,8 @@ use stellar_xdr::{
     Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization,
     HashIdPreimageSorobanAuthorizationWithAddress, Limits, ReadXdr, ScAddress, ScVal,
     SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, TransactionEnvelope, WriteXdr,
+    SorobanAuthorizedInvocation, SorobanCredentials, Transaction, TransactionEnvelope,
+    TransactionV1Envelope, WriteXdr,
 };
 
 /// Invocation trees deeper than this are flagged for extra scrutiny.
@@ -136,6 +137,119 @@ pub fn decode_input(input: &str, ctx: &DecodeContext) -> anyhow::Result<Vec<Deco
         anyhow::bail!("transaction contains no Soroban authorization entries");
     }
     Ok(entries)
+}
+
+/// Summary of the transaction itself (as opposed to its auth entries), shown
+/// to an offline signer before they approve anything.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DecodedTransaction {
+    pub source_account: String,
+    pub fee: u32,
+    pub sequence: i64,
+    pub operation_count: usize,
+    pub min_time: u64,
+    pub max_time: u64,
+    pub memo: String,
+    /// Hex SHA-256 of the transaction XDR, recomputed locally.
+    pub tx_hash: String,
+}
+
+/// Decode the transaction portion of a base64 `TransactionEnvelope`.
+pub fn decode_transaction(input: &str) -> anyhow::Result<DecodedTransaction> {
+    let envelope = TransactionEnvelope::from_xdr_base64(input.trim(), Limits::none())
+        .map_err(|e| anyhow::anyhow!("input is not a TransactionEnvelope ({e})"))?;
+    let tx: &Transaction = match &envelope {
+        TransactionEnvelope::Tx(v1) => &v1.tx,
+        TransactionEnvelope::TxV0(v0) => {
+            anyhow::bail!("legacy TransactionV0 envelopes are not supported for offline signing")
+        }
+        TransactionEnvelope::TxFeeBump(_) => {
+            anyhow::bail!("fee-bump envelopes are not supported for offline signing")
+        }
+    };
+    let tx_bytes = tx.to_xdr(Limits::none())?;
+    Ok(DecodedTransaction {
+        source_account: tx.source_account.to_string(),
+        fee: tx.fee,
+        sequence: tx.seq_num.0,
+        operation_count: tx.operations.len(),
+        min_time: tx.cond.as_v1().map_or(0, |c| c.min_time),
+        max_time: tx.cond.as_v1().map_or(0, |c| c.max_time),
+        memo: format!("{:?}", tx.memo),
+        tx_hash: hex::encode(Sha256::digest(&tx_bytes)),
+    })
+}
+
+/// The full human-readable decode of an offline-signing envelope: the
+/// transaction summary followed by every authorization entry.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DecodedEnvelope {
+    pub transaction: DecodedTransaction,
+    pub entries: Vec<DecodedEntry>,
+}
+
+/// Decode a transaction envelope for offline review, returning both the
+/// transaction summary and the decoded authorization entries.
+pub fn decode_envelope(input: &str, ctx: &DecodeContext) -> anyhow::Result<DecodedEnvelope> {
+    let transaction = decode_transaction(input)?;
+    let entries = decode_input(input, ctx)?;
+    Ok(DecodedEnvelope {
+        transaction,
+        entries,
+    })
+}
+
+/// Stable, deterministic text rendering of a decoded envelope. This is the
+/// exact string embedded in the envelope's `human_readable` field, so the
+/// offline device can recompute it and compare byte-for-byte.
+pub fn render_envelope_text(decoded: &DecodedEnvelope, ctx: &DecodeContext) -> String {
+    let tx = &decoded.transaction;
+    let mut out = String::new();
+    out.push_str("=== Transaction\n");
+    out.push_str(&format!("Source:      {}\n", tx.source_account));
+    out.push_str(&format!("Fee:         {} stroops\n", tx.fee));
+    out.push_str(&format!("Sequence:    {}\n", tx.sequence));
+    out.push_str(&format!("Operations:  {}\n", tx.operation_count));
+    out.push_str(&format!(
+        "Time bounds: {} .. {}\n",
+        tx.min_time, tx.max_time
+    ));
+    out.push_str(&format!("Memo:        {}\n", tx.memo));
+    out.push_str(&format!("Tx hash:     {}  (recomputed locally)\n", tx.tx_hash));
+    out.push_str(&render_text(&decoded.entries, ctx));
+    out
+}
+
+/// Re-decode `envelope_xdr` on the offline device and verify that the
+/// recomputed human-readable decode and checksum match what the envelope
+/// claims. Any mismatch means the envelope was tampered with in transit.
+pub fn verify_envelope(
+    envelope_xdr: &str,
+    claimed_human_readable: &str,
+    claimed_checksum: &str,
+    ctx: &DecodeContext,
+) -> anyhow::Result<DecodedEnvelope> {
+    let decoded = decode_envelope(envelope_xdr, ctx)?;
+    let rendered = render_envelope_text(&decoded, ctx);
+    if rendered != claimed_human_readable {
+        anyhow::bail!(
+            "human-readable decode does not match the envelope contents; \
+             the envelope may have been tampered with"
+        );
+    }
+    let actual = envelope_checksum(envelope_xdr)?;
+    if actual != claimed_checksum {
+        anyhow::bail!(
+            "envelope checksum mismatch (expected {claimed_checksum}, got {actual}); \
+             the envelope may have been tampered with"
+        );
+    }
+    Ok(decoded)
+}
+
+/// Hex SHA-256 of the canonical (whitespace-trimmed) envelope XDR string.
+pub fn envelope_checksum(envelope_xdr: &str) -> anyhow::Result<String> {
+    Ok(hex::encode(Sha256::digest(envelope_xdr.trim().as_bytes())))
 }
 
 /// Network ID as defined by the protocol: SHA-256 of the passphrase.
@@ -616,5 +730,59 @@ mod tests {
     #[test]
     fn rejects_garbage_input() {
         assert!(decode_input("not-xdr", &ctx()).is_err());
+    }
+
+    fn sample_envelope() -> String {
+        let inv = call(
+            contract(0x01),
+            "add_attester",
+            vec![ScVal::Address(contract(0x05))],
+            vec![],
+        );
+        let tx = Transaction {
+            source_account: stellar_xdr::MuxedAccount::Ed25519(
+                stellar_xdr::Uint256([0x11; 32]),
+            ),
+            fee: 100,
+            seq_num: stellar_xdr::SequenceNumber(7),
+            cond: stellar_xdr::Preconditions::None,
+            memo: stellar_xdr::Memo::None,
+            operations: VecM::try_from(Vec::new()).unwrap(),
+            ext: stellar_xdr::TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::try_from(Vec::new()).unwrap(),
+        });
+        let _ = inv;
+        envelope.to_xdr_base64(Limits::none()).unwrap()
+    }
+
+    #[test]
+    fn envelope_round_trip_verifies() {
+        let xdr = sample_envelope();
+        let decoded = decode_envelope(&xdr, &ctx()).unwrap();
+        let rendered = render_envelope_text(&decoded, &ctx());
+        let checksum = envelope_checksum(&xdr).unwrap();
+        let verified = verify_envelope(&xdr, &rendered, &checksum, &ctx()).unwrap();
+        assert_eq!(verified.transaction.sequence, 7);
+    }
+
+    #[test]
+    fn tampered_human_readable_is_rejected() {
+        let xdr = sample_envelope();
+        let decoded = decode_envelope(&xdr, &ctx()).unwrap();
+        let mut rendered = render_envelope_text(&decoded, &ctx());
+        rendered.push_str("WARNING: injected\n");
+        let checksum = envelope_checksum(&xdr).unwrap();
+        assert!(verify_envelope(&xdr, &rendered, &checksum, &ctx()).is_err());
+    }
+
+    #[test]
+    fn tampered_checksum_is_rejected() {
+        let xdr = sample_envelope();
+        let decoded = decode_envelope(&xdr, &ctx()).unwrap();
+        let rendered = render_envelope_text(&decoded, &ctx());
+        assert!(verify_envelope(&xdr, &rendered, "deadbeef", &ctx()).is_err());
     }
 }

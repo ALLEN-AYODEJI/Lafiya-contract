@@ -11,6 +11,8 @@ mod attester_import;
 mod audit;
 mod auth_decode;
 mod logging;
+mod signer;
+mod submit;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -121,6 +123,64 @@ enum Commands {
     Deployments {
         #[command(subcommand)]
         sub: DeploymentsSub,
+    },
+    /// Air-gapped transaction signing: prepare, sign offline, submit
+    Tx {
+        #[command(subcommand)]
+        sub: TxSub,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TxSub {
+    /// Build a self-describing envelope for offline signing
+    Prepare {
+        /// Base64 XDR of the unsigned transaction envelope, or a path to a file
+        /// containing it
+        #[arg(long)]
+        xdr: String,
+        /// Contract id the transaction targets (C...)
+        #[arg(long)]
+        contract_id: String,
+        /// Ledger sequence after which the envelope must not be signed
+        #[arg(long)]
+        expiry_ledger: u32,
+        /// Write the envelope to this file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Also render the envelope as animated QR frames (to stdout)
+        #[arg(long, default_value_t = false)]
+        qr: bool,
+    },
+    /// Re-decode and verify an envelope, then sign it offline
+    Sign {
+        /// Path to the envelope file produced by `tx prepare`
+        #[arg(long)]
+        envelope: PathBuf,
+        /// Sign without any network access (required for air-gapped hosts)
+        #[arg(long, default_value_t = false)]
+        offline: bool,
+        /// Stellar identity name or G... address whose key signs the envelope
+        #[arg(long)]
+        signer: String,
+        /// Write the detached signature bundle to this file instead of stdout
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Current ledger sequence, to reject expired envelopes before signing
+        #[arg(long)]
+        current_ledger: Option<u32>,
+    },
+    /// Assemble an envelope plus signature bundle and submit it
+    Submit {
+        /// Path to the envelope file produced by `tx prepare`
+        #[arg(long)]
+        envelope: PathBuf,
+        /// Path to the signature bundle produced by `tx sign --offline`
+        #[arg(long)]
+        signatures: PathBuf,
+        /// Stellar identity or G... address used as transaction source
+        #[arg(long)]
+        source: Option<String>,
     },
 }
 
@@ -840,6 +900,108 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Commands::Tx { sub } => match sub {
+            TxSub::Prepare {
+                xdr,
+                contract_id,
+                expiry_ledger,
+                out,
+                qr,
+            } => {
+                let _span = tracing::info_span!("tx.prepare", network = %cli.network).entered();
+                validate_address("contract_id", &contract_id)
+                    .context("invalid --contract-id (expected a C... contract id)")?;
+                let raw = match std::fs::read_to_string(&xdr) {
+                    Ok(contents) => contents,
+                    Err(_) => xdr,
+                };
+                let ctx = auth_decode::DecodeContext {
+                    network_name: cli.network.clone(),
+                    network_passphrase: network_cfg.network_passphrase.clone(),
+                    labels: known_labels(&network_cfg, &[])?,
+                    current_ledger: None,
+                };
+                let envelope = submit::prepare_envelope(
+                    &raw,
+                    &cli.network,
+                    &network_cfg.network_passphrase,
+                    &contract_id,
+                    expiry_ledger,
+                    &ctx,
+                )?;
+                let json = serde_json::to_string_pretty(&envelope)?;
+                match &out {
+                    Some(path) => {
+                        std::fs::write(path, &json)
+                            .with_context(|| format!("writing envelope to {path:?}"))?;
+                        println!("Wrote envelope to {}", path.display());
+                    }
+                    None => println!("{json}"),
+                }
+                if qr {
+                    for frame in lafiya_qr::encode_frames(&json) {
+                        println!("{frame}");
+                    }
+                }
+            }
+            TxSub::Sign {
+                envelope,
+                offline,
+                signer,
+                out,
+                current_ledger,
+            } => {
+                let _span = tracing::info_span!("tx.sign", network = %cli.network).entered();
+                if !offline {
+                    anyhow::bail!(
+                        "`tx sign` requires --offline; keys must never be reachable from the submitting host"
+                    );
+                }
+                validate_source_account(&signer)
+                    .context("invalid --signer (expected a stellar identity name or G... address)")?;
+                let raw = std::fs::read_to_string(&envelope)
+                    .with_context(|| format!("reading envelope {envelope:?}"))?;
+                let ctx = auth_decode::DecodeContext {
+                    network_name: cli.network.clone(),
+                    network_passphrase: network_cfg.network_passphrase.clone(),
+                    labels: known_labels(&network_cfg, &[])?,
+                    current_ledger,
+                };
+                let bundle = signer::sign_offline(&raw, &signer, &ctx)?;
+                let json = serde_json::to_string_pretty(&bundle)?;
+                match &out {
+                    Some(path) => {
+                        std::fs::write(path, &json)
+                            .with_context(|| format!("writing signature bundle to {path:?}"))?;
+                        println!("Wrote signature bundle to {}", path.display());
+                    }
+                    None => println!("{json}"),
+                }
+            }
+            TxSub::Submit {
+                envelope,
+                signatures,
+                source,
+            } => {
+                let _span = tracing::info_span!("tx.submit", network = %cli.network).entered();
+                let source = validated_source(source)?;
+                let envelope_raw = std::fs::read_to_string(&envelope)
+                    .with_context(|| format!("reading envelope {envelope:?}"))?;
+                let bundle_raw = std::fs::read_to_string(&signatures)
+                    .with_context(|| format!("reading signature bundle {signatures:?}"))?;
+                let signed_xdr = submit::assemble(&envelope_raw, &bundle_raw, &network_cfg)?;
+                let args = submit::submit_args(&network_cfg, source.as_deref(), &signed_xdr);
+                run_audited(
+                    "tx submit",
+                    &cli.network,
+                    &network_cfg.contracts.attester_registry,
+                    "submit",
+                    &[],
+                    source.as_deref(),
+                    args,
+                )?;
+            }
+        },
         Commands::Deployments { sub } => match sub {
             DeploymentsSub::Record {
                 event,
@@ -1993,5 +2155,82 @@ mod tests {
             message.to_uppercase().contains("NEW_WASM_HASH"),
             "expected error to name the missing `new_wasm_hash` argument, got: {message}"
         );
+    }
+
+    // ── tx subcommands ────────────────────────────────────────────────────────
+
+    #[test]
+    fn tx_prepare_parses_required_flags() {
+        let cli = Cli::try_parse_from([
+            "lafiya-cli",
+            "tx",
+            "prepare",
+            "--xdr",
+            "AAAA",
+            "--contract-id",
+            CONTRACT_ID,
+            "--expiry-ledger",
+            "1234",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Tx {
+                sub:
+                    TxSub::Prepare {
+                        xdr,
+                        contract_id,
+                        expiry_ledger,
+                        out,
+                        qr,
+                    },
+            } => {
+                assert_eq!(xdr, "AAAA");
+                assert_eq!(contract_id, CONTRACT_ID);
+                assert_eq!(expiry_ledger, 1234);
+                assert!(out.is_none());
+                assert!(!qr);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_sign_requires_offline_flag() {
+        let cli = Cli::try_parse_from([
+            "lafiya-cli",
+            "tx",
+            "sign",
+            "--envelope",
+            "env.json",
+            "--signer",
+            "alice",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Tx {
+                sub: TxSub::Sign { offline, .. },
+            } => assert!(!offline),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_submit_parses_paths() {
+        let cli = Cli::try_parse_from([
+            "lafiya-cli",
+            "tx",
+            "submit",
+            "--envelope",
+            "env.json",
+            "--signatures",
+            "sig.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Tx {
+                sub: TxSub::Submit { envelope, .. },
+            } => assert_eq!(envelope, PathBuf::from("env.json")),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

@@ -22,6 +22,204 @@ pub type Signature = [u8; 64];
 /// A 32-byte ed25519 public key.
 pub type PublicKey = [u8; 32];
 
+/// A detached signature bundle produced by an offline signer.
+///
+/// The bundle carries everything a networked host needs to assemble the
+/// signed envelope without ever seeing the secret key: the signer's public
+/// key, the signature over the envelope payload, and the digest of the
+/// exact envelope bytes that were signed.  The digest lets the assembling
+/// host detect tampering between the offline device and submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureBundle {
+    /// The ed25519 public key that produced `signature`.
+    pub public_key: PublicKey,
+    /// The detached signature over the envelope payload.
+    pub signature: Signature,
+    /// SHA-256 digest of the envelope bytes that were signed.
+    pub envelope_digest: [u8; 32],
+}
+
+impl SignatureBundle {
+    /// Encode the bundle as a compact, self-describing text payload suitable
+    /// for writing to a file or splitting into QR frames.
+    ///
+    /// Format: `lafiya-sig-v1:<hex public key>:<hex signature>:<hex digest>`
+    pub fn to_envelope_string(&self) -> String {
+        format!(
+            "lafiya-sig-v1:{}:{}:{}",
+            hex_encode(&self.public_key),
+            hex_encode(&self.signature),
+            hex_encode(&self.envelope_digest),
+        )
+    }
+
+    /// Decode a bundle previously produced by [`SignatureBundle::to_envelope_string`].
+    pub fn from_envelope_string(s: &str) -> Result<Self, SignerError> {
+        let mut parts = s.trim().split(':');
+        let tag = parts.next().unwrap_or_default();
+        if tag != "lafiya-sig-v1" {
+            return Err(SignerError::BundleDecodeError {
+                detail: format!("unexpected bundle tag '{tag}'"),
+            });
+        }
+        let public_key = decode_fixed::<32>(parts.next(), "public key")?;
+        let signature = decode_fixed::<64>(parts.next(), "signature")?;
+        let envelope_digest = decode_fixed::<32>(parts.next(), "envelope digest")?;
+        if parts.next().is_some() {
+            return Err(SignerError::BundleDecodeError {
+                detail: "trailing data after signature bundle".to_string(),
+            });
+        }
+        Ok(Self {
+            public_key,
+            signature,
+            envelope_digest,
+        })
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn decode_fixed<const N: usize>(
+    field: Option<&str>,
+    name: &str,
+) -> Result<[u8; N], SignerError> {
+    let field = field.ok_or_else(|| SignerError::BundleDecodeError {
+        detail: format!("missing {name}"),
+    })?;
+    if field.len() != N * 2 {
+        return Err(SignerError::BundleDecodeError {
+            detail: format!("{name} must be {} hex chars", N * 2),
+        });
+    }
+    let mut out = [0u8; N];
+    for (i, chunk) in field.as_bytes().chunks(2).enumerate() {
+        let hi = hex_val(chunk[0])?;
+        let lo = hex_val(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_val(c: u8) -> Result<u8, SignerError> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(SignerError::BundleDecodeError {
+            detail: format!("invalid hex character '{}'", c as char),
+        }),
+    }
+}
+
+/// A minimal, dependency-free SHA-256 used to bind a signature bundle to the
+/// exact envelope bytes that were signed.
+///
+/// This is intentionally self-contained so the offline signing path has no
+/// external crate requirements.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let mut msg = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7)
+                ^ w[i - 15].rotate_right(18)
+                ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17)
+                ^ w[i - 2].rotate_right(19)
+                ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
 /// Errors that can occur during signing.
 #[derive(Debug)]
 pub enum SignerError {
@@ -35,6 +233,12 @@ pub enum SignerError {
     StellarCliNotFound,
     /// The `stellar` binary exited with an error.
     StellarCliFailed { exit_code: Option<i32>, stderr: String },
+    /// The envelope could not be re-decoded on the offline device.
+    EnvelopeDecodeError { detail: String },
+    /// The envelope digest did not match the bundle (tampering detected).
+    EnvelopeTampered { expected: String, actual: String },
+    /// A detached signature bundle could not be decoded.
+    BundleDecodeError { detail: String },
 }
 
 impl fmt::Display for SignerError {
@@ -58,6 +262,16 @@ impl fmt::Display for SignerError {
                     "stellar CLI failed (exit {:?}): {}",
                     exit_code, stderr
                 )
+            }
+            SignerError::EnvelopeDecodeError { detail } => {
+                write!(f, "could not decode envelope: {detail}")
+            }
+            SignerError::EnvelopeTampered { expected, actual } => write!(
+                f,
+                "envelope tampering detected: expected digest {expected}, got {actual}"
+            ),
+            SignerError::BundleDecodeError { detail } => {
+                write!(f, "could not decode signature bundle: {detail}")
             }
         }
     }
@@ -88,6 +302,192 @@ pub trait Signer: Send + Sync {
 
     /// The ed25519 public key this signer will use, without actually signing.
     fn public_key(&self) -> Result<PublicKey, SignerError>;
+}
+
+/// A self-describing, unsigned envelope prepared on a networked host and
+/// carried to an offline signing device.
+///
+/// The envelope is intentionally minimal and transport-agnostic: it can be
+/// written to a file or split into QR frames.  The offline device re-decodes
+/// it (see [`OfflineSigner::verify_envelope`]) before signing so that
+/// tampering in transit is detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedEnvelope {
+    /// Stellar network passphrase the transaction targets.
+    pub network_passphrase: String,
+    /// Contract id the transaction interacts with.
+    pub contract_id: String,
+    /// Unix timestamp (seconds) after which the envelope must not be signed.
+    pub expires_at: u64,
+    /// Human-readable decode of the payload for operator review.
+    pub human_readable: String,
+    /// The raw payload bytes to be signed.
+    pub payload: Vec<u8>,
+}
+
+impl UnsignedEnvelope {
+    /// Encode the envelope as a self-describing text payload.
+    ///
+    /// Format:
+    /// `lafiya-env-v1:<network>:<contract>:<expires>:<hex payload>:<human readable>`
+    pub fn to_envelope_string(&self) -> String {
+        format!(
+            "lafiya-env-v1:{}:{}:{}:{}:{}",
+            self.network_passphrase,
+            self.contract_id,
+            self.expires_at,
+            hex_encode(&self.payload),
+            self.human_readable,
+        )
+    }
+
+    /// Re-decode an envelope produced by [`UnsignedEnvelope::to_envelope_string`].
+    ///
+    /// This is the verification step run on the offline device: it parses the
+    /// envelope and recomputes its digest so the caller can compare against
+    /// the digest that was communicated out-of-band.
+    pub fn from_envelope_string(s: &str) -> Result<Self, SignerError> {
+        let s = s.trim();
+        let mut parts = s.splitn(6, ':');
+        let tag = parts.next().unwrap_or_default();
+        if tag != "lafiya-env-v1" {
+            return Err(SignerError::EnvelopeDecodeError {
+                detail: format!("unexpected envelope tag '{tag}'"),
+            });
+        }
+        let network_passphrase = parts
+            .next()
+            .ok_or_else(|| SignerError::EnvelopeDecodeError {
+                detail: "missing network passphrase".to_string(),
+            })?
+            .to_string();
+        let contract_id = parts
+            .next()
+            .ok_or_else(|| SignerError::EnvelopeDecodeError {
+                detail: "missing contract id".to_string(),
+            })?
+            .to_string();
+        let expires_at = parts
+            .next()
+            .ok_or_else(|| SignerError::EnvelopeDecodeError {
+                detail: "missing expiry".to_string(),
+            })?
+            .parse::<u64>()
+            .map_err(|e| SignerError::EnvelopeDecodeError {
+                detail: format!("invalid expiry: {e}"),
+            })?;
+        let payload_hex = parts
+            .next()
+            .ok_or_else(|| SignerError::EnvelopeDecodeError {
+                detail: "missing payload".to_string(),
+            })?;
+        let payload = decode_hex(payload_hex)?;
+        let human_readable = parts.next().unwrap_or_default().to_string();
+
+        Ok(Self {
+            network_passphrase,
+            contract_id,
+            expires_at,
+            human_readable,
+            payload,
+        })
+    }
+
+    /// SHA-256 digest of the canonical envelope string.
+    pub fn digest(&self) -> [u8; 32] {
+        sha256(self.to_envelope_string().as_bytes())
+    }
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, SignerError> {
+    if s.len() % 2 != 0 {
+        return Err(SignerError::EnvelopeDecodeError {
+            detail: "payload hex has odd length".to_string(),
+        });
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_val(bytes[i])?;
+        let lo = hex_val(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Offline signing helper: re-decodes and verifies an envelope, then produces
+/// a detached [`SignatureBundle`] without any network access.
+///
+/// Keys stay on the offline host — this type only ever holds a [`Signer`]
+/// reference and never performs RPC.
+pub struct OfflineSigner<'a> {
+    signer: &'a dyn Signer,
+}
+
+impl<'a> OfflineSigner<'a> {
+    pub fn new(signer: &'a dyn Signer) -> Self {
+        Self { signer }
+    }
+
+    /// Re-decode the envelope on the offline device and verify it against the
+    /// digest communicated out-of-band.
+    ///
+    /// Returns the decoded envelope on success so the operator can review the
+    /// human-readable decode before signing.
+    pub fn verify_envelope(
+        &self,
+        envelope_string: &str,
+        expected_digest: &[u8; 32],
+    ) -> Result<UnsignedEnvelope, SignerError> {
+        let envelope = UnsignedEnvelope::from_envelope_string(envelope_string)?;
+        let actual = envelope.digest();
+        if &actual != expected_digest {
+            return Err(SignerError::EnvelopeTampered {
+                expected: hex_encode(expected_digest),
+                actual: hex_encode(&actual),
+            });
+        }
+        Ok(envelope)
+    }
+
+    /// Sign a verified envelope and emit a detached signature bundle.
+    ///
+    /// The payload must be exactly 32 bytes (the auth-entry or transaction
+    /// hash).  No network access is performed.
+    pub fn sign_envelope(
+        &self,
+        envelope: &UnsignedEnvelope,
+    ) -> Result<SignatureBundle, SignerError> {
+        let payload: [u8; 32] =
+            envelope
+                .payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| SignerError::SigningFailed {
+                    detail: format!(
+                        "envelope payload must be 32 bytes, got {}",
+                        envelope.payload.len()
+                    ),
+                })?;
+        let result = self.signer.sign(&payload)?;
+        Ok(SignatureBundle {
+            public_key: result.public_key,
+            signature: result.signature,
+            envelope_digest: envelope.digest(),
+        })
+    }
+
+    /// Convenience: verify then sign in one step.
+    pub fn verify_and_sign(
+        &self,
+        envelope_string: &str,
+        expected_digest: &[u8; 32],
+    ) -> Result<SignatureBundle, SignerError> {
+        let envelope = self.verify_envelope(envelope_string, expected_digest)?;
+        self.sign_envelope(&envelope)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +612,100 @@ mod tests {
         let s = ViaStellarCli::new("test-key");
         let payload = [0u8; 32];
         let err = s.sign(&payload).unwrap_err();
+        assert!(matches!(err, SignerError::SigningFailed { .. }));
+    }
+
+    struct FixedSigner {
+        key: PublicKey,
+        sig: Signature,
+    }
+
+    impl Signer for FixedSigner {
+        fn sign(&self, _payload: &[u8; 32]) -> Result<SignResult, SignerError> {
+            Ok(SignResult {
+                public_key: self.key,
+                signature: self.sig,
+            })
+        }
+        fn public_key(&self) -> Result<PublicKey, SignerError> {
+            Ok(self.key)
+        }
+    }
+
+    fn sample_envelope() -> UnsignedEnvelope {
+        UnsignedEnvelope {
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_string(),
+            expires_at: 1_700_000_000,
+            human_readable: "admin transfer 100 XLM".to_string(),
+            payload: vec![7u8; 32],
+        }
+    }
+
+    #[test]
+    fn sha256_known_vector() {
+        // SHA-256("abc")
+        let digest = sha256(b"abc");
+        assert_eq!(
+            hex_encode(&digest),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn envelope_round_trips() {
+        let env = sample_envelope();
+        let s = env.to_envelope_string();
+        let decoded = UnsignedEnvelope::from_envelope_string(&s).unwrap();
+        assert_eq!(env, decoded);
+    }
+
+    #[test]
+    fn envelope_tampering_detected() {
+        let env = sample_envelope();
+        let digest = env.digest();
+        let signer = FixedSigner {
+            key: [1u8; 32],
+            sig: [2u8; 64],
+        };
+        let offline = OfflineSigner::new(&signer);
+
+        // Tamper with the human-readable decode in transit.
+        let tampered = env.to_envelope_string().replace("100 XLM", "999 XLM");
+        let err = offline.verify_envelope(&tampered, &digest).unwrap_err();
+        assert!(matches!(err, SignerError::EnvelopeTampered { .. }));
+    }
+
+    #[test]
+    fn offline_sign_produces_bundle_round_trip() {
+        let env = sample_envelope();
+        let digest = env.digest();
+        let signer = FixedSigner {
+            key: [9u8; 32],
+            sig: [3u8; 64],
+        };
+        let offline = OfflineSigner::new(&signer);
+        let bundle = offline
+            .verify_and_sign(&env.to_envelope_string(), &digest)
+            .unwrap();
+        assert_eq!(bundle.public_key, [9u8; 32]);
+        assert_eq!(bundle.envelope_digest, digest);
+
+        let encoded = bundle.to_envelope_string();
+        let decoded = SignatureBundle::from_envelope_string(&encoded).unwrap();
+        assert_eq!(bundle, decoded);
+    }
+
+    #[test]
+    fn offline_sign_rejects_wrong_payload_length() {
+        let mut env = sample_envelope();
+        env.payload = vec![0u8; 16];
+        let signer = FixedSigner {
+            key: [1u8; 32],
+            sig: [2u8; 64],
+        };
+        let offline = OfflineSigner::new(&signer);
+        let err = offline.sign_envelope(&env).unwrap_err();
         assert!(matches!(err, SignerError::SigningFailed { .. }));
     }
 }
