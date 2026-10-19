@@ -49,6 +49,36 @@ is submitted. An alert with no matching announcement is an incident.
 | `pause_toggled` | high | Registry paused or unpaused | Confirm with the admin; unplanned unpause during an incident is critical |
 | `mass_enrollment` | high | More than N attesters added within M ledgers | Check the batch against the approved attester list |
 | `bulk_revocation` | info | Attestation revoked | Watch for bursts |
+| `pool_paused` | high | Incentive pool paused or unpaused | Confirm with the admin; an unplanned pause stalls all funding and payouts, an unplanned unpause during an incident is critical |
+| `large_pool_withdrawal` | high | A single withdrawal from the incentive pool exceeded `pool.large_withdrawal_threshold` | Confirm the payout was approved; check the recipient against the work item and the attester record |
+| `pool_approval_burst` | high | More than `pool.approval_burst_count` approvals within `pool.approval_burst_ledgers` ledgers | Check the batch against the approved work items; bursts can indicate a compromised attester or a scripted drain |
+| `claim_by_readded_attester` | critical | A pool claim came from an attester that was removed and re-added within `pool.readd_window_ledgers` ledgers | Treat as an attempt to launder a revoked attester's standing; freeze the pool and review the re-add approval |
+======>>>REPLACE
+<<<<<<< SEARCH
+CI runs `every_critical_rule_reaches_the_webhook`, which feeds the same event
+sequence through the rules and a real HTTP webhook sink into a mock server.
+=======
+CI runs `every_critical_rule_reaches_the_webhook`, which feeds the same event
+sequence through the rules and a real HTTP webhook sink into a mock server.
+
+## Incentive-pool rules
+
+The pool rules read the same event stream as the registry rules; the pool
+contract address is configured under `contracts` alongside the registries.
+Thresholds live in the `[pool]` section of `watchdog.toml`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `large_withdrawal_threshold` | `10000000000` (stroops) | Withdrawals at or above this amount raise `large_pool_withdrawal` |
+| `approval_burst_count` | `10` | Number of approvals that constitutes a burst |
+| `approval_burst_ledgers` | `100` | Window (in ledgers) over which approvals are counted |
+| `readd_window_ledgers` | `1000` | How far back to look for a remove/re-add of the claiming attester |
+
+Tune the thresholds to the pool's normal payout size before enabling the
+rules; a threshold far below typical payouts will page on every cycle. The
+`claim_by_readded_attester` rule keeps a bounded in-memory history of attester
+removals, so after a watchdog restart it can only flag re-adds that happened
+since startup; replay over an exported event range covers the gap.
 | `watchdog_lag` | critical | Watchdog is behind the network by more than `max_lag_ledgers` | Check RPC health ([rpc-outage-recovery.md](rpc-outage-recovery.md)); nothing is being watched |
 | `watchdog_failing` | critical | Polls failing repeatedly | Same as above |
 

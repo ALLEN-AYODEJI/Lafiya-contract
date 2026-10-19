@@ -240,3 +240,109 @@ for how these events are consumed.
 | `new_wasm_hash` | `BytesN<32>` | topic_list |
 | `contract_kind` | `Symbol` | data |
 | `schema_version` | `u32` | data |
+
+## `incentive-pool`
+
+### `AdminTransferred`
+
+- **Prefix topics:** `admin_transferred`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `previous_admin` | `Address` | topic_list |
+| `new_admin` | `Address` | topic_list |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Claimed`
+
+- **Prefix topics:** `claimed`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `recipient` | `Address` | topic_list |
+| `amount` | `i128` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Deposited`
+
+- **Prefix topics:** `deposited`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `depositor` | `Address` | topic_list |
+| `amount` | `i128` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Initialized`
+
+- **Prefix topics:** `initialized`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `admin` | `Address` | topic_list |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Paused`
+
+- **Prefix topics:** `paused`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `by` | `Address` | topic_list |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `PoolFunded`
+
+- **Prefix topics:** `pool_funded`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `funder` | `Address` | topic_list |
+| `amount` | `i128` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Unpaused`
+
+- **Prefix topics:** `unpaused`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `by` | `Address` | topic_list |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Upgraded`
+
+- **Prefix topics:** `upgraded`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `new_wasm_hash` | `BytesN<32>` | topic_list |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `Withdrawn`
+
+- **Prefix topics:** `withdrawn`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `depositor` | `Address` | topic_list |
+| `amount` | `i128` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |

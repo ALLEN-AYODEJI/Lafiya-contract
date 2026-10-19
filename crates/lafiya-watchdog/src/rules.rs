@@ -10,6 +10,33 @@ pub const WASM_CHANGED_WITHOUT_EVENT: &str = "wasm_changed_without_event";
 pub const MASS_ENROLLMENT: &str = "mass_enrollment";
 pub const WATCHDOG_LAG: &str = "watchdog_lag";
 pub const WATCHDOG_FAILING: &str = "watchdog_failing";
+pub const LARGE_WITHDRAWAL: &str = "large_withdrawal";
+pub const APPROVAL_BURST: &str = "approval_burst";
+pub const CLAIM_BY_READDED_ATTESTER: &str = "claim_by_readded_attester";
+pub const POOL_PAUSED: &str = "pool_paused";
+
+/// Thresholds for the incentive-pool rules.
+#[derive(Debug, Clone)]
+pub struct PoolRules {
+    /// Withdrawals of at least this amount (in stroops) are flagged.
+    pub large_withdrawal_amount: i128,
+    /// More than this many approvals within `approval_window_ledgers` is a burst.
+    pub approval_max_count: usize,
+    pub approval_window_ledgers: u32,
+    /// How long a re-added attester stays "recent" for claim alerting.
+    pub readd_window_ledgers: u32,
+}
+
+impl Default for PoolRules {
+    fn default() -> PoolRules {
+        PoolRules {
+            large_withdrawal_amount: 1_000_000_000_000,
+            approval_max_count: 5,
+            approval_window_ledgers: 20,
+            readd_window_ledgers: 100,
+        }
+    }
+}
 
 pub struct Engine {
     rules: Vec<EventRule>,
@@ -20,6 +47,11 @@ pub struct Engine {
     /// Wasm hash each contract is expected to run, from `upgraded` events or
     /// the first observation.
     expected_wasm: BTreeMap<String, String>,
+    pool: PoolRules,
+    /// Ledgers of recent pool approvals, for burst detection.
+    approval_window: VecDeque<u32>,
+    /// Attesters that were (re-)added, with the ledger of the add.
+    readded_attesters: BTreeMap<String, u32>,
 }
 
 /// Default rules from the issue: privileged changes are critical, pause
@@ -76,7 +108,16 @@ impl Engine {
             explorer_tx_url: cfg.explorer_tx_url.clone(),
             rate_window: VecDeque::new(),
             expected_wasm: BTreeMap::new(),
+            pool: PoolRules::default(),
+            approval_window: VecDeque::new(),
+            readded_attesters: BTreeMap::new(),
         }
+    }
+
+    /// Override the incentive-pool rule thresholds.
+    pub fn with_pool_rules(mut self, pool: PoolRules) -> Engine {
+        self.pool = pool;
+        self
     }
 
     fn alert(&self, kind: &str, severity: Severity, summary: String, e: &Event) -> Alert {
@@ -138,6 +179,8 @@ impl Engine {
             self.expected_wasm.insert(e.contract.clone(), hash);
         }
 
+        alerts.extend(self.evaluate_pool(e));
+
         if let Some(rate) = &self.rate {
             if e.name == rate.event {
                 self.rate_window.push_back(e.ledger);
@@ -158,6 +201,85 @@ impl Engine {
                     alerts.push(self.alert(MASS_ENROLLMENT, rate.severity, summary, e));
                 }
             }
+        }
+
+        alerts
+    }
+
+    /// Incentive-pool rules: large withdrawals, approval bursts, claims by
+    /// recently re-added attesters, and pool pauses.
+    fn evaluate_pool(&mut self, e: &Event) -> Vec<Alert> {
+        let mut alerts = Vec::new();
+
+        match e.name.as_str() {
+            "attester_added" | "attester_readded" => {
+                // The first topic carries the attester address.
+                if let Some(attester) = e.topics.first() {
+                    self.readded_attesters
+                        .insert(attester.to_ascii_lowercase(), e.ledger);
+                }
+            }
+            "withdrawal" | "withdrawn" => {
+                if let Some(amount) = parse_amount(&e.data) {
+                    if amount >= self.pool.large_withdrawal_amount {
+                        alerts.push(self.alert(
+                            LARGE_WITHDRAWAL,
+                            Severity::High,
+                            format!(
+                                "withdrawal of {amount} on {} exceeds threshold {}",
+                                e.contract, self.pool.large_withdrawal_amount
+                            ),
+                            e,
+                        ));
+                    }
+                }
+            }
+            "approval" | "approved" => {
+                self.approval_window.push_back(e.ledger);
+                while let Some(&first) = self.approval_window.front() {
+                    if e.ledger.saturating_sub(first) >= self.pool.approval_window_ledgers {
+                        self.approval_window.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if self.approval_window.len() == self.pool.approval_max_count + 1 {
+                    let summary = format!(
+                        "{} approvals within {} ledgers (approval burst)",
+                        self.approval_window.len(),
+                        self.pool.approval_window_ledgers
+                    );
+                    alerts.push(self.alert(APPROVAL_BURST, Severity::High, summary, e));
+                }
+            }
+            "claim" | "claimed" => {
+                if let Some(attester) = e.topics.first() {
+                    let key = attester.to_ascii_lowercase();
+                    if let Some(&added) = self.readded_attesters.get(&key) {
+                        if e.ledger.saturating_sub(added) <= self.pool.readd_window_ledgers {
+                            alerts.push(self.alert(
+                                CLAIM_BY_READDED_ATTESTER,
+                                Severity::High,
+                                format!(
+                                    "claim by attester {attester} re-added at ledger {added}"
+                                ),
+                                e,
+                            ));
+                        }
+                    }
+                }
+            }
+            "pool_paused" | "paused" => {
+                if e.name == "pool_paused" || e.contract.to_ascii_lowercase().contains("pool") {
+                    alerts.push(self.alert(
+                        POOL_PAUSED,
+                        Severity::High,
+                        format!("incentive pool paused on {}", e.contract),
+                        e,
+                    ));
+                }
+            }
+            _ => {}
         }
 
         alerts
@@ -238,6 +360,23 @@ impl HealthMonitor {
         }
         None
     }
+}
+
+/// Parse an amount from event data, which may be a bare integer or a JSON
+/// object with an `amount` field.
+fn parse_amount(data: &str) -> Option<i128> {
+    let data = data.trim();
+    if let Ok(n) = data.parse::<i128>() {
+        return Some(n);
+    }
+    let key = "\"amount\"";
+    let idx = data.find(key)?;
+    let rest = &data[idx + key.len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i128>().ok()
 }
 
 fn self_alert(kind: &str, summary: String, ledger: u32) -> Alert {
@@ -421,5 +560,87 @@ mod tests {
         assert!(Engine::new(&cfg())
             .evaluate(&ev("attestation_recorded", 1, &[]))
             .is_empty());
+    }
+
+    fn pool_engine() -> Engine {
+        Engine::new(&cfg()).with_pool_rules(PoolRules {
+            large_withdrawal_amount: 1_000,
+            approval_max_count: 2,
+            approval_window_ledgers: 10,
+            readd_window_ledgers: 50,
+        })
+    }
+
+    fn pool_ev(name: &str, ledger: u32, topics: &[&str], data: &str) -> Event {
+        let mut e = ev(name, ledger, topics);
+        e.contract = "CPOOL".into();
+        e.data = data.into();
+        e
+    }
+
+    #[test]
+    fn large_withdrawal_is_flagged() {
+        let mut e = pool_engine();
+        let a = e.evaluate(&pool_ev("withdrawal", 1, &["GATT"], "1500"));
+        assert_eq!(kinds(&a), vec![(LARGE_WITHDRAWAL, Severity::High)]);
+        let a = e.evaluate(&pool_ev("withdrawal", 2, &["GATT"], "{\"amount\": 2000}"));
+        assert_eq!(kinds(&a), vec![(LARGE_WITHDRAWAL, Severity::High)]);
+    }
+
+    #[test]
+    fn small_withdrawal_is_ignored() {
+        let mut e = pool_engine();
+        assert!(e
+            .evaluate(&pool_ev("withdrawal", 1, &["GATT"], "999"))
+            .is_empty());
+    }
+
+    #[test]
+    fn approval_burst_fires_once() {
+        let mut e = pool_engine();
+        let mut fired = 0;
+        for ledger in 1..=5 {
+            fired += e
+                .evaluate(&pool_ev("approval", ledger, &["GATT"], ""))
+                .iter()
+                .filter(|a| a.kind == APPROVAL_BURST)
+                .count();
+        }
+        assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn slow_approvals_do_not_burst() {
+        let mut e = pool_engine();
+        for i in 0..5 {
+            assert!(e
+                .evaluate(&pool_ev("approval", i * 20, &["GATT"], ""))
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn claim_by_recently_readded_attester_is_flagged() {
+        let mut e = pool_engine();
+        e.evaluate(&pool_ev("attester_readded", 10, &["GATT"], ""));
+        let a = e.evaluate(&pool_ev("claim", 20, &["GATT"], ""));
+        assert_eq!(
+            kinds(&a),
+            vec![(CLAIM_BY_READDED_ATTESTER, Severity::High)]
+        );
+    }
+
+    #[test]
+    fn claim_by_long_standing_attester_is_ignored() {
+        let mut e = pool_engine();
+        e.evaluate(&pool_ev("attester_added", 1, &["GATT"], ""));
+        assert!(e.evaluate(&pool_ev("claim", 100, &["GATT"], "")).is_empty());
+    }
+
+    #[test]
+    fn pool_pause_is_flagged() {
+        let mut e = pool_engine();
+        let a = e.evaluate(&pool_ev("pool_paused", 1, &[], ""));
+        assert_eq!(kinds(&a), vec![(POOL_PAUSED, Severity::High)]);
     }
 }
