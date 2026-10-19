@@ -51,7 +51,7 @@ zlib deflate (RFC 1951) — optional, applied only when it reduces size ≥ 4 by
 base45 (RFC 9285) — for QR alphanumeric mode (45-character alphabet)
      │
      ▼
-QR code (ISO/IEC 18004), alphanumeric mode, EC level M
+QR code (ISO/IEC 18004), alphanumeric mode, EC level M (recommended default; see §5.4)
 ```
 
 The `LFQR:` prefix (5 chars, analogous to the EU DCC `HC1:` prefix) precedes the base45 payload
@@ -162,6 +162,28 @@ Base45-encoded: ≈ 1118 chars.
 → **QR version 16, EC level M** (capacity 1188 chars). Fits.
 
 Maximum supported profile without patient signature fits in QR version ≤ 20.
+
+### 5.4 Recommended default EC level
+
+The recommended default EC level is **M**, unchanged from earlier drafts of this spec. This
+default was validated against the seeded physical-robustness corpus described in
+[`qr-robustness-report.md`](./qr-robustness-report.md). The report measures decode success
+across EC levels L/M/Q/H and payload sizes under synthetic blur, perspective, noise,
+occlusion, and JPEG degradation.
+
+Summary of findings (see the report for full tables and the raw data files):
+
+- EC level **M** is the best trade-off for the minimal and paramedic profiles: it retains the
+  compact QR versions in §5.1–§5.2 while tolerating moderate blur and JPEG artifacts.
+- EC level **L** gains capacity but loses decode robustness under occlusion and low contrast,
+  and is not recommended for printed emergency cards.
+- EC levels **Q** and **H** improve robustness under heavy occlusion at the cost of larger QR
+  versions; they are recommended only for the full profile (§5.3) when print quality is
+  expected to be poor.
+
+Because the default EC level is **not changing**, no version bump is required under the
+versioning policy. Encoders MAY select a higher EC level for the full profile; decoders MUST
+accept any EC level, since EC level is not encoded in the payload.
 
 ---
 
@@ -382,6 +404,10 @@ Test vectors, including rendered QR images for manual camera tests, are in
 
 Negative vectors (truncated, wrong network, unknown version) are in
 [`crates/lafiya-qr/vectors/negative/`](../../crates/lafiya-qr/vectors/negative/).
+
+Physical-robustness measurements (decode success vs. EC level and payload size under seeded
+degradations) are documented in [`qr-robustness-report.md`](./qr-robustness-report.md), with
+plots stored as data (CSV/JSON) rather than image binaries.
 
 ---
 
