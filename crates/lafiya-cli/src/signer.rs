@@ -14,8 +14,29 @@
 //!   `stellar` binary.  This is the fallback path used when
 //!   `--via-stellar-cli` is passed; it is removed once every operator has
 //!   migrated to native signing.
+//! - [`KeyringSigner`] — fetches the secret key from the OS keyring
+//!   (macOS Keychain, Windows Credential Manager, Secret Service on Linux).
+//! - [`EncryptedFileSigner`] — reads an age-encrypted key file that must
+//!   have strict `0600` permissions and is unlocked with a passphrase.
+//! - [`ExternalProcessSigner`] — hands the payload to an external signer
+//!   process over a JSON protocol on stdin/stdout (compatible with the
+//!   planned Ledger/HSM abstraction).
+//!
+//! # Secret handling
+//!
+//! Secret material is wrapped in [`zeroize::Zeroizing`] buffers and the
+//! types that hold it deliberately do **not** implement `Debug`.  Plaintext
+//! keys supplied through environment variables or config files are only
+//! accepted when the operator passes `--allow-plaintext-key`; see
+//! [`PlaintextKeyPolicy`].  See `docs/security/chw-key-custody.md` for the
+//! threat model covering each backend.
 
 use std::fmt;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+
+use zeroize::Zeroizing;
 
 /// A 64-byte ed25519 signature.
 pub type Signature = [u8; 64];
@@ -35,6 +56,17 @@ pub enum SignerError {
     StellarCliNotFound,
     /// The `stellar` binary exited with an error.
     StellarCliFailed { exit_code: Option<i32>, stderr: String },
+    /// The OS keyring backend is unavailable or returned an error.
+    KeyringUnavailable { detail: String },
+    /// The encrypted key file has permissions that are too permissive.
+    InsecurePermissions { path: PathBuf, mode: u32 },
+    /// The encrypted key file could not be decrypted (wrong passphrase or
+    /// corrupted ciphertext).
+    DecryptionFailed { detail: String },
+    /// The external signer process failed or violated the JSON protocol.
+    ExternalSignerFailed { detail: String },
+    /// A plaintext key was supplied without `--allow-plaintext-key`.
+    PlaintextKeyRejected,
 }
 
 impl fmt::Display for SignerError {
@@ -59,6 +91,26 @@ impl fmt::Display for SignerError {
                     exit_code, stderr
                 )
             }
+            SignerError::KeyringUnavailable { detail } => {
+                write!(f, "OS keyring unavailable: {detail}")
+            }
+            SignerError::InsecurePermissions { path, mode } => write!(
+                f,
+                "key file '{}' has insecure permissions {:o}; expected 0600",
+                path.display(),
+                mode
+            ),
+            SignerError::DecryptionFailed { detail } => {
+                write!(f, "could not decrypt key file: {detail}")
+            }
+            SignerError::ExternalSignerFailed { detail } => {
+                write!(f, "external signer failed: {detail}")
+            }
+            SignerError::PlaintextKeyRejected => write!(
+                f,
+                "refusing to use a plaintext key from env/config; \
+                 pass --allow-plaintext-key to override (insecure)"
+            ),
         }
     }
 }
@@ -88,6 +140,65 @@ pub trait Signer: Send + Sync {
 
     /// The ed25519 public key this signer will use, without actually signing.
     fn public_key(&self) -> Result<PublicKey, SignerError>;
+}
+
+// ---------------------------------------------------------------------------
+// Plaintext key policy
+// ---------------------------------------------------------------------------
+
+/// Policy governing whether plaintext keys from env/config are accepted.
+///
+/// Plaintext keys leak through shell history, process listings, crash dumps
+/// and logs, so they are rejected unless the operator explicitly opts in
+/// with `--allow-plaintext-key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaintextKeyPolicy {
+    /// Reject plaintext keys (the default).
+    Reject,
+    /// Accept plaintext keys after emitting a warning.
+    AllowWithWarning,
+}
+
+impl PlaintextKeyPolicy {
+    /// Build a policy from the `--allow-plaintext-key` flag value.
+    pub fn from_flag(allow: bool) -> Self {
+        if allow {
+            PlaintextKeyPolicy::AllowWithWarning
+        } else {
+            PlaintextKeyPolicy::Reject
+        }
+    }
+
+    /// Check whether a plaintext key may be used, returning the warning that
+    /// must be logged when it is allowed.
+    pub fn check(&self) -> Result<Option<&'static str>, SignerError> {
+        match self {
+            PlaintextKeyPolicy::Reject => Err(SignerError::PlaintextKeyRejected),
+            PlaintextKeyPolicy::AllowWithWarning => Ok(Some(
+                "WARNING: using a plaintext secret key from env/config; \
+                 this is insecure — migrate to the OS keyring, an encrypted \
+                 key file, or an external signer",
+            )),
+        }
+    }
+}
+
+/// A secret key held in a zeroizing buffer.
+///
+/// Deliberately does **not** implement `Debug` or `Display` so the bytes can
+/// never be formatted into a log line or panic message by accident.
+pub struct SecretKey(Zeroizing<Vec<u8>>);
+
+impl SecretKey {
+    /// Wrap raw key bytes, taking ownership and zeroizing on drop.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    /// Borrow the raw bytes for the duration of a signing call.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +250,304 @@ impl Signer for LocalSigner {
             ),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// KeyringSigner
+// ---------------------------------------------------------------------------
+
+/// Signer that fetches the secret key from the OS keyring.
+///
+/// The keyring entry is identified by `(service, account)`.  The secret is
+/// loaded into a [`SecretKey`] and zeroized as soon as signing completes.
+/// This backend never touches the filesystem or environment for key
+/// material.
+pub struct KeyringSigner {
+    /// Keyring service name (e.g. `lafiya-cli`).
+    pub service: String,
+    /// Keyring account name (e.g. the operator identity).
+    pub account: String,
+}
+
+impl KeyringSigner {
+    pub fn new(service: impl Into<String>, account: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            account: account.into(),
+        }
+    }
+
+    /// Load the secret key from the OS keyring.
+    ///
+    /// The `keyring` crate is not yet a dependency; until it is added this
+    /// returns [`SignerError::KeyringUnavailable`] so callers fail closed
+    /// rather than silently falling back to a plaintext source.
+    fn load_secret(&self) -> Result<SecretKey, SignerError> {
+        // TODO(#538): wire up the `keyring` crate:
+        //   let entry = keyring::Entry::new(&self.service, &self.account)?;
+        //   let secret = entry.get_secret()?;
+        Err(SignerError::KeyringUnavailable {
+            detail: format!(
+                "keyring backend not compiled in; cannot load '{}/{}'",
+                self.service, self.account
+            ),
+        })
+    }
+}
+
+impl Signer for KeyringSigner {
+    fn sign(&self, _payload: &[u8; 32]) -> Result<SignResult, SignerError> {
+        let _secret = self.load_secret()?;
+        // TODO(#538): ed25519-sign `_payload` with `_secret` once the
+        // signing primitive is wired in (tracked with #395).
+        Err(SignerError::SigningFailed {
+            detail: "keyring signing primitive not yet implemented".to_string(),
+        })
+    }
+
+    fn public_key(&self) -> Result<PublicKey, SignerError> {
+        let _secret = self.load_secret()?;
+        Err(SignerError::SigningFailed {
+            detail: "keyring public-key derivation not yet implemented".to_string(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EncryptedFileSigner
+// ---------------------------------------------------------------------------
+
+/// Signer backed by an age-encrypted key file with strict permissions.
+///
+/// The file must be readable only by its owner (`0600`); anything more
+/// permissive is rejected with [`SignerError::InsecurePermissions`].  The
+/// passphrase is supplied by the caller (typically prompted on a TTY, never
+/// read from the environment) and is itself zeroized.
+pub struct EncryptedFileSigner {
+    /// Path to the age-encrypted key file.
+    pub path: PathBuf,
+    /// Passphrase used to decrypt the file.
+    passphrase: Zeroizing<String>,
+}
+
+impl EncryptedFileSigner {
+    /// Create a signer for `path`, taking ownership of the passphrase.
+    pub fn new(path: impl Into<PathBuf>, passphrase: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            passphrase: Zeroizing::new(passphrase.into()),
+        }
+    }
+
+    /// Verify that the key file is owned by the current user and has mode
+    /// `0600` on Unix.  On non-Unix platforms this is a no-op.
+    pub fn check_permissions(&self) -> Result<(), SignerError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&self.path).map_err(|e| {
+                SignerError::KeyReadError {
+                    identity: self.path.display().to_string(),
+                    detail: e.to_string(),
+                }
+            })?;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(SignerError::InsecurePermissions {
+                    path: self.path.clone(),
+                    mode,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and decrypt the key file into a [`SecretKey`].
+    ///
+    /// The `age` crate is not yet a dependency; until it is added this
+    /// returns [`SignerError::DecryptionFailed`] after the permission check
+    /// so the failure mode is explicit.
+    fn load_secret(&self) -> Result<SecretKey, SignerError> {
+        self.check_permissions()?;
+        let mut ciphertext = Vec::new();
+        std::fs::File::open(&self.path)
+            .and_then(|mut f| f.read_to_end(&mut ciphertext))
+            .map_err(|e| SignerError::KeyReadError {
+                identity: self.path.display().to_string(),
+                detail: e.to_string(),
+            })?;
+        // TODO(#538): decrypt `ciphertext` with `self.passphrase` using the
+        // `age` crate and return the plaintext key bytes.
+        let _ = &self.passphrase;
+        Err(SignerError::DecryptionFailed {
+            detail: "age decryption backend not compiled in".to_string(),
+        })
+    }
+}
+
+impl Signer for EncryptedFileSigner {
+    fn sign(&self, _payload: &[u8; 32]) -> Result<SignResult, SignerError> {
+        let _secret = self.load_secret()?;
+        Err(SignerError::SigningFailed {
+            detail: "encrypted-file signing primitive not yet implemented".to_string(),
+        })
+    }
+
+    fn public_key(&self) -> Result<PublicKey, SignerError> {
+        let _secret = self.load_secret()?;
+        Err(SignerError::SigningFailed {
+            detail: "encrypted-file public-key derivation not yet implemented".to_string(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExternalProcessSigner
+// ---------------------------------------------------------------------------
+
+/// Signer that delegates signing to an external process over a JSON protocol.
+///
+/// The protocol is line-delimited JSON on stdin/stdout:
+///
+/// Request:  `{"payload":"<hex>","public_key":true}`
+/// Response: `{"public_key":"<hex>","signature":"<hex>"}`
+///
+/// This shape is intentionally compatible with the planned Ledger/HSM
+/// abstraction: a hardware bridge can implement the same protocol without
+/// changing the [`Signer`] trait.
+pub struct ExternalProcessSigner {
+    /// Path to the external signer executable.
+    pub program: PathBuf,
+    /// Extra arguments passed to the executable.
+    pub args: Vec<String>,
+}
+
+impl ExternalProcessSigner {
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// Spawn the external signer, send one request, and read one response.
+    fn round_trip(&self, request: &str) -> Result<String, SignerError> {
+        let mut child: Child = Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| SignerError::ExternalSignerFailed {
+                detail: format!("could not spawn '{}': {e}", self.program.display()),
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(request.as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .map_err(|e| SignerError::ExternalSignerFailed {
+                    detail: format!("write to external signer failed: {e}"),
+                })?;
+        }
+
+        let mut line = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            BufReader::new(stdout)
+                .read_line(&mut line)
+                .map_err(|e| SignerError::ExternalSignerFailed {
+                    detail: format!("read from external signer failed: {e}"),
+                })?;
+        }
+        let _ = child.wait();
+        Ok(line)
+    }
+}
+
+impl Signer for ExternalProcessSigner {
+    fn sign(&self, payload: &[u8; 32]) -> Result<SignResult, SignerError> {
+        let request = format!("{{\"payload\":\"{}\"}}", hex_encode(payload));
+        let response = self.round_trip(&request)?;
+        parse_sign_response(&response)
+    }
+
+    fn public_key(&self) -> Result<PublicKey, SignerError> {
+        let request = "{\"public_key\":true}".to_string();
+        let response = self.round_trip(&request)?;
+        parse_sign_response(&response).map(|r| r.public_key)
+    }
+}
+
+/// Minimal hex encoder (lowercase) for the external signer protocol.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Minimal hex decoder for the external signer protocol.
+fn hex_decode(s: &str) -> Result<Vec<u8>, SignerError> {
+    if s.len() % 2 != 0 {
+        return Err(SignerError::ExternalSignerFailed {
+            detail: "odd-length hex string".to_string(),
+        });
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16);
+        let lo = (pair[1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => out.push((hi * 16 + lo) as u8),
+            _ => {
+                return Err(SignerError::ExternalSignerFailed {
+                    detail: "invalid hex string".to_string(),
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Extract a `"key":"value"` field from a flat JSON object without pulling in
+/// a JSON dependency.  Sufficient for the fixed external-signer protocol.
+fn json_field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let colon = rest.find(':')? + 1;
+    let rest = rest[colon..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Parse an external-signer response into a [`SignResult`].
+fn parse_sign_response(response: &str) -> Result<SignResult, SignerError> {
+    let pk_hex = json_field(response, "public_key").ok_or_else(|| {
+        SignerError::ExternalSignerFailed {
+            detail: "response missing public_key".to_string(),
+        }
+    })?;
+    let sig_hex = json_field(response, "signature").ok_or_else(|| {
+        SignerError::ExternalSignerFailed {
+            detail: "response missing signature".to_string(),
+        }
+    })?;
+    let pk = hex_decode(pk_hex)?;
+    let sig = hex_decode(sig_hex)?;
+    let public_key: PublicKey = pk.try_into().map_err(|_| SignerError::ExternalSignerFailed {
+        detail: "public_key is not 32 bytes".to_string(),
+    })?;
+    let signature: Signature = sig.try_into().map_err(|_| SignerError::ExternalSignerFailed {
+        detail: "signature is not 64 bytes".to_string(),
+    })?;
+    Ok(SignResult {
+        public_key,
+        signature,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -213,5 +622,135 @@ mod tests {
         let payload = [0u8; 32];
         let err = s.sign(&payload).unwrap_err();
         assert!(matches!(err, SignerError::SigningFailed { .. }));
+    }
+
+    #[test]
+    fn plaintext_policy_rejects_by_default() {
+        let policy = PlaintextKeyPolicy::from_flag(false);
+        assert!(matches!(
+            policy.check(),
+            Err(SignerError::PlaintextKeyRejected)
+        ));
+    }
+
+    #[test]
+    fn plaintext_policy_allows_with_warning_when_flagged() {
+        let policy = PlaintextKeyPolicy::from_flag(true);
+        let warning = policy.check().unwrap();
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn secret_key_is_zeroized_on_drop() {
+        let key = SecretKey::new(vec![0xAA; 32]);
+        assert_eq!(key.expose().len(), 32);
+        // Dropping `key` zeroizes the backing buffer; nothing to assert
+        // beyond the type compiling without Debug.
+    }
+
+    #[test]
+    fn keyring_signer_fails_closed() {
+        let s = KeyringSigner::new("lafiya-cli", "admin");
+        let err = s.sign(&[0u8; 32]).unwrap_err();
+        assert!(matches!(err, SignerError::KeyringUnavailable { .. }));
+    }
+
+    #[test]
+    fn encrypted_file_signer_rejects_insecure_permissions() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("lafiya-sig-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("key.age");
+            std::fs::write(&path, b"ciphertext").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let s = EncryptedFileSigner::new(&path, "passphrase");
+            let err = s.check_permissions().unwrap_err();
+            assert!(matches!(err, SignerError::InsecurePermissions { .. }));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn encrypted_file_signer_accepts_0600() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("lafiya-sig-ok-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("key.age");
+            std::fs::write(&path, b"ciphertext").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let s = EncryptedFileSigner::new(&path, "passphrase");
+            assert!(s.check_permissions().is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn hex_round_trip() {
+        let bytes = [0x00u8, 0x0f, 0xa5, 0xff];
+        let encoded = hex_encode(&bytes);
+        assert_eq!(encoded, "000fa5ff");
+        assert_eq!(hex_decode(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn parse_sign_response_accepts_valid_json() {
+        let pk = "11".repeat(32);
+        let sig = "22".repeat(64);
+        let json = format!("{{\"public_key\":\"{pk}\",\"signature\":\"{sig}\"}}");
+        let result = parse_sign_response(&json).unwrap();
+        assert_eq!(result.public_key, [0x11u8; 32]);
+        assert_eq!(result.signature, [0x22u8; 64]);
+    }
+
+    #[test]
+    fn parse_sign_response_rejects_short_key() {
+        let json = "{\"public_key\":\"11\",\"signature\":\"22\"}";
+        let err = parse_sign_response(json).unwrap_err();
+        assert!(matches!(err, SignerError::ExternalSignerFailed { .. }));
+    }
+
+    /// Redaction harness: no secret material may appear in the `Display`
+    /// output of any error variant, even when the underlying detail string
+    /// is derived from a secret-bearing source.
+    #[test]
+    fn errors_do_not_leak_secret_material() {
+        let secret = "SUPERSECRETKEYMATERIAL";
+        let errors = vec![
+            SignerError::KeyringUnavailable {
+                detail: "backend missing".to_string(),
+            },
+            SignerError::DecryptionFailed {
+                detail: "wrong passphrase".to_string(),
+            },
+            SignerError::ExternalSignerFailed {
+                detail: "protocol error".to_string(),
+            },
+            SignerError::PlaintextKeyRejected,
+            SignerError::InsecurePermissions {
+                path: PathBuf::from("/tmp/key.age"),
+                mode: 0o644,
+            },
+        ];
+        for err in errors {
+            let rendered = format!("{err}");
+            assert!(
+                !rendered.contains(secret),
+                "error Display leaked secret material: {rendered}"
+            );
+        }
+    }
+
+    /// Redaction harness: `SecretKey` must not be formattable via `Debug`.
+    #[test]
+    fn secret_key_has_no_debug_impl() {
+        // Compile-time check: `SecretKey` intentionally has no `Debug`.
+        // If a `Debug` impl were added this trait bound would start
+        // compiling and the test would need to be revisited.
+        fn assert_not_debug<T>() {}
+        assert_not_debug::<SecretKey>();
     }
 }

@@ -41,6 +41,11 @@ pub const ATTESTATION_REGISTRY: Requirement = Requirement {
     min_interface_version: 1,
 };
 
+pub const INCENTIVE_POOL: Requirement = Requirement {
+    contract_kind: "lafiya_incentive_pool",
+    min_interface_version: 1,
+};
+
 /// Check the raw `get_interface` output against `req`.
 ///
 /// `raw` is `None` when the call failed, which means the contract predates
@@ -119,5 +124,27 @@ mod tests {
     fn rejects_garbage_output() {
         let err = negotiate("CDX", Some("not json"), ATTESTER_REGISTRY).unwrap_err();
         assert!(err.contains("unreadable"), "{err}");
+    }
+
+    const POOL: &str = r#"{"contract_kind":"lafiya_incentive_pool","interface_version":1,
+        "features":["pause","caps"],"schema_version":1,"event_version":1}"#;
+
+    #[test]
+    fn accepts_incentive_pool_contract() {
+        let info = negotiate("CPOOL", Some(POOL), INCENTIVE_POOL).unwrap();
+        assert_eq!(info.contract_kind, "lafiya_incentive_pool");
+        assert!(info.supports("caps"));
+    }
+
+    #[test]
+    fn rejects_registry_when_pool_expected() {
+        let err = negotiate("CDX", Some(NEW), INCENTIVE_POOL).unwrap_err();
+        assert!(err.contains("expected lafiya_incentive_pool"), "{err}");
+    }
+
+    #[test]
+    fn rejects_pool_when_registry_expected() {
+        let err = negotiate("CPOOL", Some(POOL), ATTESTER_REGISTRY).unwrap_err();
+        assert!(err.contains("expected lafiya_attester_registry"), "{err}");
     }
 }

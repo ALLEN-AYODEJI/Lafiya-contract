@@ -48,6 +48,83 @@ pub struct SimulateResult {
     pub invocation_summary: Option<String>,
 }
 
+/// A single ledger key in the transaction footprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FootprintKey {
+    /// XDR-encoded `LedgerKey`.
+    pub key_xdr: String,
+    /// Best-effort human-readable rendering of the key (e.g. contract id +
+    /// storage key), or `None` when it cannot be decoded.
+    pub label: Option<String>,
+}
+
+/// The decoded ledger footprint of a simulated transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerFootprint {
+    /// Keys the transaction reads.
+    pub read_only: Vec<FootprintKey>,
+    /// Keys the transaction reads and writes.
+    pub read_write: Vec<FootprintKey>,
+}
+
+/// A single ledger entry that changes as a result of the transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateChange {
+    /// XDR-encoded `LedgerKey` identifying the entry.
+    pub key_xdr: String,
+    /// Human-readable rendering of the key, when available.
+    pub label: Option<String>,
+    /// XDR-encoded entry value before the transaction, or `None` if the
+    /// entry is being created.
+    pub before_xdr: Option<String>,
+    /// XDR-encoded entry value after the transaction, or `None` if the
+    /// entry is being removed.
+    pub after_xdr: Option<String>,
+}
+
+/// A balance change for a single account or trustline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceChange {
+    /// The account (G...) or contract (C...) whose balance changes.
+    pub account: String,
+    /// Asset identifier (e.g. `native`, `CODE:ISSUER`).
+    pub asset: String,
+    /// Signed delta in stroops (or the asset's smallest unit).
+    pub delta: i128,
+}
+
+/// A contract event emitted by the simulated transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractEvent {
+    /// The contract that emitted the event (C...).
+    pub contract_id: String,
+    /// The event topics, rendered as strings.
+    pub topics: Vec<String>,
+    /// The event body, rendered as a string.
+    pub data: String,
+}
+
+/// The full, deterministic preview of a simulated transaction.
+///
+/// This is the data the CLI renders before asking the operator to confirm a
+/// mutating submit (issue #536).  It is intentionally transport-agnostic so
+/// it can be serialised to JSON for change-control tickets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimulationPreview {
+    /// The decoded ledger footprint.
+    pub footprint: LedgerFootprint,
+    /// Ledger entries that change, with before/after values.
+    pub state_changes: Vec<StateChange>,
+    /// Balance changes for accounts and trustlines.
+    pub balance_changes: Vec<BalanceChange>,
+    /// Contract events emitted by the transaction.
+    pub events: Vec<ContractEvent>,
+    /// The assembled transaction XDR (footprint + resource fee applied).
+    pub assembled_xdr: String,
+    /// Minimum resource fee (in stroops) from the simulation.
+    pub min_resource_fee: u64,
+}
+
 /// The outcome of `sendTransaction`.
 #[derive(Debug, Clone)]
 pub struct SendResult {
@@ -123,6 +200,9 @@ pub enum RpcClientError {
     StellarCli { detail: String },
     /// Feature not yet implemented in this stub.
     NotImplemented { detail: String },
+    /// The transaction could not be simulated.  Callers must fail closed and
+    /// refuse to submit when this is returned (issue #536).
+    SimulationFailed { detail: String },
 }
 
 impl fmt::Display for RpcClientError {
@@ -138,6 +218,9 @@ impl fmt::Display for RpcClientError {
             RpcClientError::StellarCli { detail } => write!(f, "stellar CLI error: {detail}"),
             RpcClientError::NotImplemented { detail } => {
                 write!(f, "not yet implemented: {detail}")
+            }
+            RpcClientError::SimulationFailed { detail } => {
+                write!(f, "simulation failed: {detail}")
             }
         }
     }
@@ -168,6 +251,17 @@ pub trait RpcClient: Send + Sync {
         &self,
         unsigned_xdr: &str,
     ) -> Result<SimulateResult, RpcClientError>;
+
+    /// Simulate a transaction and return the full preview (footprint, state
+    /// changes, balance changes, and events) used to render the pre-submit
+    /// diff (issue #536).
+    ///
+    /// Implementations must return [`RpcClientError::SimulationFailed`] when
+    /// the simulation cannot be completed so callers can fail closed.
+    fn simulate_preview(
+        &self,
+        unsigned_xdr: &str,
+    ) -> Result<SimulationPreview, RpcClientError>;
 
     /// Submit a signed `TransactionEnvelope` and return the transaction hash
     /// and immediate status.
@@ -242,6 +336,16 @@ impl RpcClient for NativeRpcClient {
     fn simulate(&self, _unsigned_xdr: &str) -> Result<SimulateResult, RpcClientError> {
         Err(RpcClientError::NotImplemented {
             detail: "NativeRpcClient::simulate — add stellar-xdr + HTTP client (issue #395)"
+                .to_string(),
+        })
+    }
+
+    fn simulate_preview(
+        &self,
+        _unsigned_xdr: &str,
+    ) -> Result<SimulationPreview, RpcClientError> {
+        Err(RpcClientError::NotImplemented {
+            detail: "NativeRpcClient::simulate_preview — add stellar-xdr + HTTP client (issue #395)"
                 .to_string(),
         })
     }
@@ -326,6 +430,16 @@ impl RpcClient for StellarCliClient {
     fn simulate(&self, _unsigned_xdr: &str) -> Result<SimulateResult, RpcClientError> {
         Err(RpcClientError::StellarCli {
             detail: "simulate is not available via the stellar CLI subprocess path".to_string(),
+        })
+    }
+
+    fn simulate_preview(
+        &self,
+        _unsigned_xdr: &str,
+    ) -> Result<SimulationPreview, RpcClientError> {
+        Err(RpcClientError::StellarCli {
+            detail: "simulate_preview is not available via the stellar CLI subprocess path"
+                .to_string(),
         })
     }
 
@@ -417,6 +531,31 @@ mod tests {
             matches!(err, RpcClientError::NotImplemented { .. }),
             "expected NotImplemented, got: {err}"
         );
+    }
+
+    #[test]
+    fn native_client_simulate_preview_not_implemented() {
+        let client = NativeRpcClient::new("https://example.org", "Test Net");
+        let err = client.simulate_preview("fake_xdr").unwrap_err();
+        assert!(
+            matches!(err, RpcClientError::NotImplemented { .. }),
+            "expected NotImplemented, got: {err}"
+        );
+    }
+
+    #[test]
+    fn stellar_cli_simulate_preview_errors() {
+        let client = StellarCliClient::new("https://example.org", "Test Net");
+        let err = client.simulate_preview("fake_xdr").unwrap_err();
+        assert!(matches!(err, RpcClientError::StellarCli { .. }));
+    }
+
+    #[test]
+    fn simulation_failed_displays_distinctly() {
+        let err = RpcClientError::SimulationFailed {
+            detail: "boom".to_string(),
+        };
+        assert_eq!(err.to_string(), "simulation failed: boom");
     }
 
     #[test]
