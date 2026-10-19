@@ -60,7 +60,48 @@ The CHW calls `renounce_attester` (#332) from their device. If the device is
 unavailable, the admin calls `remove_attester`. Past attestations stay verifiable,
 and `lafiya-web` displays the attester as removed (ADR-0006).
 
+## 3a. Scoped device session keys (#548)
+
+The long-lived attester identity key (section 1) stays in the hardware keystore
+and is used **only** to sign `delegate_session_key(session_pk, expires_at, scope)`.
+The field device holds a short-lived **session key** that can call `attest` and
+nothing else.
+
+- **Scope:** the only supported scope is `attest`. Any other scope is rejected
+  on-chain.
+- **Expiry:** every session carries an explicit `expires_at`; there is no
+  indefinite session.
+- **Verification:** `attest` verifies session authorization **in-contract** —
+  `attester-registry` calls `is_session_valid(attester, session_pk, op)` — not
+  via a custom account. This keeps the check auditable on-chain and avoids
+  coupling custody to a specific account implementation.
+- **Revocation:** sessions are revoked automatically when the attester is
+  removed, suspended, or rotated; no separate admin action is required.
+- **Errors:** expired sessions and out-of-scope operations fail with distinct
+  errors so the app can prompt re-delegation versus a hard failure.
+
+### Recommended session lifetime
+
+| Context | Recommended `expires_at` |
+| --- | --- |
+| Normal field shift | 12 hours |
+| Extended / multi-day outreach | 24 hours maximum |
+| Any session | Never beyond the next scheduled integrity re-check (7 days) |
+
+### Threat model
+
+| Threat | Mitigation | Residual risk |
+| --- | --- | --- |
+| Session key leaked from a field device | Attest-only scope; bounded by `expires_at`; auto-revoked on removal/suspension/rotation | Attacker can attest as the CHW until expiry or admin action |
+| Identity key leaked from a phone | Identity key is only used to sign `delegate_session_key`; sessions are short-lived and scoped | A leaked identity key can still delegate **new** sessions until the attester is removed by an admin — this is why the loss/theft SLA (section 3) still applies |
+| Stolen device with unlocked keystore | User-authentication gate on the identity key; short session lifetimes | Attacker may delegate sessions while the device is unlocked |
+
+The session key does not change the loss/theft procedure: report, suspend, and
+rotate as in section 3. Suspension revokes all outstanding sessions for that
+attester.
+
 ## 4. Shared devices
+=======
 
 - **Several CHW keys on one device are allowed only in the interim model**, and
   only when each CHW has a separate Android user profile (multi-user). Each
@@ -86,6 +127,9 @@ See the dependency table in [ADR-0012](../adr/0012-chw-attester-key-custody.md#c
 Summary: rotation (#331, #355), compromise windows (#337), renouncement (#332),
 sponsored attestations (#347), passkey signers (#356), and re-enrollment after
 suspension (#324) are open; self-suspension for duress still has to be filed.
+Scoped device session keys (#548) add `delegate_session_key` and
+`is_session_valid` to `attester-registry`; their cost impact is tracked in the
+contract budgets.
 
 ## Review
 

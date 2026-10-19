@@ -43,19 +43,52 @@
       "events_size_bytes": 0,
       "estimated_fee_stroops": 10000,
       "worst_case_scenario": "cache miss"
+    },
+    "delegate_session_key": {
+      "cpu_instructions": 110000,
+      "memory_bytes": 7168,
+      "ledger_read_entries": 2,
+      "ledger_read_bytes": 384,
+      "ledger_write_entries": 2,
+      "ledger_write_bytes": 320,
+      "events_size_bytes": 160,
+      "estimated_fee_stroops": 40000,
+      "worst_case_scenario": "max sessions per attester, full scope allowlist, signature verification"
+    },
+    "is_session_valid": {
+      "cpu_instructions": 32000,
+      "memory_bytes": 1536,
+      "ledger_read_entries": 1,
+      "ledger_read_bytes": 192,
+      "ledger_write_entries": 0,
+      "ledger_write_bytes": 0,
+      "events_size_bytes": 0,
+      "estimated_fee_stroops": 12000,
+      "worst_case_scenario": "session lookup with expiry and scope check at boundary"
     }
   },
   "attestation-registry": {
     "attest": {
-      "cpu_instructions": 180000,
-      "memory_bytes": 16384,
+      "cpu_instructions": 142000,
+      "memory_bytes": 12288,
       "ledger_read_entries": 5,
-      "ledger_read_bytes": 1024,
+      "ledger_read_bytes": 896,
       "ledger_write_entries": 3,
-      "ledger_write_bytes": 512,
+      "ledger_write_bytes": 384,
       "events_size_bytes": 256,
-      "estimated_fee_stroops": 65000,
-      "worst_case_scenario": "max history, full signature verification"
+      "estimated_fee_stroops": 52000,
+      "worst_case_scenario": "ring-buffer head write at MAX_HISTORY, full signature verification"
+    },
+    "attest_with_session": {
+      "cpu_instructions": 168000,
+      "memory_bytes": 14336,
+      "ledger_read_entries": 6,
+      "ledger_read_bytes": 1088,
+      "ledger_write_entries": 3,
+      "ledger_write_bytes": 384,
+      "events_size_bytes": 256,
+      "estimated_fee_stroops": 60000,
+      "worst_case_scenario": "ring-buffer head write at MAX_HISTORY, session verification with one cross-contract read to attester-registry"
     },
     "revoke_attestation": {
       "cpu_instructions": 95000,
