@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      indexer: ${{ steps.filter.outputs.indexer }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
@@ -41,6 +42,15 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - '.config/nextest.toml'
+              - '.github/workflows/ci.yml'
+            indexer:
+              - 'crates/lafiya-indexer/**'
+              - 'deploy/observability/**'
+              - 'docs/compliance/**'
+              - 'docs/observability.md'
+              - 'docs/runbooks/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
   shell-lint:
@@ -207,6 +217,40 @@ jobs:
           path: target/wasm32v1-none/release/*.wasm
           retention-days: 7
 
+  observability:
+    name: Observability (promtool + dashboard)
+    needs: changes
+    if: needs.changes.outputs.indexer == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install promtool
+        run: |
+          PROM_VERSION="2.53.2"
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin "prometheus-${PROM_VERSION}.linux-amd64/promtool"
+          promtool --version
+      - name: Check PrometheusRule syntax
+        run: promtool check rules deploy/observability/prometheus-rules.yaml
+      - name: Unit-test alert rules
+        run: promtool test rules deploy/observability/prometheus-rules.test.yaml
+      - name: Validate Grafana dashboard JSON
+        run: python3 .github/scripts/check_grafana_dashboard.py deploy/observability/grafana-dashboard.json
+      - name: Check alert runbook links resolve
+        run: python3 .github/scripts/check_runbook_links.py deploy/observability/prometheus-rules.yaml docs/runbooks
+
+  data-inventory:
+    name: Data inventory classification
+    needs: changes
+    if: needs.changes.outputs.indexer == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fail if any column or log field lacks a classification
+        run: cargo test -p lafiya-indexer --locked data_inventory
+
   docs-checks:
     name: Docs & catalog checks
     runs-on: ubuntu-latest
@@ -226,7 +270,7 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [shell-lint, changes, fmt, clippy, build-tests, test, test-report, build-wasm, docs-checks]
+    needs: [shell-lint, changes, fmt, clippy, build-tests, test, test-report, build-wasm, observability, data-inventory, docs-checks]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate results

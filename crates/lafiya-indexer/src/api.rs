@@ -1,12 +1,15 @@
 //! Read-only HTTP/JSON API (spec: `openapi.yaml`, served at `/openapi.yaml`).
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -33,12 +36,21 @@ pub fn router(state: AppState) -> Router {
         .route("/attesters", get(attesters))
         .route("/attestations", get(attestations))
         .route("/records/{hash}/history", get(record_history))
+        .route("/events/stream", get(events_stream))
+        .route("/subscriptions", get(list_subscriptions).post(create_subscription))
+        .route(
+            "/subscriptions/{id}",
+            get(get_subscription).delete(delete_subscription),
+        )
+        .route("/subscriptions/{id}/deliveries", get(list_deliveries))
         .with_state(state)
 }
 
 pub enum ApiError {
     BadRequest(String),
+    NotFound(String),
     Db(sqlx::Error),
+    Delivery(String),
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -51,6 +63,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            Self::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            Self::Delivery(m) => (StatusCode::BAD_GATEWAY, m),
             Self::Db(e) => {
                 tracing::error!(error = %e, "api query failed");
                 (
@@ -247,4 +261,251 @@ async fn record_history(
     .fetch_all(&s.pool)
     .await?;
     Ok(Json(page(rows, limit, |h| h.event_id.clone())))
+}
+
+/// Parse a `Last-Event-ID` value into the ledger/event index used by
+/// `raw_events`. Accepts either a bare event id or `<ledger>:<event_id>`.
+fn parse_last_event_id(raw: &str) -> Result<Option<(i64, String)>, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Some((ledger, event_id)) = raw.split_once(':') {
+        let ledger: i64 = ledger
+            .parse()
+            .map_err(|_| ApiError::BadRequest("Last-Event-ID ledger must be an integer".into()))?;
+        if event_id.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Last-Event-ID event id must not be empty".into(),
+            ));
+        }
+        return Ok(Some((ledger, event_id.to_string())));
+    }
+    Ok(Some((0, raw.to_string())))
+}
+
+#[derive(Deserialize)]
+pub struct StreamQuery {
+    contract: Option<String>,
+    event_type: Option<String>,
+    attester: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct RawEvent {
+    event_id: String,
+    ledger: i64,
+    contract_id: String,
+    event_type: String,
+    attester: Option<String>,
+    payload: serde_json::Value,
+}
+
+/// Server-sent events over `raw_events`, resumable via `Last-Event-ID`.
+///
+/// The SSE `id` field is the ledger event id, so a client that reconnects with
+/// `Last-Event-ID` never observes a duplicate event id (replays are idempotent).
+async fn events_stream(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<StreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let resume = match headers.get("last-event-id") {
+        Some(v) => v
+            .to_str()
+            .map_err(|_| ApiError::BadRequest("Last-Event-ID must be ASCII".into()))
+            .and_then(parse_last_event_id)?,
+        None => None,
+    };
+    let (start_ledger, start_event_id) = resume.unwrap_or((0, String::new()));
+    let attester = q.attester.map(|a| a.to_ascii_lowercase());
+
+    let stream = async_stream::stream! {
+        let mut cursor_ledger = start_ledger;
+        let mut cursor_event = start_event_id;
+        loop {
+            let rows: Result<Vec<RawEvent>, sqlx::Error> = sqlx::query_as(
+                "SELECT event_id, ledger, contract_id, event_type, attester, payload
+                 FROM raw_events
+                 WHERE (ledger > $1 OR (ledger = $1 AND event_id > $2))
+                   AND ($3::text IS NULL OR contract_id = $3)
+                   AND ($4::text IS NULL OR event_type = $4)
+                   AND ($5::text IS NULL OR attester = $5)
+                 ORDER BY ledger, event_id LIMIT 100",
+            )
+            .bind(cursor_ledger)
+            .bind(&cursor_event)
+            .bind(&q.contract)
+            .bind(&q.event_type)
+            .bind(&attester)
+            .fetch_all(&s.pool)
+            .await;
+
+            match rows {
+                Ok(rows) if rows.is_empty() => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Ok(rows) => {
+                    for row in rows {
+                        cursor_ledger = row.ledger;
+                        cursor_event = row.event_id.clone();
+                        let data = json!({
+                            "event_id": row.event_id,
+                            "ledger": row.ledger,
+                            "contract": row.contract_id,
+                            "event_type": row.event_type,
+                            "attester": row.attester,
+                            "payload": row.payload,
+                        });
+                        yield Ok(Event::default()
+                            .id(format!("{}:{}", row.ledger, row.event_id))
+                            .event(row.event_type)
+                            .data(data.to_string()));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "sse query failed");
+                    yield Ok(Event::default()
+                        .event("error")
+                        .data(json!({ "error": "database unavailable" }).to_string()));
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Deserialize)]
+pub struct SubscriptionQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateSubscription {
+    /// Webhook target; must be `https://`.
+    pub url: String,
+    pub contract: Option<String>,
+    pub event_type: Option<String>,
+    pub attester: Option<String>,
+    /// Optional caller-supplied secret; generated when omitted.
+    pub secret: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Subscription {
+    id: String,
+    url: String,
+    contract: Option<String>,
+    event_type: Option<String>,
+    attester: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Delivery {
+    id: i64,
+    subscription_id: String,
+    event_id: String,
+    attempts: i32,
+    status: String,
+    last_error: Option<String>,
+    next_attempt_at: Option<i64>,
+}
+
+async fn list_subscriptions(
+    State(s): State<AppState>,
+    Query(q): Query<SubscriptionQuery>,
+) -> Result<Json<Page<Subscription>>, ApiError> {
+    let limit = limit(q.limit)?;
+    let rows: Vec<Subscription> = sqlx::query_as(
+        "SELECT id, url, contract, event_type, attester, created_at
+         FROM subscriptions
+         WHERE ($1::text IS NULL OR id > $1)
+         ORDER BY id LIMIT $2",
+    )
+    .bind(&q.cursor)
+    .bind(limit + 1)
+    .fetch_all(&s.pool)
+    .await?;
+    Ok(Json(page(rows, limit, |s| s.id.clone())))
+}
+
+async fn create_subscription(
+    State(s): State<AppState>,
+    Json(body): Json<CreateSubscription>,
+) -> Result<(StatusCode, Json<Subscription>), ApiError> {
+    if !body.url.starts_with("https://") {
+        return Err(ApiError::BadRequest(
+            "subscription url must use https".into(),
+        ));
+    }
+    let attester = body.attester.map(|a| a.to_ascii_lowercase());
+    let secret = body
+        .secret
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let row: Subscription = sqlx::query_as(
+        "INSERT INTO subscriptions (url, contract, event_type, attester, secret)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, url, contract, event_type, attester, created_at",
+    )
+    .bind(&body.url)
+    .bind(&body.contract)
+    .bind(&body.event_type)
+    .bind(&attester)
+    .bind(&secret)
+    .fetch_one(&s.pool)
+    .await?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn get_subscription(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Subscription>, ApiError> {
+    let row: Option<Subscription> = sqlx::query_as(
+        "SELECT id, url, contract, event_type, attester, created_at
+         FROM subscriptions WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&s.pool)
+    .await?;
+    row.map(Json)
+        .ok_or_else(|| ApiError::NotFound("subscription not found".into()))
+}
+
+async fn delete_subscription(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let res = sqlx::query("DELETE FROM subscriptions WHERE id = $1")
+        .bind(&id)
+        .execute(&s.pool)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::NotFound("subscription not found".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_deliveries(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SubscriptionQuery>,
+) -> Result<Json<Page<Delivery>>, ApiError> {
+    let limit = limit(q.limit)?;
+    let rows: Vec<Delivery> = sqlx::query_as(
+        "SELECT id, subscription_id, event_id, attempts, status, last_error, next_attempt_at
+         FROM webhook_deliveries
+         WHERE subscription_id = $1 AND ($2::bigint IS NULL OR id > $2)
+         ORDER BY id LIMIT $3",
+    )
+    .bind(&id)
+    .bind(q.cursor.as_ref().and_then(|c| c.parse::<i64>().ok()))
+    .bind(limit + 1)
+    .fetch_all(&s.pool)
+    .await?;
+    Ok(Json(page(rows, limit, |d| d.id.to_string())))
 }

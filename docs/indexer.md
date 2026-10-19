@@ -71,14 +71,25 @@ List responses are `{ "items": [...], "next_cursor": "..." | null }`; pass
 | `LAFIYA_RECONCILE_INTERVAL_SECS` | `300` | Reconciliation period. |
 | `LAFIYA_RECONCILE_SAMPLE` | `50` | Attesters and records sampled per cycle. |
 | `LAFIYA_RECONCILE_MAX_LAG` | `2` | Skip the sample while ingestion lags more ledgers than this, so in-flight changes are not reported as mismatches. |
+| `LAFIYA_RETENTION_OPERATIONAL_DAYS` | `30` | Prune derived/operational rows (delivery attempts, dead letters, request logs) older than this. `0` disables pruning. |
+| `LAFIYA_RETENTION_PRUNE_INTERVAL_SECS` | `3600` | How often the pruning job runs. |
+| `LAFIYA_WEBHOOK_SECRET` | none | HMAC-SHA256 key for webhook signatures. Required to enable webhook delivery. |
+| `LAFIYA_WEBHOOK_MAX_ATTEMPTS` | `8` | Delivery attempts before a webhook is moved to the dead-letter table. |
 | `RUST_LOG` | `info` | Log filter. |
 
 ## Running
+
+The published image is built from `crates/lafiya-indexer/Dockerfile` on a
+distroless runtime, runs as a non-root user (UID 65532), and expects a
+read-only root filesystem. It writes nothing to disk: all state lives in
+Postgres, so the only writable mounts needed are a `tmpfs` at `/tmp`.
 
 ```sh
 docker build -f crates/lafiya-indexer/Dockerfile -t lafiya-indexer .
 
 docker run -d --name lafiya-indexer -p 8080:8080 \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --user 65532:65532 \
   -e DATABASE_URL=postgres://indexer:...@db:5432/lafiya \
   -e LAFIYA_RPC_URL=https://soroban-testnet.stellar.org \
   -e LAFIYA_ATTESTER_REGISTRY=C... \
@@ -86,6 +97,83 @@ docker run -d --name lafiya-indexer -p 8080:8080 \
   -e LAFIYA_START_LEDGER=<deployment ledger> \
   lafiya-indexer
 ```
+
+### Docker Compose
+
+```yaml
+services:
+  indexer:
+    image: ghcr.io/<org>/lafiya-indexer:<version>
+    read_only: true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASE_URL: postgres://indexer:...@db:5432/lafiya
+      LAFIYA_RPC_URL: https://soroban-testnet.stellar.org
+      LAFIYA_ATTESTER_REGISTRY: C...
+      LAFIYA_ATTESTATION_REGISTRY: C...
+    ports: ["8080:8080"]
+```
+
+### Kubernetes / Helm
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: indexer
+      image: ghcr.io/<org>/lafiya-indexer:<version>
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+  volumes:
+    - name: tmp
+      emptyDir: { medium: Memory, sizeLimit: 16Mi }
+```
+
+The image contains no shell, so `kubectl exec` debugging is not available;
+use logs and `/metrics` instead.
+
+### Verifying the published image
+
+Every release image is signed with cosign keyless (Sigstore Fulcio/Rekor),
+and ships a CycloneDX SBOM and SLSA provenance attestations. Verification
+is exercised in CI against the published image on each release.
+
+```sh
+IMAGE=ghcr.io/<org>/lafiya-indexer@sha256:<digest>
+
+# Signature, pinned to this repository's workflow identity
+cosign verify "$IMAGE" \
+  --certificate-identity-regexp '^https://github.com/<org>/<repo>/\.github/workflows/.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# CycloneDX SBOM
+cosign download attestation "$IMAGE" \
+  --predicate-type https://cyclonedx.org/bom | jq -r '.payload' | base64 -d | jq .
+
+# SLSA provenance
+cosign download attestation "$IMAGE" \
+  --predicate-type https://slsa.dev/provenance/v1 | jq -r '.payload' | base64 -d | jq .
+
+# Vulnerability scan gate (exceptions require justification in
+# .github/trivy-exceptions.yaml)
+trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE"
+```
+
+Always deploy by digest, not tag. Image size and CVE counts are reported on
+each release.
 
 Run one replica. Two replicas would not corrupt state, because pages and
 checkpoints are transactional and idempotent, but they duplicate RPC load.
@@ -103,14 +191,68 @@ restarts cannot fix it, only a backfill can.
 
 ### Metrics and alerts
 
-| Metric | Suggested alert |
-|---|---|
-| `lafiya_indexer_lag_ledgers` | > 60 for 5 minutes (about 5 minutes behind). |
-| `rate(lafiya_indexer_events_total[1m])` | Events per second, for dashboards. |
-| `lafiya_indexer_ingest_errors_total` | Increasing steadily (RPC or database problems; retried with backoff). |
-| `lafiya_indexer_reconcile_mismatches_total{kind}` | Any sustained increase: derived state disagrees with chain. |
-| `lafiya_indexer_checkpoint_ledger` | Not advancing. |
-| process exit with `retention gap` | Page immediately: backfill needed. |
+Metric names are stable; see [`observability.md`](observability.md) for the
+full SLI/SLO definitions, recording rules and alert runbooks.
+
+| Metric | SLI / SLO | Suggested alert |
+|---|---|---|
+| `lafiya_indexer_lag_ledgers` | Ingestion lag ≤ 60 ledgers for 99% of the time | > 60 for 5 minutes (about 5 minutes behind). |
+| `lafiya_indexer_lag_seconds` | Ingestion lag ≤ 300s for 99% of the time | > 300 for 5 minutes. |
+| `lafiya_indexer_checkpoint_age_seconds` | Checkpoint age ≤ 600s for 99% of the time | > 600 for 5 minutes. |
+| `lafiya_indexer_api_errors_total` / `lafiya_indexer_api_requests_total` | API error ratio < 1% over 5 minutes | `rate(...errors[5m]) / rate(...requests[5m]) > 0.01`. |
+| `lafiya_indexer_api_request_duration_seconds` | p99 latency < 500ms | p99 > 500ms for 10 minutes. |
+| `rate(lafiya_indexer_events_total[1m])` | Events per second, for dashboards. | — |
+| `lafiya_indexer_ingest_errors_total` | Increasing steadily (RPC or database problems; retried with backoff). | — |
+| `lafiya_indexer_reconcile_mismatches_total{kind}` | Any sustained increase: derived state disagrees with chain. | Any increase over 15 minutes. |
+| `lafiya_indexer_webhook_dead_letters_total` | Any increase: a subscriber is not receiving events. | Any increase. |
+| `lafiya_indexer_checkpoint_ledger` | Not advancing. | — |
+| process exit with `retention gap` | Page immediately: backfill needed. | — |
+
+Labels never carry record hashes or addresses; see the data inventory in
+[`compliance/`](compliance/) for the classification of every stored column
+and log field.
+
+## Push delivery (SSE and webhooks)
+
+Integrators can subscribe instead of polling. Both transports are
+**at-least-once**: consumers must deduplicate on the event `id` (the RPC
+event id), which is stable across retries and replays.
+
+### Server-sent events
+
+`GET /events/stream` streams events as they are ingested. Filters:
+`contract` (contract ID), `event_type`, `attester`. Resume with the standard
+`Last-Event-ID` header (or `?last_event_id=`); the server maps it to the
+ledger/event index and replays everything after it, so a reconnect never
+skips or duplicates beyond the at-least-once guarantee.
+
+### Webhooks
+
+Register a subscription with `POST /subscriptions` (URL, filters, optional
+secret override). Each delivery is signed:
+
+```
+X-Lafiya-Signature: sha256=<hex HMAC-SHA256 of the raw body using LAFIYA_WEBHOOK_SECRET>
+X-Lafiya-Event-Id: <event id>
+```
+
+Verify the signature over the raw request body before parsing. Failed
+deliveries are retried with exponential backoff up to
+`LAFIYA_WEBHOOK_MAX_ATTEMPTS`, then moved to the `webhook_dead_letters`
+table; inspect and replay them with `lafiya-indexer webhooks dead-letters`
+and `lafiya-indexer webhooks replay <id>`. Replays are idempotent because
+consumers key on the event id. Delivery semantics are covered by a
+fault-injection test in CI.
+
+## Retention and pruning
+
+The index stores only public chain data plus operational tables (delivery
+attempts, dead letters, request logs). The data inventory in
+[`compliance/`](compliance/) classifies every column and log field; a test
+fails if a new column lacks a classification. The pruning job deletes
+operational rows older than `LAFIYA_RETENTION_OPERATIONAL_DAYS`; it is
+idempotent and takes short row-level locks so ingestion is not blocked.
+`raw_events` is never pruned.
 
 ## Backfill from archived history
 

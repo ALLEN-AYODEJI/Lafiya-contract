@@ -209,3 +209,78 @@ describes.
    unresolved after a few rounds, escalate per [§5](#5-escalate); note in the escalation that
    this was a fee-congestion case, not an ambiguous-outcome case, so the next operator
    doesn't re-walk §3a expecting a different answer.
+
+## 7. Indexer ingestion lag and checkpoint age
+
+**Scope:** the indexer's Prometheus alerts fire — `LafiyaIndexerIngestionLagHigh`,
+`LafiyaIndexerIngestionLagCritical`, `LafiyaIndexerCheckpointStalled`,
+`LafiyaIndexerCheckpointAgeHigh`, or `LafiyaIndexerRetentionGap`. These are about the
+indexer falling behind the chain, not about RPC submission failures; if you also see
+`watchdog_failing` / `watchdog_lag`, treat the RPC outage first ([§4](#4-if-the-provider-itself-is-down)).
+SLI definitions, metric names, and thresholds are in
+[`../observability.md`](../observability.md#indexer-slis).
+
+### 7a. Confirm the lag is real
+
+1. Check the SLI directly:
+   ```sh
+   curl -s http://<indexer-host>:<metrics-port>/metrics \
+     | grep -E '^lafiya_indexer_(ingestion_lag_ledgers|ingestion_lag_seconds|checkpoint_age_seconds|last_indexed_ledger|chain_head_ledger)'
+   ```
+   `lafiya_indexer_ingestion_lag_ledgers` is `chain_head_ledger - last_indexed_ledger`; a
+   non-zero, growing value means the indexer is behind. A flat value means it is caught up
+   but the chain head is advancing normally.
+2. Compare against the chain head from a known-good RPC endpoint (§3a's `getLatestLedger`):
+   ```sh
+   curl -s "$LAFIYA_RPC_URL" -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}' | python3 -m json.tool
+   ```
+   If the RPC's `sequence` matches `lafiya_indexer_chain_head_ledger`, the indexer's view of
+   the head is current and the gap is on the indexing side, not the RPC side.
+3. If the lag is small (a few ledgers) and shrinking, it is normal catch-up after a restart
+   or a burst of activity — no action beyond watching it clear.
+
+### 7b. Stalled checkpoint (`LafiyaIndexerCheckpointStalled`)
+
+`lafiya_indexer_checkpoint_age_seconds` measures how long since the last checkpoint was
+persisted. A stalled checkpoint with a *growing* ingestion lag usually means the indexer
+process is wedged or its database is unreachable:
+
+1. Check the process is alive and its logs for repeated errors:
+   ```sh
+   systemctl status lafiya-indexer   # or: docker ps / kubectl get pods
+   journalctl -u lafiya-indexer -n 200 --no-pager
+   ```
+2. Check database connectivity and disk space — a full disk prevents checkpoint writes and
+   is the most common cause of a stalled checkpoint with a healthy process.
+3. If the process is wedged, restart it. The indexer resumes from its last persisted
+   checkpoint, so a restart is safe and does not replay already-applied ledgers.
+4. If it restarts and stalls again within one checkpoint interval, escalate
+   ([§5](#5-escalate)) with the logs; do not loop restarts.
+
+### 7c. Retention gap (`LafiyaIndexerRetentionGap`)
+
+This alert means the indexer's checkpoint is older than the RPC provider's ledger retention
+window, so the ledgers it needs are no longer available from that provider. It cannot be
+fixed by waiting — the indexer must be re-pointed at a provider that still has the missing
+range, or resynced from a snapshot:
+
+1. Determine the checkpoint ledger and the provider's oldest available ledger:
+   ```sh
+   curl -s http://<indexer-host>:<metrics-port>/metrics | grep '^lafiya_indexer_last_indexed_ledger'
+   curl -s "$LAFIYA_RPC_URL" -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
+   ```
+2. Point the indexer at a provider whose retention window covers the checkpoint ledger (see
+   [§4](#4-if-the-provider-itself-is-down) for how to override the RPC URL without editing
+   tracked config), then restart it.
+3. If no reachable provider retains the range, resync the indexer from the most recent
+   snapshot and accept the gap in indexed history; record the gap's ledger range in the
+   incident notes so downstream consumers know which range is missing.
+
+### 7d. After recovery
+
+Confirm `lafiya_indexer_ingestion_lag_ledgers` returns to its steady-state value and
+`lafiya_indexer_checkpoint_age_seconds` is below the checkpoint interval before closing the
+incident. If the alert was `LafiyaIndexerRetentionGap`, note the missing ledger range in the
+incident record even after the alert clears.

@@ -90,3 +90,64 @@ CREATE TABLE admin_events (
     ledger      BIGINT NOT NULL,
     tx_hash     TEXT NOT NULL
 );
+
+-- Push delivery subscriptions. Filters are nullable: a NULL filter matches
+-- everything on that dimension. `event_types` is an array of decoded event
+-- names (e.g. 'AttestationRecorded', 'AttesterAdded'); an empty array means
+-- "all event types". `secret_ref` names the HMAC secret in the secret store
+-- (never the secret itself) used to sign deliveries.
+CREATE TABLE subscriptions (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    contract_id TEXT,
+    event_types TEXT[] NOT NULL DEFAULT '{}',
+    attester    TEXT,
+    callback_url TEXT NOT NULL,
+    secret_ref  TEXT NOT NULL,
+    active      BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX subscriptions_active_idx ON subscriptions (active) WHERE active;
+
+-- One row per (subscription, event) delivery. The composite primary key makes
+-- replays idempotent: re-enqueueing an already-delivered event is a no-op.
+-- `next_attempt_at` drives exponential backoff; `attempts` counts failed
+-- attempts. A row is terminal when `delivered_at` is set or it has been moved
+-- to `webhook_dead_letters`.
+CREATE TABLE webhook_deliveries (
+    subscription_id BIGINT NOT NULL REFERENCES subscriptions (id) ON DELETE CASCADE,
+    event_id        TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error      TEXT,
+    delivered_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (subscription_id, event_id)
+);
+CREATE INDEX webhook_deliveries_due_idx
+    ON webhook_deliveries (next_attempt_at)
+    WHERE delivered_at IS NULL;
+
+-- Deliveries that exhausted their retry budget. Kept for operator inspection
+-- and manual replay; `payload` is the exact signed body that was attempted.
+CREATE TABLE webhook_dead_letters (
+    subscription_id BIGINT NOT NULL,
+    event_id        TEXT NOT NULL,
+    attempts        INTEGER NOT NULL,
+    last_error      TEXT,
+    payload         JSONB NOT NULL,
+    dead_lettered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (subscription_id, event_id)
+);
+
+-- Bookkeeping for the retention/pruning job. One row per run so operators can
+-- audit what was pruned and confirm idempotent re-runs.
+CREATE TABLE prune_runs (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ,
+    table_name  TEXT NOT NULL,
+    rows_pruned BIGINT NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'running'
+);
+CREATE INDEX prune_runs_table_idx ON prune_runs (table_name, started_at);
