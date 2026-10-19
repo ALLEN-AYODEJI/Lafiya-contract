@@ -32,6 +32,9 @@ use stellar_xdr::{
 /// How many times an expired transaction is rebuilt before giving up.
 const MAX_REBUILDS: u32 = 2;
 
+/// Maximum number of ledger entries a single restore footprint may cover.
+const MAX_RESTORE_ENTRIES: usize = 32;
+
 /// Build, bound, sign, and submit a `stellar contract invoke` argument list
 /// (as produced by `invoke_args`), rebuilding it if it expires.
 pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> anyhow::Result<()> {
@@ -87,6 +90,118 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
         }
     }
     unreachable!("the final attempt always returns")
+}
+
+/// Build, bound, sign, and submit an `extend_attestation_ttl` invocation.
+///
+/// This is permissionless: any account may pay rent to extend an attestation
+/// (issue #544). The contract caps `extend_to` to its maximum horizon, so the
+/// CLI only validates that the value is a plausible ledger sequence.
+pub fn run_extend_ttl(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    extend_to: u32,
+    window: u32,
+) -> anyhow::Result<()> {
+    if extend_to == 0 {
+        bail!("extend_to must be a positive ledger sequence");
+    }
+    let invoke = invoke_args(
+        contract_id,
+        source,
+        "extend_attestation_ttl",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--extend_to".to_string(),
+            extend_to.to_string(),
+        ],
+    );
+    run_bounded(cfg, invoke, window)
+}
+
+/// Build, bound, sign, and submit a patient-initiated `dispute` invocation.
+///
+/// The dispute overlay is keyed by record hash and signer; the patient signs
+/// the commitment with the QR-spec scheme, so the signature is passed through
+/// verbatim (issue #546).
+pub fn run_dispute(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    patient: &str,
+    signature: &str,
+    window: u32,
+) -> anyhow::Result<()> {
+    if signature.is_empty() {
+        bail!("dispute requires a patient signature over the commitment");
+    }
+    let invoke = invoke_args(
+        contract_id,
+        source,
+        "dispute",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--patient".to_string(),
+            patient.to_string(),
+            "--signature".to_string(),
+            signature.to_string(),
+        ],
+    );
+    run_bounded(cfg, invoke, window)
+}
+
+/// Restore archived attestation entries, then extend their TTL.
+///
+/// Archived entries must be restored into the live footprint before they can
+/// be extended. The restore transaction is submitted first (bounded like any
+/// other write); only once it is accepted do we submit the TTL extension.
+pub fn run_restore(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    extend_to: u32,
+    window: u32,
+) -> anyhow::Result<()> {
+    if extend_to == 0 {
+        bail!("extend_to must be a positive ledger sequence");
+    }
+    let restore = invoke_args(
+        contract_id,
+        source,
+        "restore_attestation",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--max_entries".to_string(),
+            MAX_RESTORE_ENTRIES.to_string(),
+        ],
+    );
+    run_bounded(cfg, restore, window)
+        .with_context(|| format!("restoring archived attestation {record_hash} failed"))?;
+    println!("Attestation {record_hash} restored; extending TTL to ledger {extend_to}");
+    run_extend_ttl(cfg, contract_id, source, record_hash, extend_to, window)
+}
+
+/// Assemble a `stellar contract invoke` argument list.
+fn invoke_args(contract_id: &str, source: &str, function: &str, args: &[String]) -> Vec<String> {
+    let mut invoke = vec![
+        "contract".to_string(),
+        "invoke".to_string(),
+        "--id".to_string(),
+        contract_id.to_string(),
+        "--source".to_string(),
+        source.to_string(),
+        "--".to_string(),
+        function.to_string(),
+    ];
+    invoke.extend(args.iter().cloned());
+    invoke
 }
 
 /// `stellar contract invoke ... --build-only -- fn args`
@@ -270,6 +385,64 @@ impl RpcProvider for SorobanRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invoke_args_places_function_after_separator() {
+        let args = invoke_args(
+            "C1",
+            "GSOURCE",
+            "extend_attestation_ttl",
+            &[
+                "--record_hash".to_string(),
+                "abc".to_string(),
+                "--extend_to".to_string(),
+                "42".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            [
+                "contract",
+                "invoke",
+                "--id",
+                "C1",
+                "--source",
+                "GSOURCE",
+                "--",
+                "extend_attestation_ttl",
+                "--record_hash",
+                "abc",
+                "--extend_to",
+                "42",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn dispute_requires_signature() {
+        let cfg = NetworkConfig {
+            rpc_url: "http://localhost".into(),
+            network_passphrase: "Test SDF Network ; September 2015".into(),
+            ..Default::default()
+        };
+        let err = run_dispute(&cfg, "C1", "GSOURCE", "abc", "GPATIENT", "", 10)
+            .expect_err("empty signature must be rejected");
+        assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn extend_ttl_rejects_zero_horizon() {
+        let cfg = NetworkConfig {
+            rpc_url: "http://localhost".into(),
+            network_passphrase: "Test SDF Network ; September 2015".into(),
+            ..Default::default()
+        };
+        let err = run_extend_ttl(&cfg, "C1", "GSOURCE", "abc", 0, 10)
+            .expect_err("zero extend_to must be rejected");
+        assert!(err.to_string().contains("extend_to"));
+    }
 
     #[test]
     fn build_only_goes_before_the_function_separator() {
