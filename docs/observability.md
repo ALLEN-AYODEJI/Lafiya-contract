@@ -81,3 +81,58 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
 The collector prints an `auth.decode` span with `service.name: lafiya-cli`.
 Point the endpoint at Jaeger, Tempo, or Honeycomb in the same way. Without
 `OTEL_EXPORTER_OTLP_ENDPOINT` the exporter stays off even when compiled in.
+
+## Indexer health and leadership
+
+The indexer exposes a health endpoint that reports whether the replica is the
+active ingester or a read-only follower, plus ingestion lag. It is safe to
+scrape from a load balancer and from monitoring.
+
+```json
+{"status":"ok","role":"leader","fencing_token":42,"lag_ledgers":0,"lag_seconds":0}
+{"status":"ok","role":"follower","leader_observed":true,"lag_ledgers":3,"lag_seconds":12}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `role` | `leader` (holds the single-writer lock) or `follower` |
+| `fencing_token` | Monotonic token on checkpoint writes; stale writers are rejected |
+| `leader_observed` | Follower has seen a leader heartbeat recently |
+| `lag_ledgers` / `lag_seconds` | Distance between the last ingested ledger and chain tip |
+
+`status` is `ok` while a leader exists and lag is within budget, `degraded`
+when a follower has not observed a leader or lag exceeds the budget, and
+`error` when the replica cannot reach Postgres or the RPC provider.
+
+### Metrics
+
+| Metric | Type | Labels | Use |
+| --- | --- | --- | --- |
+| `indexer_role` | gauge | `role` | 1 for the current role, 0 otherwise |
+| `indexer_leader_changes_total` | counter | — | Failover events |
+| `indexer_ingest_lag_ledgers` | gauge | — | Ingestion lag in ledgers |
+| `indexer_ingest_lag_seconds` | gauge | — | Ingestion lag in wall-clock seconds |
+| `indexer_checkpoint_fenced_total` | counter | — | Stale checkpoint writes rejected by fencing |
+| `indexer_api_requests_total` | counter | `route`, `tier`, `outcome` | `outcome` is `allowed` or `denied` |
+| `indexer_api_denials_total` | counter | `route`, `tier`, `reason` | `reason` is `rate_limited`, `quota_exhausted`, or `unauthenticated` |
+| `indexer_api_page_size` | histogram | `route` | Bounded page sizes actually served |
+
+Denial logs are structured and never contain query hashes in cleartext; the
+record-hash route logs only a keyed digest. See
+`docs/security/linkability.md` for the scraping threat model.
+
+### Alerting
+
+- **Failover**: page when `indexer_leader_changes_total` increases more than
+  twice in 15 minutes, or when no replica reports `indexer_role{role="leader"} == 1`
+  for 2 minutes.
+- **Lag**: warn when `indexer_ingest_lag_ledgers` exceeds the configured budget
+  for 5 minutes; page when `indexer_ingest_lag_seconds` exceeds 10 minutes.
+- **Fencing**: alert on any sustained increase in
+  `indexer_checkpoint_fenced_total`, which indicates two writers racing.
+- **Quota enforcement**: alert when the ratio of
+  `indexer_api_denials_total{reason="rate_limited"}` to
+  `indexer_api_requests_total` exceeds 10% for 10 minutes, or when
+  `reason="quota_exhausted"` denials appear for a tier that should not be
+  exhausting its budget. A sudden drop in `allowed` requests with stable
+  traffic suggests limits are misconfigured.

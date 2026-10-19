@@ -54,6 +54,58 @@ format and no new infrastructure. The PoC shows the attack linking 1 event inste
 Pair it with relayed submission later for channel 5, and track batch anchoring as a
 research item for channels 2 and 4.
 
+## Indexer query surface as a probing oracle
+
+The public indexer API (`crates/lafiya-indexer/src/api.rs`) exposes
+`/attesters`, `/attestations`, and `/records/{hash}/history`. The history endpoint is a
+direct instance of channel 1: anyone holding a `record_hash` (from one card scan, or by
+scraping hashes out of the ledger) can query it to enumerate every attestation tied to
+that record, and can sweep candidate hashes to confirm which ones exist. Even without
+the history endpoint, the ability to test "does this hash have activity?" is a
+linkability oracle, so the query surface must be treated as part of the threat model,
+not just the ledger.
+
+### Guidance for operators
+
+- **Do not expose the indexer directly.** Put it behind a reverse proxy that terminates
+  TLS, enforces its own connection limits, and forwards a trustworthy client IP
+  (`X-Forwarded-For` handling must be configured so the indexer sees the real peer, not
+  a spoofable header). The indexer's own limits are a backstop, not the only control.
+- **Keep the history endpoint private by default.** `/records/{hash}/history` should be
+  reachable only by authenticated clients (API key) and, where possible, only from
+  trusted networks. Public, unauthenticated history lookups are the highest-risk
+  configuration and should require an explicit opt-in.
+- **Never expose admin, metrics, or debug endpoints** (health detail, config dumps,
+  raw DB access) on the public listener; bind them to a separate internal interface.
+- **Defaults are safe:** rate limits and request budgets are enabled unless explicitly
+  disabled in configuration. Disabling them should be a deliberate, logged action.
+
+### Controls in the indexer
+
+- **Token-bucket limits by IP and by API key**, with configurable tiers. Both buckets
+  apply; a request is denied if either is exhausted. Limits must hold under load
+  (target: no more than the configured rate sustained at 10x offered load).
+- **Bounded page size** on list endpoints, with a hard maximum and a stable default, so
+  a client cannot request an unbounded scan in one call.
+- **Constant-shape responses** to reduce enumeration signal: a miss and a hit should be
+  indistinguishable in status code, body shape, and (as far as practical) timing.
+  History responses for unknown hashes return the same empty-page shape as a known hash
+  with no visible entries, rather than a distinct 404.
+- **Structured denial logging without cleartext hashes.** When a request is denied
+  (rate limit, quota, auth failure), log a structured event with the client identity
+  (hashed or truncated), the route, the reason, and a timestamp. Do **not** log the
+  requested `record_hash` in cleartext; log a keyed hash or a truncated prefix so
+  operators can correlate abuse without turning logs into a linkability dataset.
+
+### Residual risk
+
+Rate limits and constant-shape responses raise the cost of scraping but do not remove
+the oracle: a patient with a known hash can still be tracked by a determined observer
+who stays under the limits, and a slow sweep can still confirm hash existence. The
+durable fix remains per-attestation blinded commitments (ADR-0012), which removes the
+repeating hash the endpoint keys on. Until then, treat the indexer as a
+sensitive service and restrict it accordingly.
+
 ## Follow-up engineering issues
 
 1. Extend LRC-1 with a per-attestation nonce (`LRC-2`) and update `lafiya-commitment` and the CLI.
@@ -61,3 +113,5 @@ research item for channels 2 and 4.
 3. Revocation by blinded hash, and an off-chain (patient-held) attestation history.
 4. Relayed submission for attesters (channel 5).
 5. Research spike: batch anchoring and CHW activity privacy (channels 2 and 4).
+6. Harden the indexer query surface: API keys, per-IP/per-key token buckets, bounded page
+   size, constant-shape responses, and redacted denial logging (see above).

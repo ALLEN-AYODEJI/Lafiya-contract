@@ -114,12 +114,39 @@ restarts cannot fix it, only a backfill can.
 
 ## Backfill from archived history
 
-**Chosen source:** the
-[Stellar Hubble](https://developers.stellar.org/docs/data/analytics/hubble)
-public BigQuery dataset. It is derived from full ledger history (via Galexie
-and stellar-etl) and exposes contract events with their XDR topics and data.
-Any archive works if it can be exported in the format below: a Galexie data
-lake processed with `stellar-etl`, or a captive-core history source.
+RPC `getEvents` only serves roughly the last 7 days. A cold start after a
+longer outage, or a brand-new deployment that must index from the deployment
+ledger, therefore needs an **archive source**: a copy of ledger history that
+predates the RPC retention window. The indexer models this as an
+`EventSource` implementation (`crates/lafiya-indexer/src/rpc.rs`) that yields
+the same event objects as `getEvents`, so the archive and live RPC paths share
+one ingestion pipeline.
+
+### Choosing and trusting a data source
+
+An archive is only usable if its data can be **verified against checkpoint
+hashes**. Ledger history is committed to by the Stellar network's history
+archive checkpoints (every 64 ledgers, hashed into a Merkle tree). A source
+that cannot be checked against those hashes is refused: the backfill aborts
+with an `unverifiable archive` error rather than importing unproven data.
+
+| Source | How to verify | Notes |
+|---|---|---|
+| **Galexie data lake** (your own or a provider's) | Checkpoint hashes are part of the lake; `stellar-etl` exports carry ledger sequence and close time. | Preferred: full history, self-hostable, verifiable end to end. |
+| **Stellar Hubble** ([BigQuery](https://developers.stellar.org/docs/data/analytics/hubble)) | Cross-check exported ledger ranges against published checkpoint hashes for the same ledgers. | Convenient, but you are trusting a third party's ETL; spot-check hashes. |
+| **Captive-core history source** | Native checkpoint verification. | Heaviest to operate; use when you must not trust any third party. |
+
+Rules of thumb:
+
+- Prefer a source whose checkpoint hashes you can verify yourself. If you
+  must use a third-party export, verify at least the first and last ledger of
+  every exported range, plus a random sample in between.
+- Pin the archive to the **same network passphrase** as the RPC endpoint. A
+  testnet export verified against mainnet checkpoints will fail verification.
+- Record the archive's provenance (provider, export date, ledger range) next
+  to the database so a rebuild can be reproduced.
+
+### Export format
 
 The `backfill` command reads **newline-delimited JSON** where each line is a
 `getEvents` event object:
@@ -134,7 +161,7 @@ contract IDs and on successful contract events, then map the table's ledger,
 transaction and operation columns into this shape. Check the column names
 against the current Hubble schema.
 
-Procedure:
+### Procedure
 
 1. Export all events for the two contracts from the deployment ledger up to
    a ledger `N` that RPC still retains (`oldestLedger` from `getHealth`).
@@ -154,6 +181,103 @@ Procedure:
 The backfill refuses to run behind an existing checkpoint, because derived
 state must be built in chain order. To rebuild from scratch, drop the
 database and backfill again.
+
+### Resumable and parallel range backfill
+
+Backfill is **resumable**: progress is recorded per ledger range, so an
+interrupted backfill continues from the last committed range instead of
+restarting. It is also **parallelizable by ledger range**: split the export
+into contiguous ranges (for example 100k ledgers each) and backfill them
+concurrently. Ranges are applied in chain order per range; the checkpoint is
+only advanced across a range once every earlier range is complete, so a
+partially backfilled database is never treated as caught up.
+
+### Verified handoff to live RPC
+
+The switch from archive to live RPC happens at a **verified ledger boundary**:
+the backfill's `--through-ledger N` must be at or before the RPC's current
+`oldestLedger`, and the first live page starts at `N + 1`. The indexer
+verifies that the archive's last ledger and the RPC's first served ledger are
+contiguous (no gap, no overlap) before it begins live ingestion. If the
+boundary cannot be verified, it refuses to hand off and exits non-zero.
+
+### Cost of a full backfill
+
+These are order-of-magnitude figures for a full backfill from the deployment
+ledger; measure against your own archive before committing to a plan.
+
+| Resource | Rough cost | Notes |
+|---|---|---|
+| **Bandwidth** | Tens of GB for a full-history export of two contracts; dominated by the archive download, not the indexer. | Stream the export; do not materialise the whole lake locally. |
+| **Storage** | The Postgres database is small (events for two contracts); the archive copy is the large item. | `raw_events` is the authoritative audit copy; size backups accordingly. |
+| **Time** | Hours to a day for a full history, depending on archive throughput and parallelism. | Parallel ranges cut wall-clock time roughly linearly until the database write path saturates. |
+
+## High-availability deployment
+
+Multiple replicas are supported: one replica is the **leader** (the only
+active ingester) and the rest are **followers** that serve reads. Leadership
+is coordinated with a Postgres advisory lock / lease table, and checkpoint
+updates carry a **fencing token** so a stale writer is rejected rather than
+interleaving writes. `/health` reports `leader` or `follower` and the current
+lag.
+
+- **Failover time:** a follower takes over within one lease period after the
+  leader stops renewing (measure and record the observed value for your
+  deployment; it is bounded by the lease TTL, not by RPC latency).
+- **Exactly-once:** killing the leader mid-page is safe because each page and
+  its checkpoint commit in one transaction; the new leader resumes from the
+  last committed checkpoint.
+
+### Kubernetes example
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lafiya-indexer
+spec:
+  replicas: 2            # one leader, one follower
+  selector:
+    matchLabels: { app: lafiya-indexer }
+  template:
+    metadata:
+      labels: { app: lafiya-indexer }
+    spec:
+      containers:
+        - name: indexer
+          image: lafiya-indexer:latest
+          args: ["run"]
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: lafiya-indexer, key: database-url } }
+            - name: LAFIYA_RPC_URL
+              value: https://soroban-testnet.stellar.org
+            - name: LAFIYA_ATTESTER_REGISTRY
+              value: C...
+            - name: LAFIYA_ATTESTATION_REGISTRY
+              value: C...
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+```
+
+## Performance
+
+API latency is bounded by keyset pagination and covering/partial indexes
+added in migrations (online-safe, `CONCURRENTLY`). The supported filter sets
+are covered by indexes; no supported query performs a sequential scan on the
+large tables.
+
+- **p99 latency budget:** propose and record the agreed budget in the PR that
+  changes query plans or indexes; the CI performance smoke test asserts it on
+  a smaller synthetic dataset.
+- **Synthetic dataset:** 10M attestations across 50k attesters with realistic
+  skew, used to capture `EXPLAIN (ANALYZE, BUFFERS)` for every endpoint
+  filter set.
+=======
 
 ## Tests
 

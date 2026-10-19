@@ -12,6 +12,16 @@ pub struct Metrics {
     /// Labelled by `kind` (`attester` / `attestation`).
     pub reconcile_checks_total: IntCounterVec,
     pub reconcile_mismatches_total: IntCounterVec,
+    /// Labelled by `scope` (`ip` / `key`) and `tier`.
+    pub rate_limit_denials_total: IntCounterVec,
+    /// Labelled by `scope` (`ip` / `key`) and `tier`.
+    pub rate_limit_allowed_total: IntCounterVec,
+    /// 1 when this replica is the active ingester, 0 for read-only followers.
+    pub is_leader: IntGauge,
+    /// Ledgers between the leader's checkpoint and this replica's view.
+    pub follower_lag_ledgers: IntGauge,
+    /// Checkpoint writes rejected because the fencing token was stale.
+    pub stale_writer_rejections_total: IntCounter,
 }
 
 impl Metrics {
@@ -38,6 +48,13 @@ impl Metrics {
                 .expect("unique metric");
             c
         };
+        let counter_vec2 = |name: &str, help: &str, labels: &[&str]| {
+            let c = IntCounterVec::new(Opts::new(name, help), labels).expect("valid metric");
+            registry
+                .register(Box::new(c.clone()))
+                .expect("unique metric");
+            c
+        };
         Self {
             lag_ledgers: gauge(
                 "lafiya_indexer_lag_ledgers",
@@ -59,6 +76,28 @@ impl Metrics {
             reconcile_mismatches_total: counter_vec(
                 "lafiya_indexer_reconcile_mismatches_total",
                 "Entities whose derived state differs from on-chain storage",
+            ),
+            rate_limit_denials_total: counter_vec2(
+                "lafiya_indexer_rate_limit_denials_total",
+                "API requests denied by rate limits or budgets",
+                &["scope", "tier"],
+            ),
+            rate_limit_allowed_total: counter_vec2(
+                "lafiya_indexer_rate_limit_allowed_total",
+                "API requests admitted by rate limits",
+                &["scope", "tier"],
+            ),
+            is_leader: gauge(
+                "lafiya_indexer_is_leader",
+                "1 when this replica is the active ingester, 0 for read-only followers",
+            ),
+            follower_lag_ledgers: gauge(
+                "lafiya_indexer_follower_lag_ledgers",
+                "Ledgers between the leader checkpoint and this replica's view",
+            ),
+            stale_writer_rejections_total: counter(
+                "lafiya_indexer_stale_writer_rejections_total",
+                "Checkpoint writes rejected because the fencing token was stale",
             ),
             registry,
         }

@@ -71,6 +71,19 @@ CREATE TABLE attestations (
 );
 CREATE INDEX attestations_record_idx ON attestations (record_hash, event_id);
 CREATE INDEX attestations_attester_idx ON attestations (attester, event_id);
+-- Covering index for the "current attestation per record" keyset scan: the
+-- partial predicate keeps only live rows and the INCLUDE columns let the
+-- planner satisfy the projection without a heap fetch.
+CREATE INDEX attestations_current_record_idx
+    ON attestations (record_hash, event_id)
+    INCLUDE (attester, attested_at, ledger, tx_hash)
+    WHERE revoked_event_id IS NULL;
+-- Covering index for per-attester history keyset pagination.
+CREATE INDEX attestations_attester_covering_idx
+    ON attestations (attester, event_id)
+    INCLUDE (record_hash, attested_at, ledger, tx_hash, revoked_event_id);
+-- Ledger-ordered keyset pagination over the full attestation log.
+CREATE INDEX attestations_ledger_idx ON attestations (ledger, event_id);
 
 CREATE TABLE revocations (
     event_id    TEXT PRIMARY KEY,
@@ -79,6 +92,7 @@ CREATE TABLE revocations (
     tx_hash     TEXT NOT NULL
 );
 CREATE INDEX revocations_record_idx ON revocations (record_hash, event_id);
+CREATE INDEX revocations_ledger_idx ON revocations (ledger, event_id);
 
 -- Administration events (admin transfer, pause/unpause, upgrade, registry
 -- repointing, initialization) with their decoded topic fields.
@@ -90,3 +104,21 @@ CREATE TABLE admin_events (
     ledger      BIGINT NOT NULL,
     tx_hash     TEXT NOT NULL
 );
+CREATE INDEX admin_events_ledger_idx ON admin_events (ledger, event_id);
+CREATE INDEX admin_events_name_ledger_idx ON admin_events (name, ledger, event_id);
+
+-- Single-writer coordination. Exactly one row is expected; the active
+-- ingester holds `lease_until` in the future and bumps `fencing_token` on
+-- every checkpoint write. Stale writers whose token is behind are rejected.
+CREATE TABLE ingester_lease (
+    name          TEXT PRIMARY KEY,
+    holder        TEXT,
+    fencing_token BIGINT NOT NULL DEFAULT 0,
+    lease_until   TIMESTAMPTZ,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO ingester_lease (name) VALUES ('default');
+
+-- Fencing token on checkpoints so a superseded leader cannot advance the
+-- cursor. `fencing_token` is compared against `ingester_lease` on update.
+ALTER TABLE checkpoints ADD COLUMN fencing_token BIGINT NOT NULL DEFAULT 0;

@@ -1,15 +1,62 @@
 openapi: 3.0.3
 info:
   title: Lafiya indexer API
-  version: 0.1.0
+  version: 0.2.0
   description: >
     Read-only view of Lafiya contract state and history derived from contract
     events. List endpoints are keyset-paginated: pass `next_cursor` from a
     response as `cursor` to fetch the next page; it is null on the last page.
+
+
+    ## Authentication
+
+    API keys are optional but recommended for any non-local deployment. When
+    enabled, send the key in the `X-API-Key` header. Requests without a valid
+    key are rejected with `401` when keys are required, or are treated as an
+    anonymous client (subject to the strictest tier) when anonymous access is
+    allowed. Keys are never accepted in query strings.
+
+
+    ## Rate limits and quotas
+
+    Every client is limited by a token bucket keyed on both the source IP and
+    the API key (when present). Limits are configurable per tier; the defaults
+    are safe and limits are ON unless explicitly disabled by the operator.
+    Exceeding a limit returns `429` with a `Retry-After` header. Per-key
+    request budgets may additionally cap total requests over a rolling window.
+
+
+    ## Response shape and page size
+
+    Responses have a constant shape regardless of whether a record exists, to
+    avoid leaking existence or linkability. Page size is bounded by the server
+    (`limit` is clamped to the configured maximum, default 50, hard cap 500).
+
+
+    ## Denial logging
+
+    Denials (auth failures, rate-limit hits, budget exhaustion) are logged in
+    structured form. Query record hashes are never logged in cleartext; only a
+    truncated, salted digest is recorded for correlation.
+
+
+    ## Deployment
+
+    Deploy behind a reverse proxy (TLS termination, request size limits,
+    connection limits, and per-IP coarse limiting). The proxy MUST forward the
+    real client IP (e.g. `X-Forwarded-For`) only from trusted hops, and the
+    indexer MUST NOT be exposed directly to the public internet. `/metrics`
+    and `/health` must not be public; restrict them to the internal network.
+    See `docs/security/linkability.md` for guidance on scraping
+    `records/{hash}/history` and what must not be public.
 paths:
   /health:
     get:
       summary: Liveness and ingestion progress
+      description: >
+        Operational endpoint. Must not be exposed publicly; restrict to the
+        internal network or the reverse proxy.
+      security: []
       responses:
         "200":
           description: Healthy
@@ -25,6 +72,10 @@ paths:
   /metrics:
     get:
       summary: Prometheus metrics
+      description: >
+        Operational endpoint. Must not be exposed publicly; restrict to the
+        internal network or the reverse proxy.
+      security: []
       responses:
         "200":
           description: Prometheus text format
@@ -33,6 +84,9 @@ paths:
   /attesters:
     get:
       summary: List attesters
+      security:
+        - ApiKeyAuth: []
+        - {}
       parameters:
         - { name: region, in: query, schema: { type: string } }
         - name: status
@@ -52,9 +106,14 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/Attester" } }
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /attestations:
     get:
       summary: List attestations
+      security:
+        - ApiKeyAuth: []
+        - {}
       parameters:
         - { name: attester, in: query, schema: { type: string } }
         - { name: record_hash, in: query, schema: { $ref: "#/components/schemas/Hash" } }
@@ -72,9 +131,19 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/Attestation" } }
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /records/{hash}/history:
     get:
       summary: Attestation and revocation history of one record
+      description: >
+        Returns the history of a single record. This endpoint can act as a
+        probing oracle for linkability, so it is subject to the strictest rate
+        limit tier and bounded page size. Responses have a constant shape
+        whether or not the record exists. See `docs/security/linkability.md`.
+      security:
+        - ApiKeyAuth: []
+        - {}
       parameters:
         - { name: hash, in: path, required: true, schema: { $ref: "#/components/schemas/Hash" } }
         - $ref: "#/components/parameters/limit"
@@ -91,11 +160,24 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/HistoryEntry" } }
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        Optional API key. When keys are required, requests without a valid key
+        are rejected with 401. Keys are never accepted in query strings.
   parameters:
     limit:
       name: limit
       in: query
+      description: >
+        Page size. Clamped by the server to the configured maximum (default 50,
+        hard cap 500) to bound enumeration signal.
       schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
     cursor:
       name: cursor
@@ -104,6 +186,18 @@ components:
   responses:
     Error:
       description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+    RateLimited:
+      description: Rate limit or request budget exceeded
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema: { type: integer }
       content:
         application/json:
           schema:
