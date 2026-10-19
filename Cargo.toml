@@ -12,6 +12,8 @@ members = [
     "crates/lafiya-rpc-resilience",
     "crates/lafiya-watchdog",
     "crates/lafiya-fraud-scoring",
+    "crates/lafiya-qr",
+    "fuzz",
 ]
 
 [workspace.package]
@@ -32,3 +34,24 @@ debug-assertions = false
 panic = "abort"
 codegen-units = 1
 lto = true
+
+[profile.fuzz]
+inherits = "release"
+debug = 1
+debug-assertions = true
+overflow-checks = true
+panic = "unwind"
+strip = "none"
+lto = false
+codegen-units = 16
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true
+debug-assertions = false
+debug = 0
