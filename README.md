@@ -262,9 +262,17 @@ mechanical steps are automated by [`scripts/upgrade.sh`](scripts/upgrade.sh).
 | `fund(amount: i128)` | See the contract rustdoc for details. |
 | `withdraw(to: Address, amount: i128)` | See the contract rustdoc for details. |
 | `approve_work_item(work_item_id: BytesN<32>, attester: Address, payout_amount: i128)` | See the contract rustdoc for details. |
+| `approve_scheduled_work_item(work_item_id: BytesN<32>, attester: Address, work_type: u32, region_class: u32)` | See the contract rustdoc for details. |
+| `get_work_item_schedule_version(work_item_id: BytesN<32>) -> u32` | See the contract rustdoc for details. |
+| `propose_payout_rate(work_type: u32, region_class: u32, amount: i128)` | See the contract rustdoc for details. |
+| `apply_payout_rate(work_type: u32, region_class: u32) -> Result<u32, Error>` | See the contract rustdoc for details. |
+| `get_payout_rate(work_type: u32, region_class: u32) -> Option<PayoutRate>` | See the contract rustdoc for details. |
+| `get_pending_payout_rate(work_type: u32, region_class: u32) -> Option<PendingPayoutRate>` | See the contract rustdoc for details. |
+| `get_schedule_version() -> u32` | See the contract rustdoc for details. |
 | `claim(work_item_id: BytesN<32>)` | See the contract rustdoc for details. |
 | `pause()` | See the contract rustdoc for details. |
 | `unpause()` | See the contract rustdoc for details. |
+| `can_receive(address: Address) -> Result<bool, Error>` | See the contract rustdoc for details. |
 | `is_paused() -> bool` | See the contract rustdoc for details. |
 
 ### `multisig-account`
@@ -292,7 +300,10 @@ Bounded USDC payout/escrow contract for the M2 milestone. Donors fund the pool, 
 | `set_max_per_attester(max: i128)` | Sets the per-attester cumulative claim cap. Requires admin auth. |
 | `fund(amount: i128)` | Deposits tokens from the caller into the pool. Requires admin auth. Blocked while paused. Emits `PoolFunded`. |
 | `withdraw(to: Address, amount: i128)` | Withdraws tokens from the pool to `to`. Requires admin auth. Blocked while paused. Emits `PoolWithdrawn`. |
-| `approve_work_item(work_item_id, attester, payout_amount)` | Approves a work item for payout. Requires approver auth. Verifies attester is allowlisted, enforces per-claim cap. Blocked while paused. Emits `WorkItemApproved`. |
+| `approve_scheduled_work_item(work_item_id, attester, work_type, region_class)` | Approves a work item priced from the on-chain payout schedule. Requires approver auth. Records the schedule version used. |
+| `propose_payout_rate(work_type, region_class, amount)` / `apply_payout_rate(work_type, region_class)` | Timelocked (`SCHEDULE_TIMELOCK_SECS`, 2 days) payout-schedule change. Propose requires admin auth; apply is permissionless after the timelock. Emit `PayoutRateProposed` / `PayoutRateApplied`. |
+| `can_receive(address)` | Preflight: whether `address` holds an authorized trustline for the pool token. |
+| `approve_work_item(work_item_id, attester, payout_amount)` | Override path: approves a work item for an explicit amount. Requires approver **and** admin auth. Verifies attester is allowlisted, enforces per-claim cap. Blocked while paused. Emits `WorkItemApproved`. |
 | `claim(work_item_id)` | Claims payout for an approved work item. Requires the approved attester's auth. Enforces replay protection, per-attester cap, and pool balance. Transfers tokens on success. Blocked while paused. Emits `PayoutClaimed`. |
 | `pause()` | Blocks `fund`, `withdraw`, `approve_work_item`, and `claim`. Requires admin auth. Emits `Paused`. |
 | `unpause()` | Resumes normal operation. Requires admin auth. Emits `Unpaused`. |

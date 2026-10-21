@@ -91,3 +91,7 @@ For programmatic decoding, use the generated [`catalog/errors.json`](../catalog/
 | `13` | `PayoutCapExceeded` | The payout would exceed the per-claim cap. |
 | `14` | `TransferFailed` | The token transfer call returned an error. |
 | `15` | `NonPositiveAmount` | A non-positive amount was provided where a positive amount is required. |
+| `16` | `RecipientCannotReceive` | The token rejected the payout to the attester (missing trustline or issuer authorization revoked). No state changed. **Remediation:** have the CHW create/authorize the USDC trustline (see `docs/runbooks/chw-trustline-onboarding.md`), check with `can_receive`, then retry `claim`. |
+| `17` | `ScheduleEntryNotFound` | No payout-schedule entry exists for the (work type, region class). **Remediation:** admin proposes and applies a rate, or use the override path. |
+| `18` | `NoPendingScheduleChange` | No pending payout-schedule change exists for the pair. |
+| `19` | `TimelockNotElapsed` | The payout-schedule change's timelock has not elapsed yet. **Remediation:** retry `apply_payout_rate` after `eta`. |
