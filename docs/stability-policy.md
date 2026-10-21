@@ -56,6 +56,26 @@ functions do not emit a `Deprecated { fn_name }` event.**
 4. After the deprecation window, remove the old surface in a release whose
    version bump follows ADR-0010 (major from `1.0.0`, minor while `0.x`).
 
+## Contract metadata (SEP-46)
+
+Every contract wasm (`attestation-registry`, `attester-registry`,
+`multisig-account`, `incentive-pool`) must embed these `contractmetav0` keys:
+
+| Key | Meaning | Must equal |
+| --- | --- | --- |
+| `crate_version` | version | workspace `package.version` in `Cargo.toml` |
+| `source_repo` | repo | `github:Lafiya-xyz/Lafiya-contract` |
+| `source_rev` | commit | the commit being released (`--commit`) |
+| `interface_version` | interface version | the crate's `INTERFACE_VERSION` const |
+| `crate_name`, `home_domain` | identity | the `contracts/*` package name; `lafiya-xyz.github.io` |
+
+`scripts/check_wasm_meta.py --require-all` fails if any key is missing or
+empty, disagrees with Cargo or source, or a contract crate has no wasm. It runs
+in `deployments-verify.yml` and `release-manifest.yml`. The release manifest
+records each wasm's `meta_digest` (sha256 of the sorted `key=value` lines).
+Bumping `INTERFACE_VERSION` also requires updating that contract's
+`interface_version` `contractmeta!` entry (literal only; the check catches drift).
+
 ## Enforcement
 
 | Rule | Status |

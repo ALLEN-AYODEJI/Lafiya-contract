@@ -498,6 +498,7 @@ soroban_sdk::contractmeta!(key = "home_domain", val = "lafiya-xyz.github.io");
 soroban_sdk::contractmeta!(key = "crate_name", val = env!("CARGO_PKG_NAME"));
 soroban_sdk::contractmeta!(key = "crate_version", val = env!("CARGO_PKG_VERSION"));
 soroban_sdk::contractmeta!(key = "source_rev", val = env!("LAFIYA_GIT_COMMIT"));
+soroban_sdk::contractmeta!(key = "interface_version", val = "2");
 
 /// The attestation registry contract.
 #[contract]

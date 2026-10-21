@@ -202,6 +202,21 @@ pub enum Error {
 
 // ──────────────────────────── Contract ────────────────────────────
 
+/// Version of the public contract interface (functions, errors, types).
+pub const INTERFACE_VERSION: u32 = 1;
+
+// Source-provenance metadata (SEP-46 `contractmetav0`); policy in
+// docs/stability-policy.md, enforced by scripts/check_wasm_meta.py.
+soroban_sdk::contractmeta!(
+    key = "source_repo",
+    val = "github:Lafiya-xyz/Lafiya-contract"
+);
+soroban_sdk::contractmeta!(key = "home_domain", val = "lafiya-xyz.github.io");
+soroban_sdk::contractmeta!(key = "crate_name", val = env!("CARGO_PKG_NAME"));
+soroban_sdk::contractmeta!(key = "crate_version", val = env!("CARGO_PKG_VERSION"));
+soroban_sdk::contractmeta!(key = "source_rev", val = env!("LAFIYA_GIT_COMMIT"));
+soroban_sdk::contractmeta!(key = "interface_version", val = "1");
+
 #[contract]
 pub struct IncentivePool;
 

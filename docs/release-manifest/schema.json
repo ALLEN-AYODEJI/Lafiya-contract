@@ -79,7 +79,12 @@
                 "type": ["string", "null"],
                 "pattern": "^[0-9a-f]{64}$"
               },
-              "size_bytes": { "type": ["integer", "null"], "minimum": 0 }
+              "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "meta_digest": {
+                "description": "SHA-256 of the sorted key=value lines of the wasm's SEP-46 contractmetav0 entries (scripts/check_wasm_meta.py --digest). Null when no wasm was built.",
+                "type": ["string", "null"],
+                "pattern": "^[0-9a-f]{64}$"
+              }
             }
           }
         }

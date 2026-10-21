@@ -20,6 +20,8 @@ export interface AttesterState {
  */
 export interface ChainReader {
   readonly source: "rpc" | "offline";
+  /** Unix seconds the data was captured at; set by snapshot-backed readers. */
+  readonly snapshotAt?: number;
   getAttestation(trust: NetworkTrust, recordHash: string): Promise<OnChainAttestation | null>;
   /** Oldest first, as `get_attestation_history` returns it. */
   getAttestationHistory(trust: NetworkTrust, recordHash: string): Promise<OnChainAttestation[]>;
@@ -51,6 +53,10 @@ export class OfflineChainReader implements ChainReader {
   readonly source = "offline" as const;
 
   constructor(readonly bundle: OfflineBundle) {}
+
+  get snapshotAt(): number {
+    return this.bundle.snapshotAt;
+  }
 
   async getAttestationHistory(_t: NetworkTrust, recordHash: string) {
     return (this.bundle.attestations[recordHash] ?? []).map((a) => ({

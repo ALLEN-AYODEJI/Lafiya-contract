@@ -80,6 +80,22 @@ When several conditions hold, the verdict is the first match in this order:
 - Implementations **MUST NOT** retry into a different network or registry to obtain a
   positive result.
 
+### Snapshot staleness
+
+A snapshot-backed verifier (TypeScript SDK: `OfflineChainReader`, `SnapshotCache`) **MUST**
+report the snapshot capture time as `staleAsOf` and apply a staleness policy: a maximum age
+per risk class (`StalenessPolicy.byRiskClass`, else `defaultMaxSeconds`) and a mode.
+
+- **Within the limit:** the verdict equals the online evaluation of the snapshot's state.
+- **Beyond the limit** (or dated in the future): in `fail` mode the verdict is
+  `Indeterminate`. In `warn` mode negative verdicts are still reported, since staleness can
+  only hide a *new* negative fact, but a would-be `Verified` becomes `Indeterminate`.
+
+A stale snapshot therefore **MUST NOT** yield a stronger verdict than the same state read
+fresh. Snapshots are integrity-checked (SHA-256 hash chain over bundle, ledger, and the
+previous hash, with an optional publisher signature); a snapshot that fails checks is
+treated as absent.
+
 ## 5. Truth table
 
 `verification-model.json` lists `default_input` and a set of `cases`. Each case overrides
@@ -89,7 +105,7 @@ implementation **MUST** run the whole table in CI and fail on any mismatch.
 | Implementation | Runs the table in CI |
 |---|---|
 | Reference (`scripts/verification_model.py`) | Yes (`ci.yml`, `docs-checks` job) |
-| TypeScript SDK | Pending |
+| TypeScript SDK | Pending (staleness property tests run in `packages/verifier-sdk`) |
 | `attestation-registry` `verify()` view | Pending (view not yet implemented) |
 | Rust verifier | Pending |
 

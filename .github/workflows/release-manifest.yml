@@ -68,7 +68,7 @@ jobs:
         run: make wasm-reproducible
 
       - name: Assert provenance metadata in every wasm
-        run: python3 scripts/check_wasm_meta.py --commit "$(git rev-parse HEAD)" target/wasm32v1-none/release/*.wasm
+        run: python3 scripts/check_wasm_meta.py --require-all --commit "$(git rev-parse HEAD)" target/wasm32v1-none/release/*.wasm
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
