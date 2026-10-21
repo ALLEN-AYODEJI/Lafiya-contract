@@ -30,6 +30,7 @@
 # Operate
 
 - [Runbook: contract upgrade](runbooks/contract-upgrade.md)
+- [Runbook: incentive-pool balance drift](runbooks/incentive-pool-drift.md)
 - [Runbook: RPC outage recovery](runbooks/rpc-outage-recovery.md)
 - [CLI reference: lafiya-cli](reference/cli/lafiya-cli.md)
 - [CLI reference: cargo xtask](reference/cli/xtask.md)

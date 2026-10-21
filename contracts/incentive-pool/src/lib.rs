@@ -1,5 +1,10 @@
 #![no_std]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
 #![allow(missing_docs)] // soroban macros generate undocumented public items
 
 //! # Incentive Pool
@@ -31,6 +36,12 @@ const SCHEMA_VERSION: u32 = 1;
 /// - Extend to: 90 days (17280 * 90 = 1555200 ledgers)
 const INSTANCE_BUMP_AMOUNT: u32 = 1_555_200;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 518_400;
+
+/// Default approval lifetime: 90 days, in seconds of ledger time.
+/// Also applied to work items approved before expiry existed (see ADR 0018).
+pub const DEFAULT_APPROVAL_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+/// Default upper bound on any approval lifetime: 365 days.
+pub const DEFAULT_MAX_APPROVAL_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// Storage keys for the incentive pool.
 ///
@@ -71,6 +82,23 @@ enum DataKey {
     WorkItemClaimed(BytesN<32>),
     /// Cumulative amount paid to a given attester across all claims.
     AttesterTotalClaimed(Address),
+    /// Default approval TTL in seconds (u64).
+    DefaultApprovalTtl,
+    /// Maximum approval TTL in seconds (u64); bounds per-approval overrides.
+    MaxApprovalTtl,
+    /// Work-item record carrying `expires_at`. Items approved before the
+    /// expiry upgrade remain under `WorkItem` in the legacy shape.
+    WorkItemV2(BytesN<32>),
+    /// Tombstone: reason code of a cancelled work item. Never removed, so a
+    /// cancelled id cannot be re-approved.
+    WorkItemCancelled(BytesN<32>),
+    /// Tombstone: the work item expired and its reservation was swept.
+    WorkItemSwept(BytesN<32>),
+    /// Sum of payout amounts of approved, unclaimed, live work items (i128).
+    TotalReserved,
+    /// Set when a token balance mismatch was observed; blocks `claim`
+    /// until the admin calls `resolve_drift`.
+    DriftDetected,
 }
 
 /// On-chain record of an approved work item.
@@ -83,6 +111,31 @@ pub struct WorkItem {
     pub payout_amount: i128,
     /// Ledger timestamp when the item was approved.
     pub approved_at: u64,
+    /// Ledger timestamp after which the item can no longer be claimed.
+    /// The item is claimable while `now < expires_at`.
+    pub expires_at: u64,
+}
+
+/// Pre-expiry work-item shape, still stored under `DataKey::WorkItem` for
+/// items approved before the upgrade. Read-only.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyWorkItem {
+    attester: Address,
+    payout_amount: i128,
+    approved_at: u64,
+}
+
+/// Result of `reconcile`: internal accounting versus custody.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Reconciliation {
+    /// `total_deposited - total_paid`: what the pool believes it holds.
+    pub accounted: i128,
+    /// The pool's actual token balance.
+    pub actual_balance: i128,
+    /// `actual_balance - accounted`. Negative means custody shortfall.
+    pub drift: i128,
 }
 
 // ──────────────────────────── Events ────────────────────────────
@@ -136,6 +189,41 @@ pub struct PayoutClaimed {
     #[topic]
     pub attester: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WorkItemCancelled {
+    #[topic]
+    pub work_item_id: BytesN<32>,
+    pub cancelled_by: Address,
+    pub reason_code: u32,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WorkItemExpired {
+    #[topic]
+    pub work_item_id: BytesN<32>,
+    pub attester: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct BalanceMismatch {
+    #[topic]
+    pub expected: i128,
+    pub observed: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DriftResolved {
+    #[topic]
+    pub by: Address,
+    pub drift: i128,
 }
 
 #[contractevent]
@@ -198,6 +286,26 @@ pub enum Error {
     TransferFailed = 14,
     /// A non-positive amount was provided where a positive amount is required.
     NonPositiveAmount = 15,
+    /// A cumulative counter update would overflow or underflow `i128`.
+    /// @severity bug
+    ArithmeticOverflow = 16,
+    /// The work item's approval has expired; it can only be swept.
+    WorkItemExpired = 17,
+    /// `sweep_expired` was called on a work item that has not expired yet.
+    WorkItemNotExpired = 18,
+    /// The work item was cancelled; it cannot be claimed or re-approved.
+    WorkItemCancelled = 19,
+    /// The requested approval TTL is zero or exceeds the configured maximum.
+    InvalidApprovalTtl = 20,
+    /// The caller is neither the approver nor the admin.
+    Unauthorized = 21,
+    /// The pool's token balance diverged from internal accounting;
+    /// `claim` is blocked until the admin calls `resolve_drift`.
+    /// @severity operator
+    ReconciliationRequired = 22,
+    /// A token transfer moved a different amount than requested.
+    /// @severity operator
+    TokenBalanceMismatch = 23,
 }
 
 // ──────────────────────────── Contract ────────────────────────────
@@ -335,24 +443,18 @@ impl IncentivePool {
 
     /// Whether a work item has been approved.
     pub fn is_work_item_approved(env: Env, work_item_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::WorkItem(work_item_id))
+        Self::has_work_item(&env, &work_item_id)
     }
 
     /// Whether a work item has been claimed.
     pub fn is_work_item_claimed(env: Env, work_item_id: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::WorkItemClaimed(work_item_id))
-            .unwrap_or(false)
+        Self::is_claimed(&env, &work_item_id)
     }
 
-    /// Return the work item details, if approved.
+    /// Return the work item details, if approved. Legacy items report
+    /// `expires_at = approved_at + DEFAULT_APPROVAL_TTL_SECS`.
     pub fn get_work_item(env: Env, work_item_id: BytesN<32>) -> Option<WorkItem> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::WorkItem(work_item_id))
+        Self::load_work_item(&env, &work_item_id).ok()
     }
 
     /// Return the cumulative amount claimed by an attester.
@@ -456,6 +558,11 @@ impl IncentivePool {
     /// Requires admin auth. The admin must have previously approved
     /// the pool contract to spend their tokens, or the transaction
     /// must include the inner `token.transfer` in the authorization tree.
+    ///
+    /// Only the observed change in the pool's token balance is credited,
+    /// so fee-on-transfer tokens cannot inflate `TotalDeposited`. If the
+    /// observed delta differs from `amount`, a `BalanceMismatch` event is
+    /// emitted and `claim` is blocked until the admin calls `resolve_drift`.
     pub fn fund(env: Env, amount: i128) -> Result<(), Error> {
         let admin = Self::admin(&env)?;
         admin.require_auth();
@@ -469,16 +576,28 @@ impl IncentivePool {
         let pool_addr = env.current_contract_address();
         let token_client = token::Client::new(&env, &token_addr);
 
+        let before = token_client.balance(&pool_addr);
         token_client.transfer(&admin, &pool_addr, &amount);
+        let after = token_client.balance(&pool_addr);
+        let received = after.checked_sub(before).ok_or(Error::ArithmeticOverflow)?;
+        if received <= 0 {
+            return Err(Error::TokenBalanceMismatch);
+        }
+        if received != amount {
+            env.storage().instance().set(&DataKey::DriftDetected, &true);
+            BalanceMismatch {
+                expected: amount,
+                observed: received,
+            }
+            .publish(&env);
+        }
 
-        let deposited: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalDeposited)
-            .unwrap_or(0);
+        let deposited = Self::total_deposited(&env)
+            .checked_add(received)
+            .ok_or(Error::ArithmeticOverflow)?;
         env.storage()
             .instance()
-            .set(&DataKey::TotalDeposited, &(deposited + amount));
+            .set(&DataKey::TotalDeposited, &deposited);
 
         env.storage()
             .instance()
@@ -486,7 +605,7 @@ impl IncentivePool {
 
         PoolFunded {
             funder: admin,
-            amount,
+            amount: received,
         }
         .publish(&env);
 
@@ -503,17 +622,10 @@ impl IncentivePool {
             return Err(Error::NonPositiveAmount);
         }
 
-        let total_paid: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalPaid)
-            .unwrap_or(0);
-        let total_deposited: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalDeposited)
-            .unwrap_or(0);
-        let available = total_deposited - total_paid;
+        let total_paid = Self::total_paid(&env);
+        let available = Self::total_deposited(&env)
+            .checked_sub(total_paid)
+            .ok_or(Error::ArithmeticOverflow)?;
         if amount > available {
             return Err(Error::InsufficientPoolBalance);
         }
@@ -527,9 +639,10 @@ impl IncentivePool {
         // Withdrawn funds leave the pool, so count them against the
         // deposited balance; otherwise `claim` would believe they are still
         // available and fail at the token transfer.
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalPaid, &(total_paid + amount));
+        let new_paid = total_paid
+            .checked_add(amount)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage().instance().set(&DataKey::TotalPaid, &new_paid);
 
         env.storage()
             .instance()
@@ -540,96 +653,206 @@ impl IncentivePool {
         Ok(())
     }
 
+    // ── Admin: reconciliation ──
+
+    /// Compare internal accounting with the pool's actual token balance.
+    pub fn reconcile(env: Env) -> Result<Reconciliation, Error> {
+        Self::reconciliation(&env)
+    }
+
+    /// Whether a balance mismatch is blocking `claim`.
+    pub fn is_drift_detected(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::DriftDetected)
+            .unwrap_or(false)
+    }
+
+    /// Accept the observed token balance as the new accounting baseline and
+    /// unblock `claim`. Positive drift (e.g. a direct transfer) is credited
+    /// as a deposit; negative drift (e.g. clawback) is debited. Requires
+    /// admin auth. Fails if the debit would make `total_paid` exceed
+    /// `total_deposited`.
+    pub fn resolve_drift(env: Env) -> Result<Reconciliation, Error> {
+        let admin = Self::admin(&env)?;
+        admin.require_auth();
+
+        let rec = Self::reconciliation(&env)?;
+        let deposited = Self::total_deposited(&env)
+            .checked_add(rec.drift)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if deposited < Self::total_paid(&env) {
+            return Err(Error::InsufficientPoolBalance);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDeposited, &deposited);
+        env.storage()
+            .instance()
+            .set(&DataKey::DriftDetected, &false);
+
+        DriftResolved {
+            by: admin,
+            drift: rec.drift,
+        }
+        .publish(&env);
+
+        Ok(rec)
+    }
+
+    // ── Admin: approval TTL configuration ──
+
+    /// Return `(default_ttl_secs, max_ttl_secs)` for work-item approvals.
+    pub fn get_approval_ttl(env: Env) -> (u64, u64) {
+        (Self::default_ttl(&env), Self::max_ttl(&env))
+    }
+
+    /// Set the default and maximum approval TTL in seconds. Requires admin
+    /// auth. Both must be positive and `default_ttl <= max_ttl`. Applies to
+    /// new approvals only; existing items keep their `expires_at`.
+    pub fn set_approval_ttl(env: Env, default_ttl: u64, max_ttl: u64) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        if default_ttl == 0 || default_ttl > max_ttl {
+            return Err(Error::InvalidApprovalTtl);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultApprovalTtl, &default_ttl);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxApprovalTtl, &max_ttl);
+        Ok(())
+    }
+
     // ── Approver: approve work items ──
 
-    /// Approve a work item for payout. Requires the approver's auth.
-    /// The `payout_amount` must be positive and must not exceed the
-    /// per-claim cap. The attester must be allowlisted.
+    /// Approve a work item for payout with the default TTL. Requires the
+    /// approver's auth. The `payout_amount` must be positive and must not
+    /// exceed the per-claim cap. The attester must be allowlisted.
     pub fn approve_work_item(
         env: Env,
         work_item_id: BytesN<32>,
         attester: Address,
         payout_amount: i128,
     ) -> Result<(), Error> {
-        Self::approver(&env)?.require_auth();
-        Self::require_not_paused(&env)?;
+        let ttl = Self::default_ttl(&env);
+        Self::approve(&env, work_item_id, attester, payout_amount, ttl)
+    }
 
-        if payout_amount <= 0 {
-            return Err(Error::NonPositiveAmount);
+    /// Like `approve_work_item`, with an explicit approval lifetime in
+    /// seconds. `ttl_secs` must be positive and at most the configured max.
+    pub fn approve_work_item_with_ttl(
+        env: Env,
+        work_item_id: BytesN<32>,
+        attester: Address,
+        payout_amount: i128,
+        ttl_secs: u64,
+    ) -> Result<(), Error> {
+        if ttl_secs == 0 || ttl_secs > Self::max_ttl(&env) {
+            return Err(Error::InvalidApprovalTtl);
+        }
+        Self::approve(&env, work_item_id, attester, payout_amount, ttl_secs)
+    }
+
+    /// Cancel an approved, unclaimed work item. `caller` must be the approver
+    /// or the admin and must authorize. The record is kept as a tombstone so
+    /// the id cannot be re-approved, and its reservation is released.
+    ///
+    /// Same-ledger race with `claim`: Soroban applies transactions in a
+    /// ledger sequentially, so whichever is applied first wins. A claim
+    /// applied first makes the cancel fail with `WorkItemAlreadyClaimed`; a
+    /// cancel applied first makes the claim fail with `WorkItemCancelled`.
+    pub fn cancel_work_item(
+        env: Env,
+        caller: Address,
+        work_item_id: BytesN<32>,
+        reason_code: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if caller != Self::approver(&env)? && caller != Self::admin(&env)? {
+            return Err(Error::Unauthorized);
         }
 
-        // Reject duplicate approval.
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::WorkItem(work_item_id.clone()))
-        {
-            return Err(Error::WorkItemAlreadyApproved);
-        }
+        let work_item = Self::open_work_item(&env, &work_item_id)?;
 
-        // Verify attester is currently allowlisted.
-        let registry_id = Self::attester_registry(&env)?;
-        let registry = AttesterRegistryClient::new(&env, &registry_id);
-        if !registry.is_attester(&attester) {
-            return Err(Error::AttesterNotAllowlisted);
-        }
+        env.storage().persistent().set(
+            &DataKey::WorkItemCancelled(work_item_id.clone()),
+            &reason_code,
+        );
+        Self::release_reservation(&env, work_item.payout_amount)?;
 
-        // Enforce per-claim cap at approval time.
-        let max_per_claim: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxPerClaim)
-            .unwrap_or(i128::MAX);
-        if payout_amount > max_per_claim {
-            return Err(Error::PayoutCapExceeded);
-        }
-
-        let work_item = WorkItem {
-            attester: attester.clone(),
-            payout_amount,
-            approved_at: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::WorkItem(work_item_id.clone()), &work_item);
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-
-        WorkItemApproved {
+        WorkItemCancelled {
             work_item_id,
-            attester,
-            payout_amount,
+            cancelled_by: caller,
+            reason_code,
+            amount: work_item.payout_amount,
         }
         .publish(&env);
 
         Ok(())
     }
 
+    /// Return the cancellation reason code, if the work item was cancelled.
+    pub fn get_cancel_reason(env: Env, work_item_id: BytesN<32>) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WorkItemCancelled(work_item_id))
+    }
+
+    /// Release the reservation of an expired, unclaimed work item.
+    /// Permissionless. Idempotent: sweeping an already-swept item is a no-op
+    /// returning `Ok` without an event. Never releases a claimed or
+    /// cancelled item.
+    pub fn sweep_expired(env: Env, work_item_id: BytesN<32>) -> Result<(), Error> {
+        if Self::is_swept(&env, &work_item_id) {
+            return Ok(());
+        }
+        let work_item = Self::load_work_item(&env, &work_item_id)?;
+        if Self::is_claimed(&env, &work_item_id) {
+            return Err(Error::WorkItemAlreadyClaimed);
+        }
+        if Self::is_cancelled(&env, &work_item_id) {
+            return Err(Error::WorkItemCancelled);
+        }
+        if env.ledger().timestamp() < work_item.expires_at {
+            return Err(Error::WorkItemNotExpired);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::WorkItemSwept(work_item_id.clone()), &true);
+        Self::release_reservation(&env, work_item.payout_amount)?;
+
+        WorkItemExpired {
+            work_item_id,
+            attester: work_item.attester,
+            amount: work_item.payout_amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Whether an expired work item's reservation has been swept.
+    pub fn is_work_item_swept(env: Env, work_item_id: BytesN<32>) -> bool {
+        Self::is_swept(&env, &work_item_id)
+    }
+
+    /// Return the sum of payouts of approved, unclaimed, live work items.
+    /// Items approved before reservation tracking existed are not counted.
+    pub fn get_total_reserved(env: Env) -> i128 {
+        Self::total_reserved(&env)
+    }
+
     // ── Attester: claim payout ──
 
     /// Claim payout for an approved work item. Requires the approved
-    /// attester's auth. Enforces replay protection, per-attester cap,
-    /// and pool balance checks. Transfers tokens on success.
+    /// attester's auth. Enforces replay protection, expiry, per-attester
+    /// cap, pool balance and custody checks. Transfers tokens on success.
     pub fn claim(env: Env, work_item_id: BytesN<32>) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
 
-        let work_item: WorkItem = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WorkItem(work_item_id.clone()))
-            .ok_or(Error::WorkItemNotApproved)?;
-
-        let claimed: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::WorkItemClaimed(work_item_id.clone()))
-            .unwrap_or(false);
-        if claimed {
-            return Err(Error::WorkItemAlreadyClaimed);
-        }
+        let work_item = Self::open_work_item(&env, &work_item_id)?;
 
         let attester = work_item.attester.clone();
         attester.require_auth();
@@ -653,44 +876,60 @@ impl IncentivePool {
             .persistent()
             .get(&DataKey::AttesterTotalClaimed(attester.clone()))
             .unwrap_or(0);
-        if attester_claimed + work_item.payout_amount > max_per_attester {
+        let new_attester_claimed = attester_claimed
+            .checked_add(work_item.payout_amount)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if new_attester_claimed > max_per_attester {
             return Err(Error::AttesterClaimCapExceeded);
         }
 
         // Verify pool has sufficient unallocated balance.
-        let total_paid: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalPaid)
-            .unwrap_or(0);
-        let total_deposited: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalDeposited)
-            .unwrap_or(0);
-        if total_paid + work_item.payout_amount > total_deposited {
+        let total_paid = Self::total_paid(&env);
+        let new_paid = total_paid
+            .checked_add(work_item.payout_amount)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if new_paid > Self::total_deposited(&env) {
             return Err(Error::InsufficientPoolBalance);
         }
 
-        // Execute token transfer. On failure the transaction is
-        // rolled back, preserving consistent state.
+        // Custody check: refuse to pay out while accounting and the actual
+        // token balance disagree (fee-on-transfer, clawback, rebasing).
+        let rec = Self::reconciliation(&env)?;
+        if Self::is_drift_detected(env.clone()) || rec.drift < 0 {
+            return Err(Error::ReconciliationRequired);
+        }
+
+        // Execute token transfer and verify the observed balance delta.
+        // On failure the transaction is rolled back.
         let token_addr = Self::token(&env)?;
         let pool_addr = env.current_contract_address();
         let token_client = token::Client::new(&env, &token_addr);
 
         token_client.transfer(&pool_addr, &attester, &work_item.payout_amount);
+        let sent = rec
+            .actual_balance
+            .checked_sub(token_client.balance(&pool_addr))
+            .ok_or(Error::ArithmeticOverflow)?;
+        if sent != work_item.payout_amount {
+            return Err(Error::TokenBalanceMismatch);
+        }
 
         // Persist state updates after successful transfer.
         env.storage()
             .persistent()
             .set(&DataKey::WorkItemClaimed(work_item_id.clone()), &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalPaid, &(total_paid + work_item.payout_amount));
+        env.storage().instance().set(&DataKey::TotalPaid, &new_paid);
         env.storage().persistent().set(
             &DataKey::AttesterTotalClaimed(attester.clone()),
-            &(attester_claimed + work_item.payout_amount),
+            &new_attester_claimed,
         );
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::WorkItemV2(work_item_id.clone()))
+        {
+            Self::release_reservation(&env, work_item.payout_amount)?;
+        }
 
         env.storage()
             .instance()
@@ -738,6 +977,203 @@ impl IncentivePool {
 
     // ── Private helpers ──
 
+    fn approve(
+        env: &Env,
+        work_item_id: BytesN<32>,
+        attester: Address,
+        payout_amount: i128,
+        ttl_secs: u64,
+    ) -> Result<(), Error> {
+        Self::approver(env)?.require_auth();
+        Self::require_not_paused(env)?;
+
+        if payout_amount <= 0 {
+            return Err(Error::NonPositiveAmount);
+        }
+
+        // Reject duplicate approval; cancelled records stay in storage as
+        // tombstones, so a cancelled id is rejected here too.
+        if Self::is_cancelled(env, &work_item_id) {
+            return Err(Error::WorkItemCancelled);
+        }
+        if Self::has_work_item(env, &work_item_id) {
+            return Err(Error::WorkItemAlreadyApproved);
+        }
+
+        // Verify attester is currently allowlisted.
+        let registry_id = Self::attester_registry(env)?;
+        let registry = AttesterRegistryClient::new(env, &registry_id);
+        if !registry.is_attester(&attester) {
+            return Err(Error::AttesterNotAllowlisted);
+        }
+
+        // Enforce per-claim cap at approval time.
+        let max_per_claim: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPerClaim)
+            .unwrap_or(i128::MAX);
+        if payout_amount > max_per_claim {
+            return Err(Error::PayoutCapExceeded);
+        }
+
+        let approved_at = env.ledger().timestamp();
+        let work_item = WorkItem {
+            attester: attester.clone(),
+            payout_amount,
+            approved_at,
+            expires_at: approved_at
+                .checked_add(ttl_secs)
+                .ok_or(Error::ArithmeticOverflow)?,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::WorkItemV2(work_item_id.clone()), &work_item);
+
+        let reserved = Self::total_reserved(env)
+            .checked_add(payout_amount)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalReserved, &reserved);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        WorkItemApproved {
+            work_item_id,
+            attester,
+            payout_amount,
+        }
+        .publish(env);
+
+        Ok(())
+    }
+
+    fn has_work_item(env: &Env, id: &BytesN<32>) -> bool {
+        let store = env.storage().persistent();
+        store.has(&DataKey::WorkItemV2(id.clone())) || store.has(&DataKey::WorkItem(id.clone()))
+    }
+
+    /// Load a work item, upgrading a legacy record on read.
+    fn load_work_item(env: &Env, id: &BytesN<32>) -> Result<WorkItem, Error> {
+        let store = env.storage().persistent();
+        if let Some(item) = store.get::<_, WorkItem>(&DataKey::WorkItemV2(id.clone())) {
+            return Ok(item);
+        }
+        let legacy: LegacyWorkItem = store
+            .get(&DataKey::WorkItem(id.clone()))
+            .ok_or(Error::WorkItemNotApproved)?;
+        Ok(WorkItem {
+            attester: legacy.attester,
+            payout_amount: legacy.payout_amount,
+            approved_at: legacy.approved_at,
+            expires_at: legacy.approved_at.saturating_add(DEFAULT_APPROVAL_TTL_SECS),
+        })
+    }
+
+    /// Load a work item that is still claimable or cancellable: approved,
+    /// not claimed, not cancelled, not expired.
+    fn open_work_item(env: &Env, id: &BytesN<32>) -> Result<WorkItem, Error> {
+        let item = Self::load_work_item(env, id)?;
+        if Self::is_claimed(env, id) {
+            return Err(Error::WorkItemAlreadyClaimed);
+        }
+        if Self::is_cancelled(env, id) {
+            return Err(Error::WorkItemCancelled);
+        }
+        if Self::is_swept(env, id) || env.ledger().timestamp() >= item.expires_at {
+            return Err(Error::WorkItemExpired);
+        }
+        Ok(item)
+    }
+
+    fn is_claimed(env: &Env, id: &BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WorkItemClaimed(id.clone()))
+            .unwrap_or(false)
+    }
+
+    fn is_cancelled(env: &Env, id: &BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::WorkItemCancelled(id.clone()))
+    }
+
+    fn is_swept(env: &Env, id: &BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WorkItemSwept(id.clone()))
+            .unwrap_or(false)
+    }
+
+    /// Decrease `TotalReserved`, flooring at zero: legacy items were never
+    /// added to the reservation counter.
+    fn release_reservation(env: &Env, amount: i128) -> Result<(), Error> {
+        let reserved = Self::total_reserved(env)
+            .checked_sub(amount)
+            .ok_or(Error::ArithmeticOverflow)?
+            .max(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalReserved, &reserved);
+        Ok(())
+    }
+
+    fn reconciliation(env: &Env) -> Result<Reconciliation, Error> {
+        let accounted = Self::total_deposited(env)
+            .checked_sub(Self::total_paid(env))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let token_client = token::Client::new(env, &Self::token(env)?);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+        let drift = actual_balance
+            .checked_sub(accounted)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Reconciliation {
+            accounted,
+            actual_balance,
+            drift,
+        })
+    }
+
+    fn total_deposited(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalDeposited)
+            .unwrap_or(0)
+    }
+
+    fn total_paid(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalPaid)
+            .unwrap_or(0)
+    }
+
+    fn total_reserved(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalReserved)
+            .unwrap_or(0)
+    }
+
+    fn default_ttl(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultApprovalTtl)
+            .unwrap_or(DEFAULT_APPROVAL_TTL_SECS)
+    }
+
+    fn max_ttl(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxApprovalTtl)
+            .unwrap_or(DEFAULT_MAX_APPROVAL_TTL_SECS)
+    }
+
     fn admin(env: &Env) -> Result<Address, Error> {
         env.storage()
             .instance()
@@ -780,5 +1216,10 @@ impl IncentivePool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
 mod test;

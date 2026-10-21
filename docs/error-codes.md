@@ -91,3 +91,11 @@ For programmatic decoding, use the generated [`catalog/errors.json`](../catalog/
 | `13` | `PayoutCapExceeded` | The payout would exceed the per-claim cap. |
 | `14` | `TransferFailed` | The token transfer call returned an error. |
 | `15` | `NonPositiveAmount` | A non-positive amount was provided where a positive amount is required. |
+| `16` | `ArithmeticOverflow` | A cumulative counter update would overflow or underflow `i128`. |
+| `17` | `WorkItemExpired` | The work item's approval has expired; it can only be swept. |
+| `18` | `WorkItemNotExpired` | `sweep_expired` was called on a work item that has not expired yet. |
+| `19` | `WorkItemCancelled` | The work item was cancelled; it cannot be claimed or re-approved. |
+| `20` | `InvalidApprovalTtl` | The requested approval TTL is zero or exceeds the configured maximum. |
+| `21` | `Unauthorized` | The caller is neither the approver nor the admin. |
+| `22` | `ReconciliationRequired` | The pool's token balance diverged from internal accounting; `claim` is blocked until the admin calls `resolve_drift`. |
+| `23` | `TokenBalanceMismatch` | A token transfer moved a different amount than requested. |
