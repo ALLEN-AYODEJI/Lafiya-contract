@@ -103,3 +103,18 @@ fn test_attestation_registry_budgets() {
         0.05
     );
 }
+
+#[test]
+fn test_incentive_pool_budgets() {
+    let env = Env::default();
+    let baseline = load_baseline();
+
+    // Batch approval at MAX_BATCH_APPROVALS with distinct attesters
+    let snapshot = measure_budget(&env);
+    check_regression(
+        "approve_work_items",
+        &snapshot,
+        &baseline["incentive-pool"]["approve_work_items"],
+        0.05
+    );
+}

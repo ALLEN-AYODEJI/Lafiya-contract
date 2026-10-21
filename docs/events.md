@@ -119,6 +119,45 @@ for how these events are consumed.
 | `contract_kind` | `Symbol` | data |
 | `schema_version` | `u32` | data |
 
+## `incentive-pool`
+
+### `WorkItemApproved`
+Topics: `work_item_id`. Data: `attester`, `payout_amount`. Emitted once per
+item by both `approve_work_item` and `approve_work_items`.
+
+### `PayoutClaimed`
+Topics: `work_item_id`, `attester`. Data: `recipient` (bound payout
+address), `amount`.
+
+### `PayoutAddressScheduled`
+Topics: `attester`. Data: `recipient`, `effective_at`. The new recipient is
+used for claims from `effective_at` (now + 48h).
+
+### `AttestationRegistryRepointed`
+Topics: `previous` (optional), `new`.
+
+### `EpochConfigProposed`
+Data: `epoch_length`, `epoch_budget`, `rollover`, `effective_at`.
+
+### `EpochConfigApplied`
+Data: `epoch_length`, `epoch_budget`, `rollover`.
+
+Epoch budget views: `get_epoch_config`, `get_pending_epoch_config`,
+`get_epoch_approved(epoch_start)`, `get_epoch_remaining`. Epochs start at
+multiples of `epoch_length`; with `rollover` the unused budget of the
+immediately preceding epoch is added (no compounding).
+
+### Work-item id derivation
+
+`work_item_id = sha256("LAFIYA-WORK-ITEM-v1" || record_hash || attester.to_xdr())`,
+where `attester.to_xdr()` is the `ScVal::Address` XDR. Test vectors (attester
+`GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF`):
+
+| record_hash | work_item_id |
+|---|---|
+| `00…00` (32 bytes) | `bd45e96a767a88270c215397386afe1b44d7c2e3665a5d237fd6cc91474172cd` |
+| `01…01` (32 bytes) | `3558e08302cd12ec063b38813911118ec8710ffabaf02e520ddb9c0872c386ea` |
+
 ## `attester-registry`
 
 ### `AdminTransferred`

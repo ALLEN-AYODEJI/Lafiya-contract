@@ -92,5 +92,18 @@
       "estimated_fee_stroops": 55000,
       "worst_case_scenario": "5-of-5 multisig signature verification"
     }
+  },
+  "incentive-pool": {
+    "approve_work_items": {
+      "cpu_instructions": 4200000,
+      "memory_bytes": 262144,
+      "ledger_read_entries": 84,
+      "ledger_read_bytes": 24576,
+      "ledger_write_entries": 18,
+      "ledger_write_bytes": 4096,
+      "events_size_bytes": 2560,
+      "estimated_fee_stroops": 900000,
+      "worst_case_scenario": "MAX_BATCH_APPROVALS (16) items, distinct attesters, full attestation history window, epoch budget enabled"
+    }
   }
 }
