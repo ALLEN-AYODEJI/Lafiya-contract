@@ -21,12 +21,24 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "docs" / "release-manifest" / "schema.json"
 
+# Contracts that must appear in every release manifest. The incentive-pool is
+# held to the same coverage as the registries and multisig.
+REQUIRED_CONTRACTS = ("incentive-pool",)
+
 
 def cross_check(manifest: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    wasm_by_contract = {c["name"]: c["wasm"]["sha256"] for c in manifest.get("contracts", [])}
+    contracts = manifest.get("contracts", [])
+    wasm_by_contract = {c["name"]: c["wasm"]["sha256"] for c in contracts}
+
+    for name in REQUIRED_CONTRACTS:
+        if name not in wasm_by_contract:
+            errors.append(f"contracts is missing required artifact '{name}'")
+
+    bound_contracts = set()
     for binding in manifest.get("bindings", []):
         contract = binding["contract"]
+        bound_contracts.add(contract)
         expected = wasm_by_contract.get(contract)
         actual = binding["generated_from_wasm_sha256"]
         if expected is not None and actual is not None and expected != actual:
@@ -34,6 +46,11 @@ def cross_check(manifest: dict[str, Any]) -> list[str]:
                 f"bindings[{contract}].generated_from_wasm_sha256 ({actual}) does not match "
                 f"contracts[{contract}].wasm.sha256 ({expected}) — binding is stale"
             )
+
+    for name in REQUIRED_CONTRACTS:
+        if name in wasm_by_contract and name not in bound_contracts:
+            errors.append(f"bindings is missing required entry for '{name}'")
+
     return errors
 
 

@@ -12,6 +12,10 @@ pub struct Metrics {
     /// Labelled by `kind` (`attester` / `attestation`).
     pub reconcile_checks_total: IntCounterVec,
     pub reconcile_mismatches_total: IntCounterVec,
+    /// Ledger-hash continuity mismatches detected during ingestion.
+    pub reorg_detected_total: IntCounter,
+    /// Depth (in ledgers) of the most recent rollback; 0 when none has occurred.
+    pub reorg_last_rollback_depth: IntGauge,
 }
 
 impl Metrics {
@@ -59,6 +63,14 @@ impl Metrics {
             reconcile_mismatches_total: counter_vec(
                 "lafiya_indexer_reconcile_mismatches_total",
                 "Entities whose derived state differs from on-chain storage",
+            ),
+            reorg_detected_total: counter(
+                "lafiya_indexer_reorg_detected_total",
+                "Ledger-hash continuity mismatches detected during ingestion",
+            ),
+            reorg_last_rollback_depth: gauge(
+                "lafiya_indexer_reorg_last_rollback_depth",
+                "Depth in ledgers of the most recent rollback (0 if none)",
             ),
             registry,
         }

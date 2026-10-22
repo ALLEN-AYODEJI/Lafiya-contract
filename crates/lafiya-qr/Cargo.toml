@@ -7,30 +7,9 @@ license = "MIT"
 repository = "https://github.com/Lafiya-xyz/Lafiya-contract"
 
 [dependencies]
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [dev-dependencies]
-hex = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Fuzzing support (issue #524). The fuzz targets live in the workspace-level
-# `fuzz/` crate; these entries expose the pure-Rust decode paths and the
-# vector corpus to it without pulling fuzzing deps into normal builds.
-[lib]
-name = "lafiya_qr"
-path = "src/lib.rs"
-
-# Expose an optional `fuzz` feature so the fuzz crate can enable any
-# instrumentation-only helpers without affecting downstream consumers.
-[features]
-default = []
-fuzz = []
-
-# Keep the negative/positive vector corpus packaged with the crate so the
-# fuzz targets can seed from it via `CARGO_MANIFEST_DIR`.
-include = [
-    "src/**/*.rs",
-    "vectors/**/*",
-    "Cargo.toml",
-]
+hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
