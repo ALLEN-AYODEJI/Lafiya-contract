@@ -1391,4 +1391,37 @@ mod tests {
             );
         }
     }
+
+    // ── Degradation harness (issue #528) ────────────────────────────────────
+
+    #[test]
+    fn degradation_pipeline_is_deterministic() {
+        use crate::degradation::{DegradationConfig, DegradationKind};
+
+        let modules = vec![vec![true, false, true], vec![false, true, false], vec![true, true, false]];
+        let config = DegradationConfig::default();
+
+        for kind in DegradationKind::ALL {
+            let a = kind.apply(&modules, &config, 0xDEAD_BEEF);
+            let b = kind.apply(&modules, &config, 0xDEAD_BEEF);
+            assert_eq!(a, b, "degradation {kind:?} must be deterministic for a fixed seed");
+        }
+    }
+
+    #[test]
+    fn degradation_harness_runs_offline() {
+        use crate::degradation::run_harness;
+
+        // Small sweep so the test stays fast; the full sweep is produced by the
+        // `qr_degradation_report` example.
+        let report = run_harness(0x1234_5678, &[1, 2], &[0, 1, 2, 3]);
+        assert!(!report.rows.is_empty(), "harness must emit at least one data row");
+        // Every row must carry a well-formed decode-rate in [0, 1].
+        for row in &report.rows {
+            assert!((0.0..=1.0).contains(&row.decode_rate));
+        }
+        // CSV/JSON renderers must be non-empty and stable.
+        assert!(!report.to_csv().is_empty());
+        assert!(!report.to_json().is_empty());
+    }
 }
