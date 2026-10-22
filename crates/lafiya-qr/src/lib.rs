@@ -27,6 +27,14 @@
 //! [`DecodeError`] covers every rejection case from the spec: invalid prefix,
 //! invalid base45, invalid CBOR, unknown version, network mismatch, truncated
 //! or missing required fields, and commitment mismatch for LRC-2 payloads.
+//!
+//! # Multi-frame transport
+//!
+//! Payloads that do not fit in a single QR code can be split into a sequence
+//! of frames with [`encode_qr_frames`] and reassembled with
+//! [`decode_qr_frames`]. Each frame is itself a valid `LFQR:` string carrying a
+//! small CBOR envelope (`{1: total, 2: index, 3: chunk}`) so frames can be
+//! scanned in any order. See [`QrFrame`] and [`FrameError`].
 
 pub mod base45;
 pub mod cbor;
@@ -445,6 +453,280 @@ pub fn decode_qr_with_network(
     }
 
     Ok(payload)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-frame transport
+// ---------------------------------------------------------------------------
+
+/// Maximum number of frames a single payload may be split into.
+///
+/// Bounds reassembly memory and keeps animated-QR playback practical.
+pub const MAX_FRAMES: usize = 64;
+
+/// Default maximum number of base45 characters carried per frame.
+///
+/// QR alphanumeric mode tops out around 4,296 characters at the highest
+/// error-correction level; 1,000 leaves headroom for the frame envelope and
+/// keeps individual codes easy to scan from a screen.
+pub const DEFAULT_FRAME_CHARS: usize = 1000;
+
+// Frame envelope CBOR keys
+const FRAME_KEY_TOTAL: u64 = 1;
+const FRAME_KEY_INDEX: u64 = 2;
+const FRAME_KEY_CHUNK: u64 = 3;
+
+/// A single frame of a multi-frame QR payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QrFrame {
+    /// Total number of frames in the sequence (1-based count).
+    pub total: u8,
+    /// Zero-based index of this frame.
+    pub index: u8,
+    /// The base45 chunk carried by this frame.
+    pub chunk: String,
+}
+
+/// Errors returned by [`encode_qr_frames`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    /// The underlying single-payload encode failed.
+    Encode(EncodeError),
+    /// The payload requires more than [`MAX_FRAMES`] frames.
+    TooManyFrames(usize),
+    /// `frame_chars` was zero.
+    InvalidFrameSize,
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FrameError::Encode(e) => write!(f, "FRAME_ENCODE: {e}"),
+            FrameError::TooManyFrames(n) => {
+                write!(f, "TOO_MANY_FRAMES: payload needs {n} frames (max {MAX_FRAMES})")
+            }
+            FrameError::InvalidFrameSize => write!(f, "INVALID_FRAME_SIZE: frame_chars must be > 0"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+impl From<EncodeError> for FrameError {
+    fn from(e: EncodeError) -> Self {
+        FrameError::Encode(e)
+    }
+}
+
+/// Errors returned by [`decode_qr_frames`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameDecodeError {
+    /// A frame failed to decode as a `LFQR:` string.
+    Decode(DecodeError),
+    /// A frame's CBOR envelope was malformed.
+    InvalidFrame(String),
+    /// Frames disagree on the total count.
+    InconsistentTotal { got: u8, expected: u8 },
+    /// A frame index is out of range for the declared total.
+    IndexOutOfRange { index: u8, total: u8 },
+    /// The same index was supplied more than once.
+    DuplicateFrame(u8),
+    /// Not all frames were supplied.
+    MissingFrames { got: usize, expected: usize },
+    /// The reassembled payload failed to decode.
+    Payload(DecodeError),
+}
+
+impl core::fmt::Display for FrameDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FrameDecodeError::Decode(e) => write!(f, "FRAME_DECODE: {e}"),
+            FrameDecodeError::InvalidFrame(e) => write!(f, "INVALID_FRAME: {e}"),
+            FrameDecodeError::InconsistentTotal { got, expected } => {
+                write!(f, "INCONSISTENT_TOTAL: got {got}, expected {expected}")
+            }
+            FrameDecodeError::IndexOutOfRange { index, total } => {
+                write!(f, "INDEX_OUT_OF_RANGE: index {index} for total {total}")
+            }
+            FrameDecodeError::DuplicateFrame(i) => write!(f, "DUPLICATE_FRAME: {i}"),
+            FrameDecodeError::MissingFrames { got, expected } => {
+                write!(f, "MISSING_FRAMES: got {got} of {expected}")
+            }
+            FrameDecodeError::Payload(e) => write!(f, "FRAME_PAYLOAD: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameDecodeError {}
+
+/// Split a [`QrPayload`] into a sequence of `LFQR:` frame strings.
+///
+/// The payload is encoded exactly as [`encode_qr`] would, then the base45 body
+/// is split into chunks of at most `frame_chars` characters. Each chunk is
+/// wrapped in a small CBOR envelope and base45-encoded behind the `LFQR:`
+/// prefix, so every frame is a self-describing QR string.
+///
+/// A payload that fits in a single chunk still yields one frame; callers that
+/// want the plain single-code form should use [`encode_qr`] directly.
+pub fn encode_qr_frames(
+    payload: &QrPayload,
+    frame_chars: usize,
+) -> Result<Vec<String>, FrameError> {
+    if frame_chars == 0 {
+        return Err(FrameError::InvalidFrameSize);
+    }
+
+    let single = encode_qr(payload)?;
+    let body = single
+        .strip_prefix(QR_PREFIX)
+        .expect("encode_qr always emits the QR prefix");
+
+    // Split the base45 body on character boundaries (base45 is ASCII).
+    let chunks: Vec<&str> = body
+        .as_bytes()
+        .chunks(frame_chars)
+        .map(|c| core::str::from_utf8(c).expect("base45 output is ASCII"))
+        .collect();
+
+    if chunks.len() > MAX_FRAMES {
+        return Err(FrameError::TooManyFrames(chunks.len()));
+    }
+
+    let total = chunks.len() as u8;
+    let mut frames = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let envelope: Vec<(u64, CborValue)> = vec![
+            (FRAME_KEY_TOTAL, CborValue::Uint(total as u64)),
+            (FRAME_KEY_INDEX, CborValue::Uint(index as u64)),
+            (FRAME_KEY_CHUNK, CborValue::Text(chunk.to_string())),
+        ];
+        let mut out = Vec::new();
+        cbor::encode_value(&CborValue::Map(envelope), &mut out);
+        frames.push(format!("{}{}", QR_PREFIX, base45::encode(&out)));
+    }
+
+    Ok(frames)
+}
+
+/// Reassemble a [`QrPayload`] from a set of `LFQR:` frame strings.
+///
+/// Frames may be supplied in any order. Duplicate indices, inconsistent totals,
+/// out-of-range indices, missing frames, or a corrupt reassembled payload are
+/// all rejected.
+pub fn decode_qr_frames<S: AsRef<str>>(frames: &[S]) -> Result<QrPayload, FrameDecodeError> {
+    if frames.is_empty() {
+        return Err(FrameDecodeError::MissingFrames { got: 0, expected: 1 });
+    }
+
+    let mut total: Option<u8> = None;
+    let mut chunks: Vec<Option<String>> = Vec::new();
+
+    for frame in frames {
+        let parsed = parse_frame(frame.as_ref())?;
+
+        match total {
+            None => {
+                total = Some(parsed.total);
+                chunks = vec![None; parsed.total as usize];
+            }
+            Some(t) if t != parsed.total => {
+                return Err(FrameDecodeError::InconsistentTotal {
+                    got: parsed.total,
+                    expected: t,
+                });
+            }
+            Some(_) => {}
+        }
+
+        if parsed.index >= parsed.total {
+            return Err(FrameDecodeError::IndexOutOfRange {
+                index: parsed.index,
+                total: parsed.total,
+            });
+        }
+
+        let slot = &mut chunks[parsed.index as usize];
+        if slot.is_some() {
+            return Err(FrameDecodeError::DuplicateFrame(parsed.index));
+        }
+        *slot = Some(parsed.chunk);
+    }
+
+    let expected = total.expect("at least one frame was parsed") as usize;
+    let mut body = String::new();
+    for (i, slot) in chunks.into_iter().enumerate() {
+        match slot {
+            Some(chunk) => body.push_str(&chunk),
+            None => {
+                return Err(FrameDecodeError::MissingFrames {
+                    got: i,
+                    expected,
+                })
+            }
+        }
+    }
+
+    let single = format!("{}{}", QR_PREFIX, body);
+    decode_qr(&single).map_err(FrameDecodeError::Payload)
+}
+
+fn parse_frame(frame: &str) -> Result<QrFrame, FrameDecodeError> {
+    let rest = frame
+        .strip_prefix(QR_PREFIX)
+        .ok_or(FrameDecodeError::Decode(DecodeError::InvalidPrefix))?;
+
+    let cbor_bytes = base45::decode(rest)
+        .map_err(|e| FrameDecodeError::Decode(DecodeError::InvalidBase45(e)))?;
+
+    let (value, trailing) = cbor::decode_value(&cbor_bytes)
+        .map_err(|e| FrameDecodeError::InvalidFrame(e.to_string()))?;
+    if !trailing.is_empty() {
+        return Err(FrameDecodeError::InvalidFrame(
+            "trailing bytes after frame envelope".into(),
+        ));
+    }
+
+    let map = match value {
+        CborValue::Map(m) => m,
+        _ => {
+            return Err(FrameDecodeError::InvalidFrame(
+                "expected CBOR map for frame envelope".into(),
+            ))
+        }
+    };
+
+    let total = map
+        .iter()
+        .find(|(k, _)| *k == FRAME_KEY_TOTAL)
+        .and_then(|(_, v)| if let CborValue::Uint(n) = v { Some(*n) } else { None })
+        .ok_or_else(|| FrameDecodeError::InvalidFrame("frame: missing total".into()))?;
+    let index = map
+        .iter()
+        .find(|(k, _)| *k == FRAME_KEY_INDEX)
+        .and_then(|(_, v)| if let CborValue::Uint(n) = v { Some(*n) } else { None })
+        .ok_or_else(|| FrameDecodeError::InvalidFrame("frame: missing index".into()))?;
+    let chunk = map
+        .iter()
+        .find(|(k, _)| *k == FRAME_KEY_CHUNK)
+        .and_then(|(_, v)| if let CborValue::Text(s) = v { Some(s.clone()) } else { None })
+        .ok_or_else(|| FrameDecodeError::InvalidFrame("frame: missing chunk".into()))?;
+
+    if total == 0 || total > MAX_FRAMES as u64 {
+        return Err(FrameDecodeError::InvalidFrame(format!(
+            "frame: total {total} out of range"
+        )));
+    }
+    if index > u8::MAX as u64 {
+        return Err(FrameDecodeError::InvalidFrame(
+            "frame: index out of range".into(),
+        ));
+    }
+
+    Ok(QrFrame {
+        total: total as u8,
+        index: index as u8,
+        chunk,
+    })
 }
 
 // ---------------------------------------------------------------------------

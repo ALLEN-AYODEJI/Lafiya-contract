@@ -1,6 +1,7 @@
 //! Rules engine: turns events (and wasm-hash observations) into alerts.
 
 use crate::config::{Config, EventRule, RateRule};
+use crate::state::{AlertFingerprint, EngineState, StateStore};
 use crate::{Alert, Event, Severity};
 use std::collections::{BTreeMap, VecDeque};
 
@@ -70,7 +71,15 @@ fn matches(pattern: &str, name: &str) -> bool {
 
 impl Engine {
     pub fn new(cfg: &Config) -> Engine {
-        Engine {
+        Engine::with_store(cfg, None)
+    }
+
+    /// Build an engine backed by a durable state store. Any previously
+    /// persisted window state and alert fingerprints are restored so a
+    /// restart (including kill -9) neither re-alerts nor loses in-flight
+    /// windows.
+    pub fn with_store(cfg: &Config, store: Option<StateStore>) -> Engine {
+        let mut engine = Engine {
             rules: if cfg.rules.is_empty() {
                 default_rules()
             } else {
@@ -88,6 +97,7 @@ impl Engine {
             expiry_threshold_ledgers: cfg.attestation_expiry_threshold_ledgers,
             alert_on_dispute: cfg.alert_on_dispute,
         }
+        fresh
     }
 
     /// Override the incentive-pool rule thresholds.
@@ -123,6 +133,13 @@ impl Engine {
 
     /// Evaluate one event. Events must be fed in ledger order.
     pub fn evaluate(&mut self, e: &Event) -> Vec<Alert> {
+        let alerts = self.evaluate_raw(e);
+        let fresh = self.dedup(alerts);
+        self.persist();
+        fresh
+    }
+
+    fn evaluate_raw(&mut self, e: &Event) -> Vec<Alert> {
         let mut alerts = Vec::new();
 
         for rule in &self.rules {
@@ -220,7 +237,7 @@ impl Engine {
     /// against the hash implied by the events seen so far.
     pub fn observe_wasm(&mut self, contract: &str, hash: &str, ledger: u32) -> Option<Alert> {
         let hash = hash.to_ascii_lowercase();
-        match self.expected_wasm.get(contract) {
+        let alert = match self.expected_wasm.get(contract) {
             None => {
                 self.expected_wasm.insert(contract.into(), hash);
                 None
@@ -241,7 +258,10 @@ impl Engine {
                 self.expected_wasm.insert(contract.into(), hash);
                 Some(alert)
             }
-        }
+        };
+        let fresh = self.dedup(alert.into_iter().collect());
+        self.persist();
+        fresh.into_iter().next()
     }
 }
 

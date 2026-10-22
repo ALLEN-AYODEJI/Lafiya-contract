@@ -31,8 +31,8 @@ use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
 use stellar_xdr::{
-    AccountId, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits, ReadXdr, TransactionEnvelope,
-    WriteXdr,
+    AccountId, DecoratedSignature, LedgerEntryData, LedgerKey, LedgerKeyAccount, Limits, ReadXdr,
+    Signature, TransactionEnvelope, WriteXdr,
 };
 
 /// How many times an expired transaction is rebuilt before giving up.
@@ -456,6 +456,73 @@ impl RpcProvider for SorobanRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_envelope() -> Envelope {
+        Envelope::new(
+            "Test SDF Network ; September 2015",
+            Some("CABC".to_string()),
+            1000,
+            42,
+            "GABC",
+            "AAAAAA==",
+            "invoke add_attester(GBOB)",
+        )
+    }
+
+    #[test]
+    fn envelope_round_trips_through_json() {
+        let envelope = sample_envelope();
+        let json = envelope.to_json().unwrap();
+        let parsed = Envelope::from_json(&json).unwrap();
+        assert_eq!(parsed, envelope);
+    }
+
+    #[test]
+    fn envelope_tampering_is_detected() {
+        let mut envelope = sample_envelope();
+        envelope.max_ledger += 1;
+        assert!(envelope.verify().is_err());
+    }
+
+    #[test]
+    fn envelope_network_swap_is_detected() {
+        let mut envelope = sample_envelope();
+        envelope.network_passphrase = "Public Global Stellar Network ; September 2015".to_string();
+        assert!(envelope.verify().is_err());
+    }
+
+    #[test]
+    fn envelope_expiry_is_enforced() {
+        let envelope = sample_envelope();
+        assert!(envelope.verify_for_signing(1000).is_ok());
+        assert!(envelope.verify_for_signing(1001).is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_version() {
+        let mut envelope = sample_envelope();
+        envelope.version = ENVELOPE_VERSION + 1;
+        envelope.checksum = envelope.checksum();
+        assert!(envelope.verify().is_err());
+    }
+
+    #[test]
+    fn bundle_round_trips_and_detects_tampering() {
+        let bundle = SignatureBundle::new("abc", "AAAAAA==", "deadbeef", vec!["00".into()]);
+        let json = bundle.to_json().unwrap();
+        assert_eq!(SignatureBundle::from_json(&json).unwrap(), bundle);
+
+        let mut tampered = bundle.clone();
+        tampered.tx_hash = "cafebabe".to_string();
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn assemble_rejects_bundle_for_a_different_envelope() {
+        let envelope = sample_envelope();
+        let bundle = SignatureBundle::new("not-the-checksum", "AAAAAA==", "deadbeef", vec![]);
+        assert!(bundle.assemble(&envelope, "Test SDF Network ; September 2015").is_err());
+    }
 
     #[test]
     fn invoke_args_places_function_after_separator() {

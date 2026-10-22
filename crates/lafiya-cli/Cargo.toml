@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 lafiya-config = { path = "../lafiya-config" }
 lafiya-rpc-resilience = { path = "../lafiya-rpc-resilience" }
+lafiya-qr = { path = "../lafiya-qr" }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_mangen = "0.2"

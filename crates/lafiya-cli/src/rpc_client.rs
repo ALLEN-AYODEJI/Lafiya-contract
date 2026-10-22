@@ -533,6 +533,208 @@ impl RpcClient for StellarCliClient {
 }
 
 // ---------------------------------------------------------------------------
+// Doctor checks (issue #535)
+// ---------------------------------------------------------------------------
+
+/// Severity of a doctor check result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorSeverity {
+    /// Informational; never blocks.
+    Info,
+    /// Degraded but non-blocking.
+    Warning,
+    /// Blocking failure; causes a non-zero exit.
+    Error,
+}
+
+impl DoctorSeverity {
+    /// Stable machine-readable label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DoctorSeverity::Info => "info",
+            DoctorSeverity::Warning => "warning",
+            DoctorSeverity::Error => "error",
+        }
+    }
+
+    /// Whether a result with this severity blocks a mutating action.
+    pub fn is_blocking(&self) -> bool {
+        matches!(self, DoctorSeverity::Error)
+    }
+}
+
+/// The result of a single doctor check.
+#[derive(Debug, Clone)]
+pub struct DoctorCheck {
+    /// Stable identifier (e.g. `rpc_health`).
+    pub id: &'static str,
+    /// Severity of the outcome.
+    pub severity: DoctorSeverity,
+    /// Short human-readable summary.
+    pub message: String,
+    /// Optional remediation hint for the operator.
+    pub remediation: Option<String>,
+}
+
+impl DoctorCheck {
+    fn new(
+        id: &'static str,
+        severity: DoctorSeverity,
+        message: impl Into<String>,
+        remediation: Option<&str>,
+    ) -> Self {
+        Self {
+            id,
+            severity,
+            message: message.into(),
+            remediation: remediation.map(str::to_string),
+        }
+    }
+
+    /// Whether this check blocks a mutating action.
+    pub fn is_blocking(&self) -> bool {
+        self.severity.is_blocking()
+    }
+}
+
+/// Minimum protocol version the CLI is known to work against.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 20;
+
+/// Default maximum ledger drift tolerated between the RPC node's latest
+/// ledger and the ledger an instance entry was last modified at.
+pub const DEFAULT_MAX_INSTANCE_LEDGER_DRIFT: u32 = 100_000;
+
+/// Check that the RPC node is reachable and reports a supported protocol
+/// version.
+///
+/// This performs a single `get_network_info` call, so it is bounded by the
+/// provider's own transport timeout.
+pub fn check_rpc_health(
+    client: &dyn RpcClient,
+    expected_passphrase: &str,
+) -> DoctorCheck {
+    match client.get_network_info() {
+        Ok(info) => {
+            if info.protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION {
+                return DoctorCheck::new(
+                    "rpc_protocol_version",
+                    DoctorSeverity::Error,
+                    format!(
+                        "RPC node reports protocol version {} (minimum supported is {})",
+                        info.protocol_version, MIN_SUPPORTED_PROTOCOL_VERSION
+                    ),
+                    Some("Point --rpc-url at a node running a supported protocol version."),
+                );
+            }
+            if info.network_passphrase != expected_passphrase {
+                return DoctorCheck::new(
+                    "rpc_network_passphrase",
+                    DoctorSeverity::Error,
+                    format!(
+                        "RPC node passphrase {:?} does not match configured {:?}",
+                        info.network_passphrase, expected_passphrase
+                    ),
+                    Some("Set --network-passphrase to match the target network."),
+                );
+            }
+            DoctorCheck::new(
+                "rpc_health",
+                DoctorSeverity::Info,
+                format!(
+                    "RPC healthy at ledger {} (protocol {})",
+                    info.latest_ledger, info.protocol_version
+                ),
+                None,
+            )
+        }
+        Err(e) => DoctorCheck::new(
+            "rpc_health",
+            DoctorSeverity::Error,
+            format!("RPC node unreachable: {e}"),
+            Some("Check --rpc-url and network connectivity, then retry."),
+        ),
+    }
+}
+
+/// Check the remaining TTL of a contract instance entry.
+///
+/// `instance_key_xdr` is the XDR-encoded ledger key of the contract instance.
+/// The check reads the entry's `last_modified_ledger` and compares it against
+/// the node's latest ledger; if the drift exceeds `max_drift` the instance is
+/// considered at risk of archival.
+pub fn check_instance_ttl(
+    client: &dyn RpcClient,
+    instance_key_xdr: &str,
+    max_drift: u32,
+) -> DoctorCheck {
+    let info = match client.get_network_info() {
+        Ok(info) => info,
+        Err(e) => {
+            return DoctorCheck::new(
+                "instance_ttl",
+                DoctorSeverity::Error,
+                format!("cannot evaluate instance TTL: {e}"),
+                Some("Resolve the RPC health check first."),
+            )
+        }
+    };
+
+    let entries = match client.get_ledger_entries(&[instance_key_xdr]) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return DoctorCheck::new(
+                "instance_ttl",
+                DoctorSeverity::Error,
+                format!("cannot read contract instance entry: {e}"),
+                Some("Verify the contract id and that the instance is not archived."),
+            )
+        }
+    };
+
+    let entry = match entries.into_iter().next() {
+        Some(entry) => entry,
+        None => {
+            return DoctorCheck::new(
+                "instance_ttl",
+                DoctorSeverity::Error,
+                "contract instance entry not found on-chain".to_string(),
+                Some("The contract may be archived or the contract id is stale."),
+            )
+        }
+    };
+
+    let drift = info.latest_ledger.saturating_sub(entry.last_modified_ledger);
+    if drift > max_drift {
+        DoctorCheck::new(
+            "instance_ttl",
+            DoctorSeverity::Error,
+            format!(
+                "contract instance last modified {} ledgers ago (limit {})",
+                drift, max_drift
+            ),
+            Some("Extend the instance TTL before running mutating actions."),
+        )
+    } else if drift * 2 > max_drift {
+        DoctorCheck::new(
+            "instance_ttl",
+            DoctorSeverity::Warning,
+            format!(
+                "contract instance last modified {} ledgers ago (limit {})",
+                drift, max_drift
+            ),
+            Some("Consider extending the instance TTL soon."),
+        )
+    } else {
+        DoctorCheck::new(
+            "instance_ttl",
+            DoctorSeverity::Info,
+            format!("contract instance fresh ({} ledgers since last modification)", drift),
+            None,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory helper
 // ---------------------------------------------------------------------------
 
@@ -615,6 +817,138 @@ mod tests {
         // The stellar-cli client returns StellarCli error for simulate.
         let err = client.simulate("xdr").unwrap_err();
         assert!(matches!(err, RpcClientError::StellarCli { .. }));
+    }
+
+    /// Mock provider for doctor checks.
+    struct MockRpcClient {
+        network: Result<NetworkInfo, RpcClientError>,
+        entries: Result<Vec<LedgerEntry>, RpcClientError>,
+    }
+
+    impl RpcClient for MockRpcClient {
+        fn simulate(&self, _unsigned_xdr: &str) -> Result<SimulateResult, RpcClientError> {
+            Err(RpcClientError::NotImplemented { detail: "mock".into() })
+        }
+        fn send(&self, _signed_xdr: &str) -> Result<SendResult, RpcClientError> {
+            Err(RpcClientError::NotImplemented { detail: "mock".into() })
+        }
+        fn poll(&self, _tx_hash: &str, _max_attempts: u32) -> Result<TxResult, RpcClientError> {
+            Err(RpcClientError::NotImplemented { detail: "mock".into() })
+        }
+        fn get_ledger_entries(
+            &self,
+            _keys_xdr: &[&str],
+        ) -> Result<Vec<LedgerEntry>, RpcClientError> {
+            match &self.entries {
+                Ok(entries) => Ok(entries.clone()),
+                Err(_) => Err(RpcClientError::Transport { detail: "mock".into() }),
+            }
+        }
+        fn get_network_info(&self) -> Result<NetworkInfo, RpcClientError> {
+            match &self.network {
+                Ok(info) => Ok(info.clone()),
+                Err(_) => Err(RpcClientError::Transport { detail: "mock".into() }),
+            }
+        }
+        fn sign_and_submit(
+            &self,
+            _unsigned_xdr: &str,
+            _signer: &dyn Signer,
+            _poll_attempts: u32,
+        ) -> Result<TxResult, RpcClientError> {
+            Err(RpcClientError::NotImplemented { detail: "mock".into() })
+        }
+    }
+
+    fn healthy_network() -> NetworkInfo {
+        NetworkInfo {
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+            latest_ledger: 1_000,
+        }
+    }
+
+    #[test]
+    fn doctor_rpc_health_ok() {
+        let client = MockRpcClient {
+            network: Ok(healthy_network()),
+            entries: Ok(vec![]),
+        };
+        let check = check_rpc_health(&client, "Test SDF Network ; September 2015");
+        assert_eq!(check.severity, DoctorSeverity::Info);
+        assert!(!check.is_blocking());
+    }
+
+    #[test]
+    fn doctor_rpc_health_unreachable_is_blocking() {
+        let client = MockRpcClient {
+            network: Err(RpcClientError::Transport { detail: "down".into() }),
+            entries: Ok(vec![]),
+        };
+        let check = check_rpc_health(&client, "Test SDF Network ; September 2015");
+        assert_eq!(check.severity, DoctorSeverity::Error);
+        assert!(check.is_blocking());
+        assert!(check.remediation.is_some());
+    }
+
+    #[test]
+    fn doctor_rpc_health_protocol_too_old_is_blocking() {
+        let mut network = healthy_network();
+        network.protocol_version = MIN_SUPPORTED_PROTOCOL_VERSION - 1;
+        let client = MockRpcClient { network: Ok(network), entries: Ok(vec![]) };
+        let check = check_rpc_health(&client, "Test SDF Network ; September 2015");
+        assert_eq!(check.severity, DoctorSeverity::Error);
+        assert_eq!(check.id, "rpc_protocol_version");
+    }
+
+    #[test]
+    fn doctor_rpc_health_passphrase_mismatch_is_blocking() {
+        let client = MockRpcClient {
+            network: Ok(healthy_network()),
+            entries: Ok(vec![]),
+        };
+        let check = check_rpc_health(&client, "Public Global Stellar Network ; September 2015");
+        assert_eq!(check.severity, DoctorSeverity::Error);
+        assert_eq!(check.id, "rpc_network_passphrase");
+    }
+
+    #[test]
+    fn doctor_instance_ttl_fresh_is_info() {
+        let client = MockRpcClient {
+            network: Ok(healthy_network()),
+            entries: Ok(vec![LedgerEntry {
+                key_xdr: "key".into(),
+                value_xdr: "value".into(),
+                last_modified_ledger: 990,
+            }]),
+        };
+        let check = check_instance_ttl(&client, "key", DEFAULT_MAX_INSTANCE_LEDGER_DRIFT);
+        assert_eq!(check.severity, DoctorSeverity::Info);
+    }
+
+    #[test]
+    fn doctor_instance_ttl_stale_is_blocking() {
+        let client = MockRpcClient {
+            network: Ok(healthy_network()),
+            entries: Ok(vec![LedgerEntry {
+                key_xdr: "key".into(),
+                value_xdr: "value".into(),
+                last_modified_ledger: 1,
+            }]),
+        };
+        let check = check_instance_ttl(&client, "key", DEFAULT_MAX_INSTANCE_LEDGER_DRIFT);
+        assert_eq!(check.severity, DoctorSeverity::Error);
+        assert!(check.is_blocking());
+    }
+
+    #[test]
+    fn doctor_instance_ttl_missing_entry_is_blocking() {
+        let client = MockRpcClient {
+            network: Ok(healthy_network()),
+            entries: Ok(vec![]),
+        };
+        let check = check_instance_ttl(&client, "key", DEFAULT_MAX_INSTANCE_LEDGER_DRIFT);
+        assert_eq!(check.severity, DoctorSeverity::Error);
     }
 
     #[test]
