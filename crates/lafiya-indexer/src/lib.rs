@@ -9,5 +9,10 @@ pub mod decode;
 pub mod ingest;
 pub mod metrics;
 pub mod reconcile;
+pub mod reorg;
 pub mod rpc;
 pub mod store;
+
+pub use ingest::{IngestConfig, IngestError, Ingestor};
+pub use reorg::{FinalityInfo, ReorgDetector, ReorgError, RollbackOutcome};
+pub use store::{IndexerStore, StoreError};

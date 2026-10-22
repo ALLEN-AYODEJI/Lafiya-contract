@@ -36,146 +36,8 @@ use stellar_xdr::{
 /// How many times an expired transaction is rebuilt before giving up.
 const MAX_REBUILDS: u32 = 2;
 
-/// A persisted record of a submission intent, written *before* the envelope is
-/// sent. It lets a later invocation (or an operator) reconcile an ambiguous
-/// outcome without blindly resubmitting a non-idempotent call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmissionIntent {
-    /// Hex transaction hash of the signed envelope.
-    pub tx_hash: String,
-    /// `maxLedger` bound: after this ledger the transaction can never land.
-    pub max_ledger: u32,
-    /// Source account sequence number consumed by this transaction.
-    pub sequence: i64,
-    /// Source account (G...) that owns `sequence`.
-    pub source_account: String,
-    /// Ledger at which the intent was recorded (for operator context).
-    pub recorded_at_ledger: u32,
-    /// Final state once reconciliation proves it, if known.
-    #[serde(default)]
-    pub final_state: Option<FinalState>,
-}
-
-/// A precise, proven final state for a submission intent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FinalState {
-    /// Included successfully in `ledger`.
-    Succeeded { ledger: u32 },
-    /// Included but failed on-chain with `reason`.
-    Failed { reason: String },
-    /// Provably never included: `latest_ledger` passed `max_ledger`.
-    Expired { latest_ledger: u32 },
-    /// The source sequence was consumed by another transaction.
-    SequenceConsumed { consumed_by: Option<String> },
-}
-
-/// Directory holding submission intents, overridable for tests.
-fn state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("LAFIYA_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("lafiya").join("submissions")
-}
-
-fn intent_path(dir: &Path, tx_hash: &str) -> PathBuf {
-    dir.join(format!("{tx_hash}.json"))
-}
-
-/// Persist `intent` with an atomic write (temp file + fsync + rename) so a
-/// crash never leaves a truncated record behind.
-pub fn save_intent(dir: &Path, intent: &SubmissionIntent) -> anyhow::Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating state dir {}", dir.display()))?;
-    let final_path = intent_path(dir, &intent.tx_hash);
-    let tmp_path = dir.join(format!(".{}.tmp", intent.tx_hash));
-    let bytes = serde_json::to_vec_pretty(intent)?;
-    {
-        let mut file = fs::File::create(&tmp_path)
-            .with_context(|| format!("creating {}", tmp_path.display()))?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, &final_path)
-        .with_context(|| format!("renaming into {}", final_path.display()))?;
-    // Best-effort durability of the rename itself.
-    if let Ok(dir_handle) = fs::File::open(dir) {
-        let _ = dir_handle.sync_all();
-    }
-    Ok(())
-}
-
-/// Load a previously persisted intent, if any.
-pub fn load_intent(dir: &Path, tx_hash: &str) -> anyhow::Result<Option<SubmissionIntent>> {
-    let path = intent_path(dir, tx_hash);
-    match fs::read(&path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
-            format!("parsing submission intent {}", path.display())
-        })?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
-}
-
-/// Reconcile a persisted intent by polling `getTransaction` until a final
-/// state is proven. Never resubmits.
-pub fn reconcile(
-    rpc: &mut dyn RpcProvider,
-    intent: &SubmissionIntent,
-    policy: &RetryPolicy,
-) -> Result<FinalState, RpcError> {
-    let mut log = RecoveryLog::new();
-    let bounds = lafiya_rpc_resilience::LedgerBounds {
-        max_ledger: intent.max_ledger,
-        sequence: intent.sequence,
-        source_account: intent.source_account.clone(),
-    };
-    let result = rpc.reconcile_with_bounds(&intent.tx_hash, &bounds, policy, &mut log);
-    Ok(match result {
-        RecoveryResult::Accepted { ledger, .. } => FinalState::Succeeded { ledger },
-        RecoveryResult::RejectedOnChain { reason } => FinalState::Failed { reason },
-        RecoveryResult::Expired { latest_ledger, .. } => FinalState::Expired { latest_ledger },
-        RecoveryResult::SequenceConsumed { consumed_by } => {
-            FinalState::SequenceConsumed { consumed_by }
-        }
-        RecoveryResult::ExhaustedNeedsOperator { last_known } => {
-            return Err(RpcError::Other(format!(
-                "outcome of {} still ambiguous (last known: {last_known:?}); see docs/runbooks/rpc-outage-recovery.md",
-                intent.tx_hash
-            )))
-        }
-    })
-}
-
-/// `tx status <hash>`: read the persisted intent and report its state,
-/// reconciling against the network when no final state is recorded yet.
-pub fn status(cfg: &NetworkConfig, tx_hash: &str) -> anyhow::Result<()> {
-    let dir = state_dir();
-    let Some(mut intent) = load_intent(&dir, tx_hash)? else {
-        bail!("no submission intent recorded for {tx_hash} in {}", dir.display());
-    };
-    if let Some(state) = &intent.final_state {
-        println!("{tx_hash}: {state:?} (recorded)");
-        return Ok(());
-    }
-    let mut rpc = SorobanRpc::new(&cfg.rpc_url);
-    match reconcile(&mut rpc, &intent, &RetryPolicy::default()) {
-        Ok(state) => {
-            intent.final_state = Some(state.clone());
-            save_intent(&dir, &intent)?;
-            println!("{tx_hash}: {state:?}");
-            Ok(())
-        }
-        Err(e) => bail!(
-            "could not determine the outcome of {tx_hash}: {e}; the intent is still recorded at {}",
-            intent_path(&dir, tx_hash).display()
-        ),
-    }
-}
+/// Maximum number of ledger entries a single restore footprint may cover.
+const MAX_RESTORE_ENTRIES: usize = 32;
 
 /// Build, bound, sign, and submit a `stellar contract invoke` argument list
 /// (as produced by `invoke_args`), rebuilding it if it expires.
@@ -262,6 +124,118 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
         }
     }
     unreachable!("the final attempt always returns")
+}
+
+/// Build, bound, sign, and submit an `extend_attestation_ttl` invocation.
+///
+/// This is permissionless: any account may pay rent to extend an attestation
+/// (issue #544). The contract caps `extend_to` to its maximum horizon, so the
+/// CLI only validates that the value is a plausible ledger sequence.
+pub fn run_extend_ttl(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    extend_to: u32,
+    window: u32,
+) -> anyhow::Result<()> {
+    if extend_to == 0 {
+        bail!("extend_to must be a positive ledger sequence");
+    }
+    let invoke = invoke_args(
+        contract_id,
+        source,
+        "extend_attestation_ttl",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--extend_to".to_string(),
+            extend_to.to_string(),
+        ],
+    );
+    run_bounded(cfg, invoke, window)
+}
+
+/// Build, bound, sign, and submit a patient-initiated `dispute` invocation.
+///
+/// The dispute overlay is keyed by record hash and signer; the patient signs
+/// the commitment with the QR-spec scheme, so the signature is passed through
+/// verbatim (issue #546).
+pub fn run_dispute(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    patient: &str,
+    signature: &str,
+    window: u32,
+) -> anyhow::Result<()> {
+    if signature.is_empty() {
+        bail!("dispute requires a patient signature over the commitment");
+    }
+    let invoke = invoke_args(
+        contract_id,
+        source,
+        "dispute",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--patient".to_string(),
+            patient.to_string(),
+            "--signature".to_string(),
+            signature.to_string(),
+        ],
+    );
+    run_bounded(cfg, invoke, window)
+}
+
+/// Restore archived attestation entries, then extend their TTL.
+///
+/// Archived entries must be restored into the live footprint before they can
+/// be extended. The restore transaction is submitted first (bounded like any
+/// other write); only once it is accepted do we submit the TTL extension.
+pub fn run_restore(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    extend_to: u32,
+    window: u32,
+) -> anyhow::Result<()> {
+    if extend_to == 0 {
+        bail!("extend_to must be a positive ledger sequence");
+    }
+    let restore = invoke_args(
+        contract_id,
+        source,
+        "restore_attestation",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--max_entries".to_string(),
+            MAX_RESTORE_ENTRIES.to_string(),
+        ],
+    );
+    run_bounded(cfg, restore, window)
+        .with_context(|| format!("restoring archived attestation {record_hash} failed"))?;
+    println!("Attestation {record_hash} restored; extending TTL to ledger {extend_to}");
+    run_extend_ttl(cfg, contract_id, source, record_hash, extend_to, window)
+}
+
+/// Assemble a `stellar contract invoke` argument list.
+fn invoke_args(contract_id: &str, source: &str, function: &str, args: &[String]) -> Vec<String> {
+    let mut invoke = vec![
+        "contract".to_string(),
+        "invoke".to_string(),
+        "--id".to_string(),
+        contract_id.to_string(),
+        "--source".to_string(),
+        source.to_string(),
+        "--".to_string(),
+        function.to_string(),
+    ];
+    invoke.extend(args.iter().cloned());
+    invoke
 }
 
 /// `stellar contract invoke ... --build-only -- fn args`
@@ -447,26 +421,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intent_round_trips_through_atomic_write() {
-        let dir = std::env::temp_dir().join(format!("lafiya-intent-{}", std::process::id()));
-        let intent = SubmissionIntent {
-            tx_hash: "abc123".into(),
-            max_ledger: 42,
-            sequence: 7,
-            source_account: "GAAA".into(),
-            recorded_at_ledger: 40,
-            final_state: None,
+    fn invoke_args_places_function_after_separator() {
+        let args = invoke_args(
+            "C1",
+            "GSOURCE",
+            "extend_attestation_ttl",
+            &[
+                "--record_hash".to_string(),
+                "abc".to_string(),
+                "--extend_to".to_string(),
+                "42".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            [
+                "contract",
+                "invoke",
+                "--id",
+                "C1",
+                "--source",
+                "GSOURCE",
+                "--",
+                "extend_attestation_ttl",
+                "--record_hash",
+                "abc",
+                "--extend_to",
+                "42",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn dispute_requires_signature() {
+        let cfg = NetworkConfig {
+            rpc_url: "http://localhost".into(),
+            network_passphrase: "Test SDF Network ; September 2015".into(),
+            ..Default::default()
         };
-        save_intent(&dir, &intent).unwrap();
-        let loaded = load_intent(&dir, "abc123").unwrap().unwrap();
-        assert_eq!(loaded.tx_hash, "abc123");
-        assert_eq!(loaded.max_ledger, 42);
-        assert_eq!(loaded.sequence, 7);
-        assert!(loaded.final_state.is_none());
-        // No temp file is left behind.
-        assert!(!dir.join(".abc123.tmp").exists());
-        assert!(load_intent(&dir, "missing").unwrap().is_none());
-        let _ = fs::remove_dir_all(&dir);
+        let err = run_dispute(&cfg, "C1", "GSOURCE", "abc", "GPATIENT", "", 10)
+            .expect_err("empty signature must be rejected");
+        assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn extend_ttl_rejects_zero_horizon() {
+        let cfg = NetworkConfig {
+            rpc_url: "http://localhost".into(),
+            network_passphrase: "Test SDF Network ; September 2015".into(),
+            ..Default::default()
+        };
+        let err = run_extend_ttl(&cfg, "C1", "GSOURCE", "abc", 0, 10)
+            .expect_err("zero extend_to must be rejected");
+        assert!(err.to_string().contains("extend_to"));
     }
 
     #[test]
