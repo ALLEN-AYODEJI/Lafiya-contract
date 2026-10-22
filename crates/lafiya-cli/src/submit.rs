@@ -19,8 +19,12 @@ use lafiya_rpc_resilience::{
     max_ledger_for, FailoverClient, RecoveryLog, RecoveryResult, RetryPolicy, RpcError,
     RpcProvider, SubmitOutcome, TxState,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
@@ -55,6 +59,19 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
             bounds.sequence
         );
 
+        // Persist the intent *before* sending so an ambiguous outcome can be
+        // reconciled later without double submission.
+        let dir = state_dir();
+        let mut intent = SubmissionIntent {
+            tx_hash: tx_hash.clone(),
+            max_ledger,
+            sequence: bounds.sequence,
+            source_account: bounds.source_account.clone(),
+            recorded_at_ledger: latest,
+            final_state: None,
+        };
+        save_intent(&dir, &intent)?;
+
         rpc.envelope = Some(signed);
         let mut client = FailoverClient::new(vec![Box::new(rpc)], RetryPolicy::default());
         let mut log = RecoveryLog::new();
@@ -64,28 +81,45 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
         }
         match result {
             RecoveryResult::Accepted { ledger, .. } => {
+                intent.final_state = Some(FinalState::Succeeded { ledger });
+                save_intent(&dir, &intent)?;
                 println!("Transaction {tx_hash} succeeded in ledger {ledger}");
                 return Ok(());
             }
             RecoveryResult::RejectedOnChain { reason } => {
+                intent.final_state = Some(FinalState::Failed {
+                    reason: reason.clone(),
+                });
+                save_intent(&dir, &intent)?;
                 bail!("transaction {tx_hash} failed on-chain: {reason}")
             }
             RecoveryResult::Expired { latest_ledger, .. } if attempt < MAX_REBUILDS => {
+                intent.final_state = Some(FinalState::Expired { latest_ledger });
+                save_intent(&dir, &intent)?;
                 eprintln!(
                     "Transaction {tx_hash} expired (ledger {latest_ledger} > {max_ledger}); it can never be included -- rebuilding"
                 );
             }
             RecoveryResult::Expired { latest_ledger, .. } => {
+                intent.final_state = Some(FinalState::Expired { latest_ledger });
+                save_intent(&dir, &intent)?;
                 bail!("transaction {tx_hash} expired at ledger {latest_ledger} after {MAX_REBUILDS} rebuilds; nothing was applied")
             }
-            RecoveryResult::SequenceConsumed { consumed_by } => bail!(
-                "sequence {} of {} was consumed by {}; transaction {tx_hash} can never be included. Check whether that transaction already made this change before retrying.",
-                bounds.sequence,
-                bounds.source_account,
-                consumed_by.as_deref().unwrap_or("another transaction")
-            ),
+            RecoveryResult::SequenceConsumed { consumed_by } => {
+                intent.final_state = Some(FinalState::SequenceConsumed {
+                    consumed_by: consumed_by.clone(),
+                });
+                save_intent(&dir, &intent)?;
+                bail!(
+                    "sequence {} of {} was consumed by {}; transaction {tx_hash} can never be included. Check whether that transaction already made this change before retrying.",
+                    bounds.sequence,
+                    bounds.source_account,
+                    consumed_by.as_deref().unwrap_or("another transaction")
+                )
+            }
             RecoveryResult::ExhaustedNeedsOperator { last_known } => bail!(
-                "could not determine the outcome of {tx_hash} (last known: {last_known:?}); see docs/runbooks/rpc-outage-recovery.md"
+                "could not determine the outcome of {tx_hash} (last known: {last_known:?}); the intent is recorded at {} -- run `tx status {tx_hash}` to reconcile; see docs/runbooks/rpc-outage-recovery.md",
+                intent_path(&dir, &tx_hash).display()
             ),
         }
     }
