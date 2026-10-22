@@ -53,10 +53,10 @@ pub struct Metrics {
     /// Labelled by `kind` (`attester` / `attestation`).
     pub reconcile_checks_total: IntCounterVec,
     pub reconcile_mismatches_total: IntCounterVec,
-    /// Labelled by `route` (templated) and `status` (HTTP code).
-    pub api_requests_total: IntCounterVec,
-    /// Labelled by `route` (templated); drives the p99 latency SLI.
-    pub api_request_duration_seconds: Histogram,
+    /// Ledger-hash continuity mismatches detected during ingestion.
+    pub reorg_detected_total: IntCounter,
+    /// Depth (in ledgers) of the most recent rollback; 0 when none has occurred.
+    pub reorg_last_rollback_depth: IntGauge,
 }
 
 impl Metrics {
@@ -134,6 +134,14 @@ impl Metrics {
                 "lafiya_indexer_api_request_duration_seconds",
                 "API request latency in seconds",
                 &["route"],
+            ),
+            reorg_detected_total: counter(
+                "lafiya_indexer_reorg_detected_total",
+                "Ledger-hash continuity mismatches detected during ingestion",
+            ),
+            reorg_last_rollback_depth: gauge(
+                "lafiya_indexer_reorg_last_rollback_depth",
+                "Depth in ledgers of the most recent rollback (0 if none)",
             ),
             registry,
         }

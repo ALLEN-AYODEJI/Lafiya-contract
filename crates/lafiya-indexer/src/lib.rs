@@ -10,7 +10,10 @@ pub mod delivery;
 pub mod ingest;
 pub mod metrics;
 pub mod reconcile;
-pub mod retention;
+pub mod reorg;
 pub mod rpc;
 pub mod store;
-pub mod webhook;
+
+pub use ingest::{IngestConfig, IngestError, Ingestor};
+pub use reorg::{FinalityInfo, ReorgDetector, ReorgError, RollbackOutcome};
+pub use store::{IndexerStore, StoreError};

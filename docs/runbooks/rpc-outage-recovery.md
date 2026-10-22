@@ -210,77 +210,56 @@ describes.
    this was a fee-congestion case, not an ambiguous-outcome case, so the next operator
    doesn't re-walk §3a expecting a different answer.
 
-## 7. Indexer ingestion lag and checkpoint age
+## 7. Ledger reorg / provider divergence (indexer)
 
-**Scope:** the indexer's Prometheus alerts fire — `LafiyaIndexerIngestionLagHigh`,
-`LafiyaIndexerIngestionLagCritical`, `LafiyaIndexerCheckpointStalled`,
-`LafiyaIndexerCheckpointAgeHigh`, or `LafiyaIndexerRetentionGap`. These are about the
-indexer falling behind the chain, not about RPC submission failures; if you also see
-`watchdog_failing` / `watchdog_lag`, treat the RPC outage first ([§4](#4-if-the-provider-itself-is-down)).
-SLI definitions, metric names, and thresholds are in
-[`../observability.md`](../observability.md#indexer-slis).
+**Scope:** the `lafiya-indexer` ingest loop (`crates/lafiya-indexer/src/ingest.rs`) has
+detected a ledger-hash discontinuity — the tip served by the current RPC provider does not
+extend the chain the indexer already persisted. This happens during provider failover or a
+provider restart that serves a divergent tip. It is *not* an RPC outage (§4) and *not* an
+ambiguous submission (§3a): the transaction outcome is known, but the indexed state may
+reflect events from a ledger that was later dropped.
 
-### 7a. Confirm the lag is real
+**What the indexer does automatically.** On every page it records the ledger hash and
+verifies continuity against the last ingested ledger. On mismatch it rolls back the derived
+tables to the common ancestor inside a single transaction and re-ingests from there. The
+rollback is atomic and idempotent — re-running yields the same state — so in the common case
+no operator action is needed. Watch for:
 
-1. Check the SLI directly:
-   ```sh
-   curl -s http://<indexer-host>:<metrics-port>/metrics \
-     | grep -E '^lafiya_indexer_(ingestion_lag_ledgers|ingestion_lag_seconds|checkpoint_age_seconds|last_indexed_ledger|chain_head_ledger)'
-   ```
-   `lafiya_indexer_ingestion_lag_ledgers` is `chain_head_ledger - last_indexed_ledger`; a
-   non-zero, growing value means the indexer is behind. A flat value means it is caught up
-   but the chain head is advancing normally.
-2. Compare against the chain head from a known-good RPC endpoint (§3a's `getLatestLedger`):
-   ```sh
-   curl -s "$LAFIYA_RPC_URL" -H 'content-type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}' | python3 -m json.tool
-   ```
-   If the RPC's `sequence` matches `lafiya_indexer_chain_head_ledger`, the indexer's view of
-   the head is current and the gap is on the indexing side, not the RPC side.
-3. If the lag is small (a few ledgers) and shrinking, it is normal catch-up after a restart
-   or a burst of activity — no action beyond watching it clear.
+- `reorg_detected_total` incrementing (metric exposed by the indexer);
+- the last-rollback depth metric rising (how many ledgers were rolled back).
 
-### 7b. Stalled checkpoint (`LafiyaIndexerCheckpointStalled`)
+A single small reorg (depth of a few ledgers) that resolves on its own is expected during
+failover. Continue below only if the metric keeps climbing, the depth is large, or the
+indexer cannot find a common ancestor.
 
-`lafiya_indexer_checkpoint_age_seconds` measures how long since the last checkpoint was
-persisted. A stalled checkpoint with a *growing* ingestion lag usually means the indexer
-process is wedged or its database is unreachable:
-
-1. Check the process is alive and its logs for repeated errors:
-   ```sh
-   systemctl status lafiya-indexer   # or: docker ps / kubectl get pods
-   journalctl -u lafiya-indexer -n 200 --no-pager
-   ```
-2. Check database connectivity and disk space — a full disk prevents checkpoint writes and
-   is the most common cause of a stalled checkpoint with a healthy process.
-3. If the process is wedged, restart it. The indexer resumes from its last persisted
-   checkpoint, so a restart is safe and does not replay already-applied ledgers.
-4. If it restarts and stalls again within one checkpoint interval, escalate
-   ([§5](#5-escalate)) with the logs; do not loop restarts.
-
-### 7c. Retention gap (`LafiyaIndexerRetentionGap`)
-
-This alert means the indexer's checkpoint is older than the RPC provider's ledger retention
-window, so the ledgers it needs are no longer available from that provider. It cannot be
-fixed by waiting — the indexer must be re-pointed at a provider that still has the missing
-range, or resynced from a snapshot:
-
-1. Determine the checkpoint ledger and the provider's oldest available ledger:
-   ```sh
-   curl -s http://<indexer-host>:<metrics-port>/metrics | grep '^lafiya_indexer_last_indexed_ledger'
-   curl -s "$LAFIYA_RPC_URL" -H 'content-type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | python3 -m json.tool
-   ```
-2. Point the indexer at a provider whose retention window covers the checkpoint ledger (see
-   [§4](#4-if-the-provider-itself-is-down) for how to override the RPC URL without editing
-   tracked config), then restart it.
-3. If no reachable provider retains the range, resync the indexer from the most recent
-   snapshot and accept the gap in indexed history; record the gap's ledger range in the
-   incident notes so downstream consumers know which range is missing.
-
-### 7d. After recovery
-
-Confirm `lafiya_indexer_ingestion_lag_ledgers` returns to its steady-state value and
-`lafiya_indexer_checkpoint_age_seconds` is below the checkpoint interval before closing the
-incident. If the alert was `LafiyaIndexerRetentionGap`, note the missing ledger range in the
-incident record even after the alert clears.
+1. **Confirm it is a reorg, not a stuck loop.** Check `reorg_detected_total` and the
+   last-rollback depth. If the depth keeps growing or the counter increments on every page,
+   the two providers likely disagree on history rather than one having a transient
+   divergent tip.
+2. **Pin the indexer to a single provider.** Mixed providers are the usual cause. Point the
+   indexer at one known-good RPC URL (the same override mechanism as §4:
+   `LAFIYA_<NETWORK>_RPC_URL=...` or `--set rpc_url=...`) and let it re-ingest from the
+   common ancestor. Do not commit a temporary override into the tracked config.
+3. **Verify the common ancestor.** If the indexer reports it cannot find a common ancestor
+   within its retention window, stop it before it ingests further. Compare the ledger hash
+   at the last known-good ledger (the one before the first `reorg_detected_total` increment)
+   across every configured provider using `getLedger`/`getLedgers`. A provider whose hash
+   for that ledger differs from the majority is the divergent one — remove it from
+   `rpc_urls` until it is resynced.
+4. **Re-ingest deterministically.** Once pinned to a consistent provider, restart the
+   indexer. Because rollback is idempotent, re-running from the checkpoint yields the same
+   state; no manual table surgery is required. If you must force a deeper rollback than the
+   indexer chose, do it only by moving the checkpoint back to a ledger whose hash you have
+   verified across providers — never by deleting rows by hand.
+5. **Tell API consumers about the confidence boundary.** API responses expose
+   `finalized_ledger`. After a reorg, `finalized_ledger` moves back to the new common
+   ancestor and only advances again as fresh ledgers are ingested. Consumers that need
+   finality should treat events at or below `finalized_ledger` as settled and anything above
+   it as provisional. If a consumer cached data derived from ledgers above the new
+   `finalized_ledger`, it must re-fetch.
+6. **Escalate** per [§5](#5-escalate) if the depth is large, providers cannot be reconciled,
+   or the indexer cannot make progress. Record: the network, every provider URL and the
+   ledger hash each reports for the disputed ledger(s), the `reorg_detected_total` value and
+   last-rollback depth at the time you intervened, and the checkpoint ledger you rolled back
+   to. Note explicitly that this was a reorg/divergence case so the next operator does not
+   re-walk §3a or §4 expecting a different answer.

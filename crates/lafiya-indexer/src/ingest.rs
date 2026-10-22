@@ -8,6 +8,7 @@ use sqlx::PgPool;
 
 use crate::decode::{cursor_ledger, RawEvent};
 use crate::metrics::Metrics;
+use crate::reconcile::{self, ReorgOutcome};
 use crate::rpc::{EventSource, RpcError, Start};
 use crate::store::{self, Checkpoint, StoreError};
 use crate::webhook::{self, WebhookConfig, WebhookError};
@@ -25,12 +26,19 @@ pub enum IngestError {
     NoStart,
     #[error("backfill: {0}")]
     Backfill(String),
+    #[error(
+        "ledger hash mismatch at ledger {ledger}: checkpoint has {expected}, RPC serves \
+         {actual}; rollback to the common ancestor failed"
+    )]
+    Reorg { ledger: u32, expected: String, actual: String },
     #[error(transparent)]
     Rpc(#[from] RpcError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+    #[error(transparent)]
+    Reconcile(#[from] reconcile::ReconcileError),
 }
 
 impl IngestError {
@@ -94,14 +102,19 @@ impl<S: EventSource> Ingestor<S> {
         let window = self.source.ledger_window().await?;
         check_retention(resume, window.oldest_ledger)?;
 
-        let page = match self.source.get_events(&start, self.page_limit).await {
-            Err(e) if e.is_out_of_retention() => {
-                return Err(IngestError::RetentionGap {
-                    resume,
-                    oldest: window.oldest_ledger,
-                })
+        // Verify hash continuity before touching derived tables: if the RPC's
+        // tip diverged from what we recorded, roll back and re-ingest instead
+        // of persisting events from a ledger that may be dropped.
+        let page = match self.fetch_verified_page(&start, resume).await? {
+            Some(page) => page,
+            None => {
+                // A reorg was rolled back; the next step re-reads the
+                // checkpoint and re-ingests from the common ancestor.
+                return Ok(Step {
+                    applied: 0,
+                    caught_up: false,
+                });
             }
-            other => other?,
         };
 
         let next = store::checkpoint_after(&page.cursor, &page.events, resume);
@@ -116,6 +129,71 @@ impl<S: EventSource> Ingestor<S> {
             applied,
             caught_up: page.events.len() < self.page_limit as usize,
         })
+    }
+
+    /// Fetch one page and verify its ledger hash chain against the recorded
+    /// hashes. Returns `None` when a reorg was detected and rolled back (the
+    /// caller must re-read the checkpoint and re-ingest).
+    async fn fetch_verified_page(
+        &self,
+        start: &Start,
+        resume: u32,
+    ) -> Result<Option<crate::rpc::EventPage>, IngestError> {
+        let page = match self.source.get_events(start, self.page_limit).await {
+            Err(e) if e.is_out_of_retention() => {
+                let window = self.source.ledger_window().await?;
+                return Err(IngestError::RetentionGap {
+                    resume,
+                    oldest: window.oldest_ledger,
+                });
+            }
+            other => other?,
+        };
+
+        // The page's first ledger hash must match what we recorded for that
+        // ledger (if we have it). A mismatch means the provider serves a
+        // divergent history.
+        if let Some(first) = page.events.first() {
+            if let Some(expected) = store::ledger_hash(&self.pool, first.ledger).await? {
+                if expected != first.ledger_hash {
+                    self.handle_reorg(first.ledger, &expected, &first.ledger_hash)
+                        .await?;
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(page))
+    }
+
+    /// Roll back derived tables to the common ancestor and record the reorg.
+    async fn handle_reorg(
+        &self,
+        ledger: u32,
+        expected: &str,
+        actual: &str,
+    ) -> Result<(), IngestError> {
+        self.metrics.reorg_detected_total.inc();
+        tracing::warn!(
+            ledger,
+            expected,
+            actual,
+            "ledger hash mismatch; rolling back to common ancestor"
+        );
+        match reconcile::rollback_to_common_ancestor(&self.pool, ledger).await? {
+            ReorgOutcome::RolledBack { depth, ancestor } => {
+                self.metrics.reorg_rollback_depth.set(i64::from(depth));
+                self.metrics
+                    .checkpoint_ledger
+                    .set(i64::from(ancestor.unwrap_or(0)));
+                Ok(())
+            }
+            ReorgOutcome::NoCommonAncestor => Err(IngestError::Reorg {
+                ledger,
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            }),
+        }
     }
 
     /// Ingest until a fatal error. Transient errors are logged and retried.
