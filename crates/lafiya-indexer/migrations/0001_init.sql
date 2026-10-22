@@ -67,10 +67,101 @@ CREATE TABLE attestations (
     attested_at      BIGINT NOT NULL,
     ledger           BIGINT NOT NULL,
     tx_hash          TEXT NOT NULL,
-    revoked_event_id TEXT
+    revoked_event_id TEXT,
+    -- Ledger at which the entry's TTL currently expires. Bumped by
+    -- `extend_attestation_ttl`; never lowered (the contract rejects
+    -- shortening), so the indexer can track the maximum observed horizon.
+    expires_at_ledger BIGINT,
+    -- Set by `AttestationTtlExtended`; the latest extension event for the
+    -- record wins. NULL when no extension has been observed.
+    ttl_extended_event_id TEXT
 );
 CREATE INDEX attestations_record_idx ON attestations (record_hash, event_id);
 CREATE INDEX attestations_attester_idx ON attestations (attester, event_id);
+-- Watchdog queries scan for entries approaching expiry.
+CREATE INDEX attestations_expiry_idx ON attestations (expires_at_ledger)
+    WHERE revoked_event_id IS NULL;
+
+-- TTL extension events, one row per `AttestationTtlExtended`. Kept separate
+-- from `attestations` so the full extension history is auditable.
+CREATE TABLE attestation_ttl_extensions (
+    event_id          TEXT PRIMARY KEY,
+    record_hash       TEXT NOT NULL,
+    caller            TEXT NOT NULL,
+    previous_expiry   BIGINT,
+    new_expiry        BIGINT NOT NULL,
+    ledger            BIGINT NOT NULL,
+    tx_hash           TEXT NOT NULL
+);
+CREATE INDEX attestation_ttl_extensions_record_idx
+    ON attestation_ttl_extensions (record_hash, event_id);
+
+-- Quorum policy per record class and the aggregated distinct-attester count
+-- for each record. `attester_count` counts distinct attesters with a live
+-- (non-revoked) attestation; the contract enforces the distinct-attester
+-- rule, so a repeated attestation from the same attester is a no-op.
+CREATE TABLE quorum_policies (
+    record_class   TEXT PRIMARY KEY,
+    required_count INTEGER NOT NULL CHECK (required_count >= 1),
+    updated_ledger BIGINT NOT NULL,
+    updated_event_id TEXT NOT NULL
+);
+
+CREATE TABLE record_quorum (
+    record_hash    TEXT PRIMARY KEY,
+    record_class   TEXT NOT NULL,
+    attester_count INTEGER NOT NULL DEFAULT 0,
+    -- Derived: attester_count >= policy.required_count at last update.
+    satisfied      BOOLEAN NOT NULL DEFAULT false,
+    updated_ledger BIGINT NOT NULL,
+    updated_event_id TEXT NOT NULL
+);
+CREATE INDEX record_quorum_class_idx ON record_quorum (record_class, satisfied);
+
+-- Patient-initiated dispute overlay. Keyed by record hash and the patient
+-- signer; disputes never delete the underlying attestation. `cleared_*`
+-- columns are set when an attester or admin clears the dispute.
+CREATE TABLE disputes (
+    record_hash       TEXT NOT NULL,
+    signer            TEXT NOT NULL,
+    raised_event_id   TEXT NOT NULL,
+    raised_ledger     BIGINT NOT NULL,
+    raised_tx_hash    TEXT NOT NULL,
+    reason_hash       TEXT,
+    cleared_event_id  TEXT,
+    cleared_ledger    BIGINT,
+    cleared_by        TEXT,
+    PRIMARY KEY (record_hash, signer)
+);
+CREATE INDEX disputes_open_idx ON disputes (record_hash)
+    WHERE cleared_event_id IS NULL;
+
+-- Status-list segments (W3C Bitstring Status List style). Each segment is a
+-- versioned bitstring with a signed root; `root` is the commitment verifiers
+-- validate inclusion against.
+CREATE TABLE status_list_segments (
+    segment_id     BIGINT PRIMARY KEY,
+    version        BIGINT NOT NULL,
+    root           TEXT NOT NULL,
+    bit_length     INTEGER NOT NULL CHECK (bit_length > 0),
+    -- Encoded bitstring payload (gzip+base64) for verifier sync.
+    payload        TEXT NOT NULL,
+    published_ledger BIGINT NOT NULL,
+    published_event_id TEXT NOT NULL
+);
+CREATE INDEX status_list_segments_version_idx
+    ON status_list_segments (segment_id, version);
+
+-- Signed roots over the full status-list state, so verifiers can validate a
+-- cached segment set against a single signed commitment.
+CREATE TABLE status_list_roots (
+    event_id       TEXT PRIMARY KEY,
+    root           TEXT NOT NULL,
+    segment_count  INTEGER NOT NULL,
+    ledger         BIGINT NOT NULL,
+    tx_hash        TEXT NOT NULL
+);
+CREATE INDEX status_list_roots_ledger_idx ON status_list_roots (ledger);
 
 CREATE TABLE revocations (
     event_id    TEXT PRIMARY KEY,

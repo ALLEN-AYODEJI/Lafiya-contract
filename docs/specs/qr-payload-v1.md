@@ -207,6 +207,46 @@ Verifiers that cannot resolve the patient key MUST silently skip signature verif
 patient signature is defense-in-depth against card substitution, not a primary trust anchor).
 The primary trust anchor is always the on-chain attestation.
 
+### 7.1 Patient dispute signature (domain-separated)
+
+A patient may flag an attestation as **disputed** without deleting it (see
+`docs/specs/verification-model.md` §"Disputed state" and the `attestation-registry`
+`Disputed` overlay). The dispute is submitted to the registry as a signed message; the
+signature is produced by the patient's Ed25519 key using the same key resolution as §7.
+
+The signed message is:
+
+```
+SHA-256("lafiya:attestation:dispute:v1" || network_id || attestation_registry || card_ref || nonce)
+```
+
+Where:
+
+| Component | Type | Description |
+|-----------|------|-------------|
+| `"lafiya:attestation:dispute:v1"` | ASCII bytes | Domain-separation tag. MUST be included verbatim. |
+| `network_id` | bytes(4) | Same derivation as §6. |
+| `attestation_registry` | bytes(32) | Contract ID of the registry holding the attestation. |
+| `card_ref` | bytes(32) | The record commitment being disputed (LRC-1 or LRC-2 root). |
+| `nonce` | bytes(32) | Per-dispute random nonce, chosen by the patient client. |
+
+**Domain separation.** The `lafiya:attestation:dispute:v1` tag is distinct from the QR
+patient-signature tag (`lafiya:qr:patient-sig:v1`, §7) and from any attester or admin
+signature domain. A signature produced for one purpose MUST NOT verify for another; verifiers
+and the registry MUST reject a dispute signature whose tag does not match exactly.
+
+**Replay protection.** The `nonce` is recorded on-chain in the `Disputed` overlay entry. The
+registry MUST reject a dispute submission whose `(card_ref, signer, nonce)` tuple has already
+been consumed, and MUST reject a `nonce` of all-zero bytes. Because `network_id` and
+`attestation_registry` are inside the signed message, a dispute signature captured on one
+network or registry cannot be replayed against another.
+
+**Scope of authority.** A dispute signature authorizes only the creation of a `Disputed`
+overlay entry. It MUST NOT authorize revocation, deletion, or modification of the underlying
+attestation; clearing a dispute requires an attester or admin action (see the verification
+model). Verifiers MUST surface the disputed state to responders as described in
+`docs/specs/verification-model.md`.
+
 ---
 
 ## 8. Verifier algorithm

@@ -41,6 +41,61 @@ for how these events are consumed.
 | `contract_kind` | `Symbol` | data |
 | `schema_version` | `u32` | data |
 
+### `AttestationTtlExtended`
+
+- **Prefix topics:** `attestation_ttl_extended`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `record_hash` | `BytesN<32>` | topic_list |
+| `extended_by` | `Address` | data |
+| `previous_expiry` | `u64` | data |
+| `new_expiry` | `u64` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `CoAttestationRecorded`
+
+- **Prefix topics:** `co_attestation_recorded`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `record_hash` | `BytesN<32>` | topic_list |
+| `attester` | `Address` | topic_list |
+| `distinct_attester_count` | `u32` | data |
+| `quorum_required` | `u32` | data |
+| `quorum_satisfied` | `bool` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `DisputeRaised`
+
+- **Prefix topics:** `dispute_raised`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `record_hash` | `BytesN<32>` | topic_list |
+| `disputer` | `Address` | topic_list |
+| `timestamp` | `u64` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
+### `DisputeCleared`
+
+- **Prefix topics:** `dispute_cleared`
+- **Data format:** `map`
+
+| Field | Type | Location |
+|---|---|---|
+| `record_hash` | `BytesN<32>` | topic_list |
+| `cleared_by` | `Address` | topic_list |
+| `reason` | `Symbol` | data |
+| `contract_kind` | `Symbol` | data |
+| `schema_version` | `u32` | data |
+
 ### `AttestationRevoked`
 
 - **Prefix topics:** `attestation_revoked`
@@ -241,108 +296,17 @@ for how these events are consumed.
 | `contract_kind` | `Symbol` | data |
 | `schema_version` | `u32` | data |
 
-## `incentive-pool`
+## `status-list`
 
-### `AdminTransferred`
+### `SegmentUpdated`
 
-- **Prefix topics:** `admin_transferred`
+- **Prefix topics:** `segment_updated`
 - **Data format:** `map`
 
 | Field | Type | Location |
 |---|---|---|
-| `previous_admin` | `Address` | topic_list |
-| `new_admin` | `Address` | topic_list |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Claimed`
-
-- **Prefix topics:** `claimed`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `recipient` | `Address` | topic_list |
-| `amount` | `i128` | data |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Deposited`
-
-- **Prefix topics:** `deposited`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `depositor` | `Address` | topic_list |
-| `amount` | `i128` | data |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Initialized`
-
-- **Prefix topics:** `initialized`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `admin` | `Address` | topic_list |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Paused`
-
-- **Prefix topics:** `paused`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `by` | `Address` | topic_list |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `PoolFunded`
-
-- **Prefix topics:** `pool_funded`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `funder` | `Address` | topic_list |
-| `amount` | `i128` | data |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Unpaused`
-
-- **Prefix topics:** `unpaused`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `by` | `Address` | topic_list |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Upgraded`
-
-- **Prefix topics:** `upgraded`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `new_wasm_hash` | `BytesN<32>` | topic_list |
-| `contract_kind` | `Symbol` | data |
-| `schema_version` | `u32` | data |
-
-### `Withdrawn`
-
-- **Prefix topics:** `withdrawn`
-- **Data format:** `map`
-
-| Field | Type | Location |
-|---|---|---|
-| `depositor` | `Address` | topic_list |
-| `amount` | `i128` | data |
+| `segment_index` | `u32` | topic_list |
+| `version` | `u64` | data |
+| `root` | `BytesN<32>` | data |
 | `contract_kind` | `Symbol` | data |
 | `schema_version` | `u32` | data |

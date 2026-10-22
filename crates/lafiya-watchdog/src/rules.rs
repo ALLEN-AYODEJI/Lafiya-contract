@@ -10,33 +10,11 @@ pub const WASM_CHANGED_WITHOUT_EVENT: &str = "wasm_changed_without_event";
 pub const MASS_ENROLLMENT: &str = "mass_enrollment";
 pub const WATCHDOG_LAG: &str = "watchdog_lag";
 pub const WATCHDOG_FAILING: &str = "watchdog_failing";
-pub const LARGE_WITHDRAWAL: &str = "large_withdrawal";
-pub const APPROVAL_BURST: &str = "approval_burst";
-pub const CLAIM_BY_READDED_ATTESTER: &str = "claim_by_readded_attester";
-pub const POOL_PAUSED: &str = "pool_paused";
-
-/// Thresholds for the incentive-pool rules.
-#[derive(Debug, Clone)]
-pub struct PoolRules {
-    /// Withdrawals of at least this amount (in stroops) are flagged.
-    pub large_withdrawal_amount: i128,
-    /// More than this many approvals within `approval_window_ledgers` is a burst.
-    pub approval_max_count: usize,
-    pub approval_window_ledgers: u32,
-    /// How long a re-added attester stays "recent" for claim alerting.
-    pub readd_window_ledgers: u32,
-}
-
-impl Default for PoolRules {
-    fn default() -> PoolRules {
-        PoolRules {
-            large_withdrawal_amount: 1_000_000_000_000,
-            approval_max_count: 5,
-            approval_window_ledgers: 20,
-            readd_window_ledgers: 100,
-        }
-    }
-}
+/// An attestation entry's remaining TTL dropped below the configured
+/// threshold; anyone may bump it with `extend_attestation_ttl`.
+pub const ATTESTATION_EXPIRING: &str = "attestation_expiring";
+/// A patient-initiated dispute overlay was recorded on an attestation.
+pub const ATTESTATION_DISPUTED: &str = "attestation_disputed";
 
 pub struct Engine {
     rules: Vec<EventRule>,
@@ -47,11 +25,10 @@ pub struct Engine {
     /// Wasm hash each contract is expected to run, from `upgraded` events or
     /// the first observation.
     expected_wasm: BTreeMap<String, String>,
-    pool: PoolRules,
-    /// Ledgers of recent pool approvals, for burst detection.
-    approval_window: VecDeque<u32>,
-    /// Attesters that were (re-)added, with the ledger of the add.
-    readded_attesters: BTreeMap<String, u32>,
+    /// Remaining TTL (in ledgers) below which an attestation is flagged.
+    expiry_threshold_ledgers: Option<u32>,
+    /// Whether disputes should be surfaced as alerts.
+    alert_on_dispute: bool,
 }
 
 /// Default rules from the issue: privileged changes are critical, pause
@@ -108,9 +85,8 @@ impl Engine {
             explorer_tx_url: cfg.explorer_tx_url.clone(),
             rate_window: VecDeque::new(),
             expected_wasm: BTreeMap::new(),
-            pool: PoolRules::default(),
-            approval_window: VecDeque::new(),
-            readded_attesters: BTreeMap::new(),
+            expiry_threshold_ledgers: cfg.attestation_expiry_threshold_ledgers,
+            alert_on_dispute: cfg.alert_on_dispute,
         }
     }
 
@@ -179,7 +155,14 @@ impl Engine {
             self.expected_wasm.insert(e.contract.clone(), hash);
         }
 
-        alerts.extend(self.evaluate_pool(e));
+        if self.alert_on_dispute && e.name == "attestation_disputed" {
+            alerts.push(self.alert(
+                ATTESTATION_DISPUTED,
+                Severity::High,
+                format!("attestation disputed on {}", e.contract),
+                e,
+            ));
+        }
 
         if let Some(rate) = &self.rate {
             if e.name == rate.event {
@@ -206,83 +189,31 @@ impl Engine {
         alerts
     }
 
-    /// Incentive-pool rules: large withdrawals, approval bursts, claims by
-    /// recently re-added attesters, and pool pauses.
-    fn evaluate_pool(&mut self, e: &Event) -> Vec<Alert> {
-        let mut alerts = Vec::new();
-
-        match e.name.as_str() {
-            "attester_added" | "attester_readded" => {
-                // The first topic carries the attester address.
-                if let Some(attester) = e.topics.first() {
-                    self.readded_attesters
-                        .insert(attester.to_ascii_lowercase(), e.ledger);
-                }
-            }
-            "withdrawal" | "withdrawn" => {
-                if let Some(amount) = parse_amount(&e.data) {
-                    if amount >= self.pool.large_withdrawal_amount {
-                        alerts.push(self.alert(
-                            LARGE_WITHDRAWAL,
-                            Severity::High,
-                            format!(
-                                "withdrawal of {amount} on {} exceeds threshold {}",
-                                e.contract, self.pool.large_withdrawal_amount
-                            ),
-                            e,
-                        ));
-                    }
-                }
-            }
-            "approval" | "approved" => {
-                self.approval_window.push_back(e.ledger);
-                while let Some(&first) = self.approval_window.front() {
-                    if e.ledger.saturating_sub(first) >= self.pool.approval_window_ledgers {
-                        self.approval_window.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                if self.approval_window.len() == self.pool.approval_max_count + 1 {
-                    let summary = format!(
-                        "{} approvals within {} ledgers (approval burst)",
-                        self.approval_window.len(),
-                        self.pool.approval_window_ledgers
-                    );
-                    alerts.push(self.alert(APPROVAL_BURST, Severity::High, summary, e));
-                }
-            }
-            "claim" | "claimed" => {
-                if let Some(attester) = e.topics.first() {
-                    let key = attester.to_ascii_lowercase();
-                    if let Some(&added) = self.readded_attesters.get(&key) {
-                        if e.ledger.saturating_sub(added) <= self.pool.readd_window_ledgers {
-                            alerts.push(self.alert(
-                                CLAIM_BY_READDED_ATTESTER,
-                                Severity::High,
-                                format!(
-                                    "claim by attester {attester} re-added at ledger {added}"
-                                ),
-                                e,
-                            ));
-                        }
-                    }
-                }
-            }
-            "pool_paused" | "paused" => {
-                if e.name == "pool_paused" || e.contract.to_ascii_lowercase().contains("pool") {
-                    alerts.push(self.alert(
-                        POOL_PAUSED,
-                        Severity::High,
-                        format!("incentive pool paused on {}", e.contract),
-                        e,
-                    ));
-                }
-            }
-            _ => {}
+    /// Check an attestation entry's remaining TTL (in ledgers) against the
+    /// configured threshold. Returns an alert when the entry is approaching
+    /// expiry and the threshold is configured.
+    pub fn observe_ttl(
+        &self,
+        contract: &str,
+        record_hash: &str,
+        remaining_ledgers: u32,
+        ledger: u32,
+    ) -> Option<Alert> {
+        let threshold = self.expiry_threshold_ledgers?;
+        if remaining_ledgers >= threshold {
+            return None;
         }
-
-        alerts
+        Some(Alert {
+            kind: ATTESTATION_EXPIRING.into(),
+            severity: Severity::High,
+            summary: format!(
+                "attestation {record_hash} on {contract} expires in {remaining_ledgers} ledgers (threshold {threshold}); bump with extend_attestation_ttl"
+            ),
+            ledger,
+            contract: contract.into(),
+            details: vec![format!("record_hash: {record_hash}")],
+            explorer_link: None,
+        })
     }
 
     /// Compare a contract's on-chain wasm hash (from `getLedgerEntries`)
@@ -413,6 +344,8 @@ mod tests {
             }),
             heartbeat: Heartbeat::default(),
             sinks: vec![],
+            attestation_expiry_threshold_ledgers: Some(100),
+            alert_on_dispute: true,
         }
     }
 
@@ -562,85 +495,40 @@ mod tests {
             .is_empty());
     }
 
-    fn pool_engine() -> Engine {
-        Engine::new(&cfg()).with_pool_rules(PoolRules {
-            large_withdrawal_amount: 1_000,
-            approval_max_count: 2,
-            approval_window_ledgers: 10,
-            readd_window_ledgers: 50,
-        })
-    }
-
-    fn pool_ev(name: &str, ledger: u32, topics: &[&str], data: &str) -> Event {
-        let mut e = ev(name, ledger, topics);
-        e.contract = "CPOOL".into();
-        e.data = data.into();
-        e
+    #[test]
+    fn approaching_expiry_is_flagged() {
+        let e = Engine::new(&cfg());
+        assert!(e.observe_ttl("CREG", "deadbeef", 500, 1).is_none());
+        let a = e.observe_ttl("CREG", "deadbeef", 50, 2).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.severity),
+            (ATTESTATION_EXPIRING, Severity::High)
+        );
+        assert!(a.summary.contains("deadbeef"));
     }
 
     #[test]
-    fn large_withdrawal_is_flagged() {
-        let mut e = pool_engine();
-        let a = e.evaluate(&pool_ev("withdrawal", 1, &["GATT"], "1500"));
-        assert_eq!(kinds(&a), vec![(LARGE_WITHDRAWAL, Severity::High)]);
-        let a = e.evaluate(&pool_ev("withdrawal", 2, &["GATT"], "{\"amount\": 2000}"));
-        assert_eq!(kinds(&a), vec![(LARGE_WITHDRAWAL, Severity::High)]);
+    fn expiry_check_disabled_without_threshold() {
+        let mut c = cfg();
+        c.attestation_expiry_threshold_ledgers = None;
+        assert!(Engine::new(&c).observe_ttl("CREG", "deadbeef", 1, 1).is_none());
     }
 
     #[test]
-    fn small_withdrawal_is_ignored() {
-        let mut e = pool_engine();
-        assert!(e
-            .evaluate(&pool_ev("withdrawal", 1, &["GATT"], "999"))
-            .is_empty());
-    }
-
-    #[test]
-    fn approval_burst_fires_once() {
-        let mut e = pool_engine();
-        let mut fired = 0;
-        for ledger in 1..=5 {
-            fired += e
-                .evaluate(&pool_ev("approval", ledger, &["GATT"], ""))
-                .iter()
-                .filter(|a| a.kind == APPROVAL_BURST)
-                .count();
-        }
-        assert_eq!(fired, 1);
-    }
-
-    #[test]
-    fn slow_approvals_do_not_burst() {
-        let mut e = pool_engine();
-        for i in 0..5 {
-            assert!(e
-                .evaluate(&pool_ev("approval", i * 20, &["GATT"], ""))
-                .is_empty());
-        }
-    }
-
-    #[test]
-    fn claim_by_recently_readded_attester_is_flagged() {
-        let mut e = pool_engine();
-        e.evaluate(&pool_ev("attester_readded", 10, &["GATT"], ""));
-        let a = e.evaluate(&pool_ev("claim", 20, &["GATT"], ""));
+    fn dispute_is_surfaced() {
+        let a = Engine::new(&cfg()).evaluate(&ev("attestation_disputed", 1, &[]));
         assert_eq!(
             kinds(&a),
-            vec![(CLAIM_BY_READDED_ATTESTER, Severity::High)]
+            vec![(ATTESTATION_DISPUTED, Severity::High)]
         );
     }
 
     #[test]
-    fn claim_by_long_standing_attester_is_ignored() {
-        let mut e = pool_engine();
-        e.evaluate(&pool_ev("attester_added", 1, &["GATT"], ""));
-        assert!(e.evaluate(&pool_ev("claim", 100, &["GATT"], "")).is_empty());
-    }
-
-    #[test]
-    fn pool_pause_is_flagged() {
-        let mut e = pool_engine();
-        let a = e.evaluate(&pool_ev("pool_paused", 1, &[], ""));
-        assert_eq!(kinds(&a), vec![(POOL_PAUSED, Severity::High)]);
+    fn dispute_alert_can_be_disabled() {
+        let mut c = cfg();
+        c.alert_on_dispute = false;
+        assert!(Engine::new(&c)
+            .evaluate(&ev("attestation_disputed", 1, &[]))
+            .is_empty());
     }
 }
