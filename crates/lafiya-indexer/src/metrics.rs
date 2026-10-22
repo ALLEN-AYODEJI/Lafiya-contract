@@ -143,6 +143,28 @@ impl Metrics {
                 "lafiya_indexer_reorg_last_rollback_depth",
                 "Depth in ledgers of the most recent rollback (0 if none)",
             ),
+            rate_limit_denials_total: counter_vec2(
+                "lafiya_indexer_rate_limit_denials_total",
+                "API requests denied by rate limits or budgets",
+                &["scope", "tier"],
+            ),
+            rate_limit_allowed_total: counter_vec2(
+                "lafiya_indexer_rate_limit_allowed_total",
+                "API requests admitted by rate limits",
+                &["scope", "tier"],
+            ),
+            is_leader: gauge(
+                "lafiya_indexer_is_leader",
+                "1 when this replica is the active ingester, 0 for read-only followers",
+            ),
+            follower_lag_ledgers: gauge(
+                "lafiya_indexer_follower_lag_ledgers",
+                "Ledgers between the leader checkpoint and this replica's view",
+            ),
+            stale_writer_rejections_total: counter(
+                "lafiya_indexer_stale_writer_rejections_total",
+                "Checkpoint writes rejected because the fencing token was stale",
+            ),
             registry,
         }
     }

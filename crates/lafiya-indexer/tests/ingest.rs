@@ -5,8 +5,9 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use lafiya_indexer::archive::{ArchiveError, ArchiveSource, CheckpointHash};
 use lafiya_indexer::decode::RawEvent;
-use lafiya_indexer::ingest::{backfill, IngestError, Ingestor};
+use lafiya_indexer::ingest::{backfill, backfill_range, handoff, IngestError, Ingestor};
 use lafiya_indexer::metrics::Metrics;
 use lafiya_indexer::rpc::{EventPage, EventSource, LedgerWindow, RpcError, Start};
 use lafiya_indexer::store;
@@ -314,6 +315,110 @@ async fn backfill_then_live_ingestion() {
     let ingestor = ingestor(&pool, &source);
     while !ingestor.step().await.unwrap().caught_up {}
     assert_final_state(&pool).await;
+}
+
+/// An archive that serves `events` and verifies them against `hashes`.
+fn archive(events: Vec<RawEvent>, hashes: Vec<(u32, CheckpointHash)>) -> ArchiveSource {
+    ArchiveSource::new(events, hashes)
+}
+
+fn hash(byte: u8) -> CheckpointHash {
+    CheckpointHash([byte; 32])
+}
+
+#[tokio::test]
+async fn archive_source_verifies_against_checkpoint_hashes() {
+    let all = scenario();
+    // Checkpoint hashes cover the archived ledgers 100..=103.
+    let hashes = vec![
+        (100, hash(0x10)),
+        (101, hash(0x11)),
+        (102, hash(0x12)),
+        (103, hash(0x13)),
+    ];
+    let source = archive(all[..4].to_vec(), hashes.clone());
+    let page = source.get_events(&Start::Ledger(100), 10).await.unwrap();
+    assert_eq!(page.events.len(), 4);
+
+    // A tampered archive event no longer matches its checkpoint hash.
+    let mut tampered = all[..4].to_vec();
+    tampered[2].value = b64(ScVal::Map(None));
+    let source = archive(tampered, hashes.clone());
+    let err = source.get_events(&Start::Ledger(100), 10).await.unwrap_err();
+    assert!(matches!(err, ArchiveError::HashMismatch { ledger: 102 }), "{err}");
+
+    // A ledger with no checkpoint hash is unverifiable and refused.
+    let source = archive(all[..4].to_vec(), hashes[..2].to_vec());
+    let err = source.get_events(&Start::Ledger(100), 10).await.unwrap_err();
+    assert!(matches!(err, ArchiveError::Unverifiable { ledger: 102 }), "{err}");
+}
+
+#[tokio::test]
+async fn backfill_is_resumable_and_parallelizable_by_ledger_range() {
+    let Some(pool) = common::test_pool().await else {
+        return;
+    };
+    let all = scenario();
+    let archived = all[..4].to_vec();
+
+    // Two workers backfill disjoint ledger ranges concurrently.
+    let (a, b) = tokio::join!(
+        backfill_range(&pool, archived.clone(), 100, 101),
+        backfill_range(&pool, archived.clone(), 102, 103),
+    );
+    assert_eq!(a.unwrap(), 2);
+    assert_eq!(b.unwrap(), 2);
+
+    // Re-running a completed range is a no-op (resumable).
+    assert_eq!(
+        backfill_range(&pool, archived.clone(), 100, 101).await.unwrap(),
+        0
+    );
+
+    // The remaining live events are ingested from RPC.
+    let source = MockSource::new(all[4..].to_vec(), 104, 110);
+    let ingestor = ingestor(&pool, &source);
+    while !ingestor.step().await.unwrap().caught_up {}
+    assert_final_state(&pool).await;
+}
+
+#[tokio::test]
+async fn handoff_from_archive_to_live_rpc_at_verified_boundary() {
+    let Some(pool) = common::test_pool().await else {
+        return;
+    };
+    let all = scenario();
+    let archived = all[..4].to_vec();
+    let hashes = vec![
+        (100, hash(0x10)),
+        (101, hash(0x11)),
+        (102, hash(0x12)),
+        (103, hash(0x13)),
+    ];
+    let source = archive(archived, hashes);
+    // Archive covers through ledger 103; RPC retains 104 onwards.
+    let boundary = handoff(&pool, &source, 100, 103).await.unwrap();
+    assert_eq!(boundary, 104);
+
+    let live = MockSource::new(all[4..].to_vec(), 104, 110);
+    let ingestor = ingestor(&pool, &live);
+    while !ingestor.step().await.unwrap().caught_up {}
+    assert_final_state(&pool).await;
+}
+
+#[tokio::test]
+async fn handoff_refuses_unverifiable_archive() {
+    let Some(pool) = common::test_pool().await else {
+        return;
+    };
+    let all = scenario();
+    // Missing the checkpoint hash for ledger 103.
+    let hashes = vec![(100, hash(0x10)), (101, hash(0x11)), (102, hash(0x12))];
+    let source = archive(all[..4].to_vec(), hashes);
+    let err = handoff(&pool, &source, 100, 103).await.unwrap_err();
+    assert!(matches!(err, IngestError::UnverifiableArchive { .. }), "{err}");
+    assert!(err.is_fatal());
+    assert_eq!(store::checkpoint(&pool).await.unwrap(), None);
 }
 
 #[tokio::test]

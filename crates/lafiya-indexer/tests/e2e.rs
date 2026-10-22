@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use lafiya_indexer::api::{router, AppState};
+use lafiya_indexer::archive::ArchiveSource;
 use lafiya_indexer::ingest::Ingestor;
 use lafiya_indexer::metrics::Metrics;
 use lafiya_indexer::reconcile::{ChainAttestation, Reconciler};

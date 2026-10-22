@@ -22,11 +22,20 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 const LIVE: &str = "live";
 
+/// Advisory lock key identifying the single active ingester. Chosen as a
+/// fixed, application-specific constant so replicas agree on it.
+pub const LEADER_LOCK_KEY: i64 = 0x6c616669_7961_0001;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     /// Last RPC cursor, or `None` to resume from `ledger` via `startLedger`.
     pub cursor: Option<String>,
     pub ledger: u32,
+    /// Hash of the ledger checkpoint covering `ledger`, when known. Used to
+    /// verify archive data against the chain and to hand off archive -> live.
+    pub checkpoint_hash: Option<String>,
+    /// Monotonically increasing fencing token; stale writers are rejected.
+    pub fencing_token: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -134,15 +143,56 @@ pub fn backoff_secs(attempts: i32) -> i64 {
 }
 
 pub async fn checkpoint(pool: &PgPool) -> Result<Option<Checkpoint>, sqlx::Error> {
-    let row: Option<(Option<String>, i64)> =
-        sqlx::query_as("SELECT cursor, ledger FROM checkpoints WHERE name = $1")
-            .bind(LIVE)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(cursor, ledger)| Checkpoint {
+    let row: Option<(Option<String>, i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT cursor, ledger, checkpoint_hash, fencing_token
+         FROM checkpoints WHERE name = $1",
+    )
+    .bind(LIVE)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(cursor, ledger, checkpoint_hash, fencing_token)| Checkpoint {
         cursor,
         ledger: ledger as u32,
+        checkpoint_hash,
+        fencing_token,
     }))
+}
+
+/// Try to become the single active ingester. Returns `true` if this session
+/// holds the leader advisory lock. The lock is session-scoped, so it is
+/// released automatically if the connection drops (leader crash).
+pub async fn try_acquire_leadership(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let (acquired,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+        .bind(LEADER_LOCK_KEY)
+        .fetch_one(pool)
+        .await?;
+    Ok(acquired)
+}
+
+/// Release the leader advisory lock, if held by this session.
+pub async fn release_leadership(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(LEADER_LOCK_KEY)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Bump the fencing token and return the new value. Called by the leader when
+/// it takes over so that any in-flight writes from a previous leader are
+/// rejected by `apply_page`.
+pub async fn bump_fencing_token(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (token,): (i64,) = sqlx::query_as(
+        "INSERT INTO checkpoints (name, cursor, ledger, fencing_token)
+         VALUES ($1, NULL, 0, 1)
+         ON CONFLICT (name) DO UPDATE
+         SET fencing_token = checkpoints.fencing_token + 1, updated_at = now()
+         RETURNING fencing_token",
+    )
+    .bind(LIVE)
+    .fetch_one(pool)
+    .await?;
+    Ok(token)
 }
 
 /// Apply `events` (in chain order) and move the checkpoint to `next`, in one
@@ -155,6 +205,20 @@ pub async fn apply_page(
     next: &Checkpoint,
 ) -> Result<usize, StoreError> {
     let mut tx = pool.begin().await?;
+    // Reject stale writers: the stored fencing token must not exceed ours.
+    let current: Option<(i64,)> =
+        sqlx::query_as("SELECT fencing_token FROM checkpoints WHERE name = $1 FOR UPDATE")
+            .bind(LIVE)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some((current,)) = current {
+        if next.fencing_token < current {
+            return Err(StoreError::StaleWriter {
+                attempted: next.fencing_token,
+                current,
+            });
+        }
+    }
     let mut applied = 0;
     for raw in events.iter().filter(|e| e.in_successful_contract_call) {
         let event = decode(raw)?;
@@ -183,13 +247,18 @@ pub async fn apply_page(
         }
     }
     sqlx::query(
-        "INSERT INTO checkpoints (name, cursor, ledger) VALUES ($1, $2, $3)
+        "INSERT INTO checkpoints (name, cursor, ledger, checkpoint_hash, fencing_token)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (name) DO UPDATE
-         SET cursor = EXCLUDED.cursor, ledger = EXCLUDED.ledger, updated_at = now()",
+         SET cursor = EXCLUDED.cursor, ledger = EXCLUDED.ledger,
+             checkpoint_hash = EXCLUDED.checkpoint_hash,
+             fencing_token = EXCLUDED.fencing_token, updated_at = now()",
     )
     .bind(LIVE)
     .bind(&next.cursor)
     .bind(i64::from(next.ledger))
+    .bind(&next.checkpoint_hash)
+    .bind(next.fencing_token)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -363,6 +432,8 @@ pub fn checkpoint_after(cursor: &str, events: &[RawEvent], previous_ledger: u32)
     Checkpoint {
         cursor: Some(cursor.to_string()),
         ledger,
+        checkpoint_hash: None,
+        fencing_token: 0,
     }
 }
 

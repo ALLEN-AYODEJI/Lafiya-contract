@@ -170,6 +170,7 @@ CREATE TABLE revocations (
     tx_hash     TEXT NOT NULL
 );
 CREATE INDEX revocations_record_idx ON revocations (record_hash, event_id);
+CREATE INDEX revocations_ledger_idx ON revocations (ledger, event_id);
 
 -- Administration events (admin transfer, pause/unpause, upgrade, registry
 -- repointing, initialization) with their decoded topic fields.

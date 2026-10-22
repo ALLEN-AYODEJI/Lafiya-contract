@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Lafiya indexer API
-  version: 0.1.0
+  version: 0.2.0
   description: >
     Read-only view of Lafiya contract state and history derived from contract
     events. List endpoints are keyset-paginated: pass `next_cursor` from a
@@ -124,6 +124,10 @@ paths:
   /health:
     get:
       summary: Liveness and ingestion progress
+      description: >
+        Operational endpoint. Must not be exposed publicly; restrict to the
+        internal network or the reverse proxy.
+      security: []
       responses:
         "200":
           description: Healthy
@@ -139,6 +143,10 @@ paths:
   /metrics:
     get:
       summary: Prometheus metrics
+      description: >
+        Operational endpoint. Must not be exposed publicly; restrict to the
+        internal network or the reverse proxy.
+      security: []
       responses:
         "200":
           description: Prometheus text format
@@ -147,6 +155,9 @@ paths:
   /attesters:
     get:
       summary: List attesters
+      security:
+        - ApiKeyAuth: []
+        - {}
       parameters:
         - { name: region, in: query, schema: { type: string } }
         - name: status
@@ -166,9 +177,14 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/Attester" } }
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /attestations:
     get:
       summary: List attestations
+      security:
+        - ApiKeyAuth: []
+        - {}
       parameters:
         - { name: attester, in: query, schema: { type: string } }
         - { name: record_hash, in: query, schema: { $ref: "#/components/schemas/Hash" } }
@@ -186,9 +202,19 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/Attestation" } }
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /records/{hash}/history:
     get:
       summary: Attestation and revocation history of one record
+      description: >
+        Returns the history of a single record. This endpoint can act as a
+        probing oracle for linkability, so it is subject to the strictest rate
+        limit tier and bounded page size. Responses have a constant shape
+        whether or not the record exists. See `docs/security/linkability.md`.
+      security:
+        - ApiKeyAuth: []
+        - {}
       parameters:
         - { name: hash, in: path, required: true, schema: { $ref: "#/components/schemas/Hash" } }
         - $ref: "#/components/parameters/limit"
@@ -248,10 +274,21 @@ paths:
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        Optional API key. When keys are required, requests without a valid key
+        are rejected with 401. Keys are never accepted in query strings.
   parameters:
     limit:
       name: limit
       in: query
+      description: >
+        Page size. Clamped by the server to the configured maximum (default 50,
+        hard cap 500) to bound enumeration signal.
       schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
     cursor:
       name: cursor

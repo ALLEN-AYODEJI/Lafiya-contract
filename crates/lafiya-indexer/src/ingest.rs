@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
+use crate::archive::{ArchiveError, ArchiveEventSource, ArchiveRange};
 use crate::decode::{cursor_ledger, RawEvent};
 use crate::metrics::Metrics;
 use crate::reconcile::{self, ReorgOutcome};
@@ -46,7 +47,10 @@ impl IngestError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::RetentionGap { .. } | Self::NoStart | Self::Store(StoreError::Decode(_))
+            Self::RetentionGap { .. }
+                | Self::NoStart
+                | Self::Archive(_)
+                | Self::Store(StoreError::Decode(_))
         )
     }
 }

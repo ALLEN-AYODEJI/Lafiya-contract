@@ -149,4 +149,3 @@ and charts every recorded series above.
 file and its unit tests (`deploy/prometheus/lafiya-indexer.rules.test.yaml`),
 so every alert has at least one firing and one non-firing case. The dashboard
 JSON is validated as parseable JSON in the same job.
-=======

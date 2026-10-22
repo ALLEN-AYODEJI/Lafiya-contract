@@ -5,6 +5,7 @@
 //! See `docs/indexer.md` for deployment.
 
 pub mod api;
+pub mod archive;
 pub mod decode;
 pub mod delivery;
 pub mod ingest;
