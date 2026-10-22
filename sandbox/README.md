@@ -39,6 +39,7 @@ running and `.env.local` points at live contracts, those contracts are reused.
 | `minimal` | 2 attesters, 1 attested record | fastest |
 | `pilot` | 50 generated CHWs, 500 attestations, plus suspended/removed attesters, a revocation, and an admin transfer | < 3 min |
 | `edge-cases` | every attester state (active, suspended after attesting, suspended idle, removed after attesting, idle), histories from several attesters, repeated attestations, histories longer than `MAX_HISTORY`, revocations, and an admin transfer. CI applies and asserts this one. | ~1.5 min |
+| `status-list` | a status-list contract deployed and initialized, a bulk set of records attested and then revoked so the list has populated segments, and a signed root published for verifier sync. Use it with the status-list sync demo below. | ~2 min |
 
 ## Scenario format
 
@@ -81,6 +82,9 @@ records applied revocations in `sandbox/.revoked-<contract>` to stay idempotent.
   gives the plaintext demo fields, the salt, the resulting `record_hash`, who attested
   it, and whether it was revoked. With these, the web app can recompute commitments
   and check them against the chain.
+- **`sandbox/.env.local`** also contains `LAFIYA_STATUS_LIST_ID` and
+  `LAFIYA_STATUS_LIST_ROOT_KEY` when the `status-list` scenario is applied, so the
+  verifier SDK can sync and validate the signed root.
 
 Demo commitments use LRC-1 (`lafiya-commitment::commit_v1`) over
 `[patient_ref, blood_group, allergies]` as `Text`, followed by the salt as `Bytes`.
@@ -156,3 +160,36 @@ self-signed anchor. `verify` fails if the rogue attestation is ever reported as
    history, `patient-003` was attested by an attester who is now suspended,
    `patient-004` by one who has since been removed, and `patient-007` and
    `patient-008` are revoked.
+
+## Status-list sync demo
+
+The `status-list` scenario exercises the compact bulk-revocation path described in
+`docs/adr/0012-w3c-vc-export-format.md` and implemented in `packages/verifier-sdk`.
+Instead of one RPC per record, a verifier downloads the status-list contract's
+versioned segments, checks them against the signed root, and answers revocation
+queries locally from a cached bitstring.
+
+1. `cargo xtask sandbox up --scenario status-list`
+2. Load the environment: `set -a; . sandbox/.env.local; set +a`
+3. Run the reference sync demo from `packages/verifier-sdk`:
+
+   ```bash
+   cargo run -p lafiya-verifier --example status_list_sync -- \
+     --rpc-url "$LAFIYA_RPC_URL" \
+     --status-list "$LAFIYA_STATUS_LIST_ID" \
+     --root-key "$LAFIYA_STATUS_LIST_ROOT_KEY" \
+     --fixtures sandbox/fixtures.json
+   ```
+
+   The demo fetches the signed root, syncs only the segments whose version changed
+   since the last run, and prints the resulting bitstring size and sync time. It then
+   checks every record in `fixtures.json` against the cached list and reports any
+   mismatch with the on-chain revocation state.
+
+4. Re-run the demo without changing the chain to see the cache hit: no segments are
+   re-fetched and sync time drops to the root check only.
+
+The demo prints measured size and sync time for the scenario's entry count. To
+reproduce the 1M-entry measurement from the acceptance criteria, use the
+`status-list` scenario's `[generate]` block with `attestations = 1000000` (expect a
+long `up`; the sync itself is the part being measured).

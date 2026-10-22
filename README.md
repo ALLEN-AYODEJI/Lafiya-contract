@@ -333,17 +333,31 @@ contracts/
     └── src/
         ├── lib.rs           # initialize, fund, withdraw, approve_work_item, claim, pause/unpause
         └── test.rs
+crates/
+├── lafiya-indexer/          # chain indexer (workspace member)
+│   ├── Cargo.toml
+│   └── src/
+└── lafiya-qr/               # QR encode/decode library (workspace member)
+    ├── Cargo.toml
+    └── src/
 docs/
 └── adr/                      # architecture decisions, index, and template
-Cargo.toml                   # workspace + release profile
+Cargo.toml                   # workspace + release profile + [workspace.dependencies]
 Cargo.lock                    # committed for reproducible builds
 CHANGELOG.md                  # release notes incl. schema-impact statements
 rust-toolchain.toml           # pins stable + wasm32v1-none
-Makefile                      # build/test/fmt/clippy/wasm/bindings/check
-.github/workflows/ci.yml      # runs the same checks on push/PR
+Makefile                      # build/test/fmt/clippy/wasm/bindings/check (aggregates all workspace crates)
+xtask/                        # repo automation; aggregate targets cover every workspace member
+.github/workflows/ci.yml      # runs the same checks on push/PR, incl. lafiya-indexer and lafiya-qr
 LICENSE                       # MIT
 CONTRIBUTING.md               # local dev workflow
 ```
+
+All crates under `contracts/` and `crates/` are first-class workspace members: they share
+dependency versions via `[workspace.dependencies]` and are built, linted (`clippy -D warnings`),
+tested, and audited (`cargo deny`) on every PR. The `lafiya-indexer` end-to-end tests run
+against a Postgres service in CI. See [docs/ci.md](docs/ci.md) for the full job list and the
+required status checks.
 
 ## TypeScript Client Bindings
 

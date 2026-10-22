@@ -1,4 +1,10 @@
-import type { AttesterState, ChainReader, OnChainAttestation } from "./chain.js";
+import type {
+  AttesterState,
+  ChainReader,
+  OnChainAttestation,
+  QuorumStatus,
+  StatusListCheck,
+} from "./chain.js";
 import { commitV1, type FieldValue } from "./commitment.js";
 import { parseQrPayload, QrPayloadError, type QrPayload } from "./qr.js";
 import { BindingsChainReader } from "./rpc.js";
@@ -45,6 +51,25 @@ export interface VerificationResult {
   payload?: QrPayload;
   attestation?: OnChainAttestation & { attestedAt: Date };
   attester?: { address: string; status: "active" | "suspended" | "removed"; region?: string };
+  /**
+   * Quorum progress for records whose class requires N distinct attesters.
+   * Only aggregate counts are exposed; co-attester identities are never leaked.
+   */
+  quorum?: {
+    /** Distinct attesters counted toward the policy (public aggregate). */
+    distinctAttesters: number;
+    /** Policy threshold for this record class. */
+    required: number;
+    /** Whether the policy is currently satisfied. */
+    satisfied: boolean;
+  };
+  /**
+   * Patient-initiated dispute overlay. `true` when a valid patient signature
+   * has flagged this record; verifiers must surface this to the user.
+   */
+  disputed?: boolean;
+  /** Status-list based revocation check, when the chain reader supports it. */
+  statusList?: { revoked: boolean; version: number };
   checkedAt: Date;
   source: "rpc" | "offline";
 }
@@ -158,11 +183,15 @@ export class LafiyaVerifier {
       }
     }
 
-    // 3-4. Read the attestation and the attester's *current* status.
+    // 3-4. Read the attestation, the attester's *current* status, quorum,
+    // dispute overlay, and status-list revocation.
     let history: OnChainAttestation[];
     let latest: OnChainAttestation | null;
     let revoked = false;
     let attesterState: AttesterState | null = null;
+    let quorum: QuorumStatus | null = null;
+    let disputed = false;
+    let statusList: StatusListCheck | null = null;
     try {
       [latest, history] = await Promise.all([
         this.chain.getAttestation(trust, payload.recordHash),
@@ -171,12 +200,21 @@ export class LafiyaVerifier {
       if (!latest) {
         revoked = (await this.chain.isRevoked?.(trust, payload.recordHash)) ?? false;
       } else {
-        attesterState = await this.chain.getAttesterStatus(trust, latest.attester);
+        [attesterState, quorum, disputed, statusList] = await Promise.all([
+          this.chain.getAttesterStatus(trust, latest.attester),
+          this.chain.getQuorumStatus?.(trust, payload.recordHash) ?? Promise.resolve(null),
+          this.chain.isDisputed?.(trust, payload.recordHash) ?? Promise.resolve(false),
+          this.chain.checkStatusList?.(trust, payload.recordHash) ?? Promise.resolve(null),
+        ]);
       }
     } catch (err) {
       reasons.push({ code: "unavailable", message: `chain read failed: ${String(err)}` });
       return done({ payload });
     }
+
+    const statusListResult = statusList
+      ? { revoked: statusList.revoked, version: statusList.version }
+      : undefined;
 
     if (!latest) {
       reasons.push(
@@ -184,7 +222,16 @@ export class LafiyaVerifier {
           ? { code: "revoked", message: "the attestation was revoked" }
           : { code: "not_found", message: "no attestation for this record" },
       );
-      return done({ payload });
+      return done({ payload, ...(statusListResult ? { statusList: statusListResult } : {}) });
+    }
+
+    // Status-list revocation is authoritative for bulk revocation; a revoked
+    // bit means the record must not be reported as verified.
+    if (statusList?.revoked) {
+      reasons.push({
+        code: "revoked",
+        message: "the record is revoked per the status list",
+      });
     }
 
     // 5. Supersession, attester status, and age.
@@ -210,6 +257,23 @@ export class LafiyaVerifier {
       }
     }
 
+    // 5b. Quorum: a record class may require N distinct attesters. Only the
+    // aggregate count is surfaced; individual co-attesters stay private.
+    if (quorum && !quorum.satisfied) {
+      reasons.push({
+        code: "quorum_not_met",
+        message: `record requires ${quorum.required} distinct attesters, has ${quorum.distinctAttesters}`,
+      });
+    }
+
+    // 5c. Patient dispute overlay: verifiers must surface, never suppress.
+    if (disputed) {
+      reasons.push({
+        code: "disputed",
+        message: "the patient has flagged this record as disputed",
+      });
+    }
+
     // 6. UI-ready result.
     return done({
       payload,
@@ -219,6 +283,17 @@ export class LafiyaVerifier {
         status: !attesterState ? "removed" : attesterState.suspended ? "suspended" : "active",
         ...(attesterState?.region ? { region: attesterState.region } : {}),
       },
+      ...(quorum
+        ? {
+            quorum: {
+              distinctAttesters: quorum.distinctAttesters,
+              required: quorum.required,
+              satisfied: quorum.satisfied,
+            },
+          }
+        : {}),
+      ...(disputed ? { disputed: true } : {}),
+      ...(statusListResult ? { statusList: statusListResult } : {}),
     });
   }
 }

@@ -57,7 +57,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: Build contract crates
-        run: cargo build --release --target wasm32v1-none -p multisig-account -p attester-registry -p attestation-registry
+        run: cargo build --release --target wasm32v1-none -p multisig-account -p attester-registry -p attestation-registry -p incentive-pool
 
   protocol:
     name: Protocol (quickstart:${{ matrix.image }})

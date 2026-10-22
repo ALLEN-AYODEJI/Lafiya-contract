@@ -126,6 +126,15 @@ fn test_attestation_registry_budgets() {
         &baseline["attestation-registry"]["attest"],
         0.05
     );
+
+    // Test extend_attestation_ttl with worst-case state
+    let snapshot = measure_budget(&env);
+    check_regression(
+        "extend_attestation_ttl",
+        &snapshot,
+        &baseline["attestation-registry"]["extend_attestation_ttl"],
+        0.05
+    );
 }
 
 #[test]

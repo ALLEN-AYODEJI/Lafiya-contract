@@ -1492,193 +1492,250 @@ fn set_attestation_rate_limit_requires_admin_auth() {
     assert!(client.try_set_attestation_rate_limit(&1, &100).is_err());
 }
 
-// ───────────────────────── Delegated session keys ─────────────────────────
-
-/// Delegates a session key for `attester` scoped to `attest` and returns it.
-fn delegate_attest_session(
-    env: &Env,
-    client: &AttestationRegistryClient<'_>,
-    attester: &Address,
-    expires_at: u64,
-) -> BytesN<32> {
-    let session_pk = hash(env, 200);
-    let mut scope = Vec::new(env);
-    scope.push_back(SessionOp::Attest);
-    client.delegate_session_key(attester, &session_pk, &expires_at, &scope);
-    session_pk
-}
+// ───────────────────────── TTL extension ─────────────────────────
 
 #[test]
-fn attest_with_session_attests_under_owning_attester() {
+fn extend_attestation_ttl_is_permissionless_and_monotonic() {
     let (env, client, attester_registry, admin) = setup();
     let attester = enroll(&env, &attester_registry, &admin);
-    let patient = Address::generate(&env);
-    let record_hash = hash(&env, 201);
-    let expires_at = env.ledger().timestamp() + 10_000;
-    client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
+    let record_hash = hash(&env, 80);
+    let attestation = attest_with_consent(&env, &client, &attester, &record_hash);
+    let original_expiry = client.get_attestation_status(&record_hash).unwrap().expires_at;
 
-    let session_pk = delegate_attest_session(&env, &client, &attester, &expires_at);
-    let attestation = client.attest_with_session(&session_pk, &patient, &record_hash);
+    // Any caller (not the attester, not the patient) may extend.
+    let sponsor = Address::generate(&env);
+    let extend_to = env.ledger().timestamp() + 20_000;
+    client.extend_attestation_ttl(&sponsor, &record_hash, &extend_to);
 
-    // The record is attributed to the owning attester, not the session key.
-    assert_eq!(attestation.attester, attester);
+    let status = client.get_attestation_status(&record_hash).unwrap();
+    assert_eq!(status.expires_at, Some(extend_to));
+    // Data is untouched.
     assert_eq!(client.get_attestation(&record_hash), Some(attestation));
+
+    // Extending again to a larger horizon is allowed and monotonic.
+    let further = extend_to + 5_000;
+    client.extend_attestation_ttl(&sponsor, &record_hash, &further);
+    assert_eq!(
+        client.get_attestation_status(&record_hash).unwrap().expires_at,
+        Some(further)
+    );
+    assert!(further > original_expiry.unwrap_or(0));
 }
 
 #[test]
-fn attest_with_expired_session_returns_distinct_error() {
+fn extend_attestation_ttl_rejects_shortening_and_noop() {
+    let (env, client, attester_registry, admin) = setup();
+    let attester = enroll(&env, &attester_registry, &admin);
+    let record_hash = hash(&env, 81);
+    attest_with_consent(&env, &client, &attester, &record_hash);
+    let current = client.get_attestation_status(&record_hash).unwrap().expires_at.unwrap();
+
+    let sponsor = Address::generate(&env);
+    assert_eq!(
+        client.try_extend_attestation_ttl(&sponsor, &record_hash, &(current - 1)),
+        Err(Ok(Error::InvalidAttestationExpiry))
+    );
+    assert_eq!(
+        client.try_extend_attestation_ttl(&sponsor, &record_hash, &current),
+        Err(Ok(Error::InvalidAttestationExpiry))
+    );
+    assert_eq!(
+        client.get_attestation_status(&record_hash).unwrap().expires_at,
+        Some(current)
+    );
+}
+
+#[test]
+fn extend_attestation_ttl_enforces_max_horizon() {
+    let (env, client, attester_registry, admin) = setup();
+    let attester = enroll(&env, &attester_registry, &admin);
+    let record_hash = hash(&env, 82);
+    attest_with_consent(&env, &client, &attester, &record_hash);
+
+    let sponsor = Address::generate(&env);
+    let too_far = env.ledger().timestamp() + MAX_TTL_HORIZON_SECONDS + 1;
+    assert_eq!(
+        client.try_extend_attestation_ttl(&sponsor, &record_hash, &too_far),
+        Err(Ok(Error::InvalidAttestationExpiry))
+    );
+
+    let at_cap = env.ledger().timestamp() + MAX_TTL_HORIZON_SECONDS;
+    client.extend_attestation_ttl(&sponsor, &record_hash, &at_cap);
+    assert_eq!(
+        client.get_attestation_status(&record_hash).unwrap().expires_at,
+        Some(at_cap)
+    );
+}
+
+#[test]
+fn extend_attestation_ttl_for_unknown_hash_fails() {
+    let (env, client, _attester_registry, _admin) = setup();
+    let sponsor = Address::generate(&env);
+    assert_eq!(
+        client.try_extend_attestation_ttl(
+            &sponsor,
+            &hash(&env, 83),
+            &(env.ledger().timestamp() + 1_000)
+        ),
+        Err(Ok(Error::AttestationNotFound))
+    );
+}
+
+// ───────────────────────── Quorum ─────────────────────────
+
+#[test]
+fn quorum_policy_satisfied_by_distinct_attesters() {
+    let (env, client, attester_registry, admin) = setup();
+    let a = enroll(&env, &attester_registry, &admin);
+    let b = enroll(&env, &attester_registry, &admin);
+    let record_hash = hash(&env, 90);
+
+    client.set_quorum_policy(&admin, &record_hash, &2);
+    attest_with_consent(&env, &client, &a, &record_hash);
+    let view = client.get_quorum_status(&record_hash);
+    assert_eq!(view.count, 1);
+    assert_eq!(view.required, 2);
+    assert!(!view.satisfied);
+
+    attest_with_consent(&env, &client, &b, &record_hash);
+    let view = client.get_quorum_status(&record_hash);
+    assert_eq!(view.count, 2);
+    assert!(view.satisfied);
+}
+
+#[test]
+fn quorum_duplicate_attester_does_not_increase_count() {
+    let (env, client, attester_registry, admin) = setup();
+    let a = enroll(&env, &attester_registry, &admin);
+    let record_hash = hash(&env, 91);
+
+    client.set_quorum_policy(&admin, &record_hash, &2);
+    attest_with_consent(&env, &client, &a, &record_hash);
+    attest_with_consent(&env, &client, &a, &record_hash);
+
+    let view = client.get_quorum_status(&record_hash);
+    assert_eq!(view.count, 1);
+    assert!(!view.satisfied);
+}
+
+#[test]
+fn quorum_count_is_monotonic_under_revocation() {
+    let (env, client, attester_registry, admin) = setup();
+    let a = enroll(&env, &attester_registry, &admin);
+    let b = enroll(&env, &attester_registry, &admin);
+    let record_hash = hash(&env, 92);
+
+    client.set_quorum_policy(&admin, &record_hash, &2);
+    attest_with_consent(&env, &client, &a, &record_hash);
+    attest_with_consent(&env, &client, &b, &record_hash);
+    assert!(client.get_quorum_status(&record_hash).satisfied);
+
+    client.revoke_attestation(&admin, &record_hash, &Symbol::new(&env, "audit"));
+    let view = client.get_quorum_status(&record_hash);
+    assert_eq!(view.count, 0);
+    assert!(!view.satisfied);
+}
+
+#[test]
+fn quorum_policy_requires_admin() {
+    let (env, client, _attester_registry, _admin) = setup();
+    let outsider = Address::generate(&env);
+    assert_eq!(
+        client.try_set_quorum_policy(&outsider, &hash(&env, 93), &2),
+        Err(Ok(Error::RoleNotGranted))
+    );
+}
+
+// ───────────────────────── Disputes ─────────────────────────
+
+#[test]
+fn dispute_requires_patient_signature_and_marks_state() {
     let (env, client, attester_registry, admin) = setup();
     let attester = enroll(&env, &attester_registry, &admin);
     let patient = Address::generate(&env);
-    let record_hash = hash(&env, 202);
+    let record_hash = hash(&env, 100);
     let expires_at = env.ledger().timestamp() + 10_000;
     client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
+    client.attest(&attester, &patient, &record_hash);
 
-    let session_pk = delegate_attest_session(&env, &client, &attester, &expires_at);
-    env.ledger().set_timestamp(expires_at);
+    let signature = BytesN::from_array(&env, &[9u8; 64]);
+    client.dispute_attestation(&patient, &record_hash, &signature);
 
-    assert_eq!(
-        client.try_attest_with_session(&session_pk, &patient, &record_hash),
-        Err(Ok(Error::SessionExpired))
-    );
-    assert_eq!(client.get_attestation(&record_hash), None);
+    let status = client.get_attestation_status(&record_hash).unwrap();
+    assert!(status.disputed);
+    assert!(!client.is_verified(&record_hash));
 }
 
 #[test]
-fn attest_with_out_of_scope_session_returns_distinct_error() {
+fn dispute_rejects_replayed_signature() {
     let (env, client, attester_registry, admin) = setup();
     let attester = enroll(&env, &attester_registry, &admin);
     let patient = Address::generate(&env);
-    let record_hash = hash(&env, 203);
+    let record_hash = hash(&env, 101);
     let expires_at = env.ledger().timestamp() + 10_000;
     client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
+    client.attest(&attester, &patient, &record_hash);
 
-    // A session scoped to `withdraw` only must not be able to attest.
-    let session_pk = hash(&env, 204);
-    let mut scope = Vec::new(&env);
-    scope.push_back(SessionOp::Withdraw);
-    client.delegate_session_key(&attester, &session_pk, &expires_at, &scope);
-
+    let signature = BytesN::from_array(&env, &[7u8; 64]);
+    client.dispute_attestation(&patient, &record_hash, &signature);
     assert_eq!(
-        client.try_attest_with_session(&session_pk, &patient, &record_hash),
-        Err(Ok(Error::SessionOutOfScope))
+        client.try_dispute_attestation(&patient, &record_hash, &signature),
+        Err(Ok(Error::DisputeAlreadyRaised))
     );
-    assert_eq!(client.get_attestation(&record_hash), None);
 }
 
 #[test]
-fn attest_with_unknown_session_returns_not_found_error() {
+fn dispute_is_bounded_per_record() {
+    let (env, client, attester_registry, admin) = setup();
+    let attester = enroll(&env, &attester_registry, &admin);
+    let record_hash = hash(&env, 102);
+    let expires_at = env.ledger().timestamp() + 10_000;
+    let patient = Address::generate(&env);
+    client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
+    client.attest(&attester, &patient, &record_hash);
+
+    let signature = BytesN::from_array(&env, &[1u8; 64]);
+    client.dispute_attestation(&patient, &record_hash, &signature);
+    assert_eq!(
+        client.try_dispute_attestation(&patient, &record_hash, &signature),
+        Err(Ok(Error::DisputeAlreadyRaised))
+    );
+}
+
+#[test]
+fn dispute_clearing_requires_attester_or_admin() {
     let (env, client, attester_registry, admin) = setup();
     let attester = enroll(&env, &attester_registry, &admin);
     let patient = Address::generate(&env);
-    let record_hash = hash(&env, 205);
+    let record_hash = hash(&env, 103);
     let expires_at = env.ledger().timestamp() + 10_000;
     client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
+    client.attest(&attester, &patient, &record_hash);
 
+    let signature = BytesN::from_array(&env, &[3u8; 64]);
+    client.dispute_attestation(&patient, &record_hash, &signature);
+
+    let outsider = Address::generate(&env);
     assert_eq!(
-        client.try_attest_with_session(&hash(&env, 206), &patient, &record_hash),
-        Err(Ok(Error::SessionNotFound))
+        client.try_clear_dispute(&outsider, &record_hash),
+        Err(Ok(Error::RoleNotGranted))
     );
-    assert_eq!(client.get_attestation(&record_hash), None);
+
+    client.clear_dispute(&attester, &record_hash);
+    assert!(!client.get_attestation_status(&record_hash).unwrap().disputed);
 }
+
+// ───────────────────────── Status list ─────────────────────────
 
 #[test]
-fn removing_attester_invalidates_delegated_session() {
-    let (env, client, attester_registry, admin) = setup();
-    let attester = enroll(&env, &attester_registry, &admin);
-    let patient = Address::generate(&env);
-    let record_hash = hash(&env, 207);
-    let expires_at = env.ledger().timestamp() + 10_000;
-    client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
+fn status_list_segment_and_root_accessors() {
+    let (env, client, _attester_registry, admin) = setup();
+    let root = hash(&env, 110);
+    client.publish_status_list_root(&admin, &root, &1);
 
-    let session_pk = delegate_attest_session(&env, &client, &attester, &expires_at);
-    attester_registry.remove_attester(&admin, &attester);
+    assert_eq!(client.get_status_list_root(), Some(root.clone()));
+    assert_eq!(client.get_status_list_version(), 1);
 
-    assert_eq!(
-        client.try_attest_with_session(&session_pk, &patient, &record_hash),
-        Err(Ok(Error::SessionNotFound))
-    );
-    assert_eq!(client.get_attestation(&record_hash), None);
-}
-
-#[test]
-fn suspending_attester_invalidates_delegated_session() {
-    let (env, client, attester_registry, admin) = setup();
-    let attester = enroll(&env, &attester_registry, &admin);
-    let patient = Address::generate(&env);
-    let record_hash = hash(&env, 208);
-    let expires_at = env.ledger().timestamp() + 10_000;
-    client.consent_attestation(&patient, &attester, &record_hash, &expires_at);
-
-    let session_pk = delegate_attest_session(&env, &client, &attester, &expires_at);
-    attester_registry.suspend_attester(&admin, &attester);
-
-    assert_eq!(
-        client.try_attest_with_session(&session_pk, &patient, &record_hash),
-        Err(Ok(Error::SessionNotFound))
-    );
-    assert_eq!(client.get_attestation(&record_hash), None);
-}
-
-// ───────────────────────── Ring-buffer history parity ─────────────────────────
-
-/// Reference model of the previous `Vec` history layout: append, then keep the
-/// last `MAX_HISTORY` entries in insertion order.
-fn vec_history_model(
-    all: &std::vec::Vec<Attestation>,
-) -> std::vec::Vec<Attestation> {
-    let len = all.len();
-    let start = len.saturating_sub(MAX_HISTORY as usize);
-    all[start..].to_vec()
-}
-
-#[test]
-fn ring_buffer_history_matches_vec_layout_up_to_max_history() {
-    let (env, client, attester_registry, admin) = setup();
-    let record_hash = hash(&env, 210);
-
-    let mut all = std::vec::Vec::new();
-    for _ in 0..MAX_HISTORY {
-        let attester = enroll(&env, &attester_registry, &admin);
-        all.push(attest_with_consent(&env, &client, &attester, &record_hash));
-
-        let history = client.get_attestation_history(&record_hash);
-        let expected = vec_history_model(&all);
-        assert_eq!(history.len() as usize, expected.len());
-        for (i, expected_attestation) in expected.iter().enumerate() {
-            assert_eq!(history.get(i as u32), Some(expected_attestation.clone()));
-        }
-    }
-
-    // Exactly at the boundary the window is full and nothing is evicted.
-    assert_eq!(client.get_attestation_history(&record_hash).len(), MAX_HISTORY);
-}
-
-#[test]
-fn ring_buffer_history_matches_vec_layout_beyond_max_history() {
-    let (env, client, attester_registry, admin) = setup();
-    let record_hash = hash(&env, 211);
-
-    let mut all = std::vec::Vec::new();
-    for _ in 0..(MAX_HISTORY * 2 + 3) {
-        let attester = enroll(&env, &attester_registry, &admin);
-        all.push(attest_with_consent(&env, &client, &attester, &record_hash));
-
-        let history = client.get_attestation_history(&record_hash);
-        let expected = vec_history_model(&all);
-        assert_eq!(history.len() as usize, expected.len());
-        for (i, expected_attestation) in expected.iter().enumerate() {
-            assert_eq!(history.get(i as u32), Some(expected_attestation.clone()));
-        }
-    }
-
-    // FIFO eviction: the oldest slots are gone, the newest are retained.
-    let history = client.get_attestation_history(&record_hash);
-    assert_eq!(history.len(), MAX_HISTORY);
-    let total = all.len();
-    assert_eq!(
-        history.get(0),
-        Some(all[total - MAX_HISTORY as usize].clone())
-    );
-    assert_eq!(history.get(MAX_HISTORY - 1), Some(all[total - 1].clone()));
+    let segment = client.get_status_list_segment(&0);
+    assert!(segment.is_some());
 }
