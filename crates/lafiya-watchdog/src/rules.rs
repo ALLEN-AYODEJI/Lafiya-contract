@@ -90,6 +90,12 @@ impl Engine {
         }
     }
 
+    /// Override the incentive-pool rule thresholds.
+    pub fn with_pool_rules(mut self, pool: PoolRules) -> Engine {
+        self.pool = pool;
+        self
+    }
+
     fn alert(&self, kind: &str, severity: Severity, summary: String, e: &Event) -> Alert {
         let mut details = Vec::new();
         if !e.topics.is_empty() {
@@ -285,6 +291,23 @@ impl HealthMonitor {
         }
         None
     }
+}
+
+/// Parse an amount from event data, which may be a bare integer or a JSON
+/// object with an `amount` field.
+fn parse_amount(data: &str) -> Option<i128> {
+    let data = data.trim();
+    if let Ok(n) = data.parse::<i128>() {
+        return Some(n);
+    }
+    let key = "\"amount\"";
+    let idx = data.find(key)?;
+    let rest = &data[idx + key.len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i128>().ok()
 }
 
 fn self_alert(kind: &str, summary: String, ledger: u32) -> Alert {

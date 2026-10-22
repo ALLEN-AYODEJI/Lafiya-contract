@@ -71,10 +71,15 @@ impl IntoResponse for ApiError {
 }
 
 /// A page of results; pass `next_cursor` back as `cursor` for the next one.
+///
+/// `finalized_ledger` is the highest ledger the indexer considers final; events
+/// at or below it will never be rolled back, so consumers can treat them as
+/// settled. It is `None` when no finality boundary is known yet.
 #[derive(Serialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+    pub finalized_ledger: Option<i64>,
 }
 
 fn page<T>(mut items: Vec<T>, limit: i64, key: impl Fn(&T) -> String) -> Page<T> {
@@ -84,7 +89,20 @@ fn page<T>(mut items: Vec<T>, limit: i64, key: impl Fn(&T) -> String) -> Page<T>
     } else {
         None
     };
-    Page { items, next_cursor }
+    Page {
+        items,
+        next_cursor,
+        finalized_ledger: None,
+    }
+}
+
+/// Attach the current finality boundary to a page of results.
+async fn with_finality<T>(
+    pool: &PgPool,
+    mut page: Page<T>,
+) -> Result<Json<Page<T>>, ApiError> {
+    page.finalized_ledger = store::finalized_ledger(pool).await?;
+    Ok(Json(page))
 }
 
 fn limit(requested: Option<i64>) -> Result<i64, ApiError> {
@@ -173,7 +191,7 @@ async fn attesters(
     .bind(limit + 1)
     .fetch_all(&s.pool)
     .await?;
-    Ok(Json(page(rows, limit, |a| a.address.clone())))
+    with_finality(&s.pool, page(rows, limit, |a| a.address.clone())).await
 }
 
 #[derive(Deserialize)]
@@ -238,7 +256,7 @@ async fn attestations(
     .bind(limit + 1)
     .fetch_all(&s.pool)
     .await?;
-    Ok(Json(page(rows, limit, |a| a.event_id.clone())))
+    with_finality(&s.pool, page(rows, limit, |a| a.event_id.clone())).await
 }
 
 #[derive(Deserialize)]
@@ -287,7 +305,99 @@ async fn record_history(
     .bind(limit + 1)
     .fetch_all(&s.pool)
     .await?;
-    Ok(Json(page(rows, limit, |h| h.event_id.clone())))
+    with_finality(&s.pool, page(rows, limit, |h| h.event_id.clone())).await
+}
+
+#[derive(Deserialize)]
+pub struct WorkItemQuery {
+    pool: Option<String>,
+    status: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct WorkItem {
+    work_item_id: String,
+    pool: String,
+    attester: String,
+    /// `pending`, `approved`, `claimed`, or `withdrawn`.
+    status: String,
+    amount: String,
+    created_ledger: i64,
+    updated_ledger: i64,
+    tx_hash: String,
+}
+
+async fn work_items(
+    State(s): State<AppState>,
+    Query(q): Query<WorkItemQuery>,
+) -> Result<Json<Page<WorkItem>>, ApiError> {
+    let limit = limit(q.limit)?;
+    if let Some(status) = &q.status {
+        if !["pending", "approved", "claimed", "withdrawn"].contains(&status.as_str()) {
+            return Err(ApiError::BadRequest(
+                "status must be pending, approved, claimed, or withdrawn".into(),
+            ));
+        }
+    }
+    let rows: Vec<WorkItem> = sqlx::query_as(
+        "SELECT work_item_id, pool, attester, status, amount::text AS amount,
+                created_ledger, updated_ledger, tx_hash
+         FROM work_items
+         WHERE ($1::text IS NULL OR pool = $1)
+           AND ($2::text IS NULL OR status = $2)
+           AND ($3::text IS NULL OR work_item_id > $3)
+         ORDER BY work_item_id LIMIT $4",
+    )
+    .bind(&q.pool)
+    .bind(&q.status)
+    .bind(&q.cursor)
+    .bind(limit + 1)
+    .fetch_all(&s.pool)
+    .await?;
+    with_finality(&s.pool, page(rows, limit, |w| w.work_item_id.clone())).await
+}
+
+#[derive(Deserialize)]
+pub struct PayoutQuery {
+    pool: Option<String>,
+    attester: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Payout {
+    event_id: String,
+    pool: String,
+    work_item_id: String,
+    attester: String,
+    amount: String,
+    ledger: i64,
+    tx_hash: String,
+}
+
+async fn payouts(
+    State(s): State<AppState>,
+    Query(q): Query<PayoutQuery>,
+) -> Result<Json<Page<Payout>>, ApiError> {
+    let limit = limit(q.limit)?;
+    let rows: Vec<Payout> = sqlx::query_as(
+        "SELECT event_id, pool, work_item_id, attester, amount::text AS amount, ledger, tx_hash
+         FROM payouts
+         WHERE ($1::text IS NULL OR pool = $1)
+           AND ($2::text IS NULL OR attester = $2)
+           AND ($3::text IS NULL OR event_id > $3)
+         ORDER BY event_id LIMIT $4",
+    )
+    .bind(&q.pool)
+    .bind(&q.attester)
+    .bind(&q.cursor)
+    .bind(limit + 1)
+    .fetch_all(&s.pool)
+    .await?;
+    with_finality(&s.pool, page(rows, limit, |p| p.event_id.clone())).await
 }
 
 /// Aggregated verification view for a single record: quorum, dispute, and TTL state.

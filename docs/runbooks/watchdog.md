@@ -49,6 +49,27 @@ is submitted. An alert with no matching announcement is an incident.
 | `pause_toggled` | high | Registry paused or unpaused | Confirm with the admin; unplanned unpause during an incident is critical |
 | `mass_enrollment` | high | More than N attesters added within M ledgers | Check the batch against the approved attester list |
 | `bulk_revocation` | info | Attestation revoked | Watch for bursts |
+CI runs `every_critical_rule_reaches_the_webhook`, which feeds the same event
+sequence through the rules and a real HTTP webhook sink into a mock server.
+
+## Incentive-pool rules
+
+The pool rules read the same event stream as the registry rules; the pool
+contract address is configured under `contracts` alongside the registries.
+Thresholds live in the `[pool]` section of `watchdog.toml`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `large_withdrawal_threshold` | `10000000000` (stroops) | Withdrawals at or above this amount raise `large_pool_withdrawal` |
+| `approval_burst_count` | `10` | Number of approvals that constitutes a burst |
+| `approval_burst_ledgers` | `100` | Window (in ledgers) over which approvals are counted |
+| `readd_window_ledgers` | `1000` | How far back to look for a remove/re-add of the claiming attester |
+
+Tune the thresholds to the pool's normal payout size before enabling the
+rules; a threshold far below typical payouts will page on every cycle. The
+`claim_by_readded_attester` rule keeps a bounded in-memory history of attester
+removals, so after a watchdog restart it can only flag re-adds that happened
+since startup; replay over an exported event range covers the gap.
 | `attestation_expiring` | high | An attestation's live-until ledger is within the configured horizon (default 30 days) | Notify the attester and the patient; anyone may extend it (see below) |
 | `attestation_archived` | high | An attestation entry has archived (rent lapsed) | Restore it with the CLI helper (see below) and extend its TTL |
 | `attestation_disputed` | high | A patient flagged an attestation as disputed | Surface the dispute to verifiers; only the attester or admin can clear it (see below) |

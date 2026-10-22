@@ -11,10 +11,11 @@ schemas are in [`events.md`](events.md).
 
 | Component | Behaviour |
 |---|---|
-| **Ingestion** | Polls `getEvents` for the two registry contract IDs. Each page is applied in one Postgres transaction together with the new cursor, so a crash either keeps or discards the whole page, and events already stored are never applied twice. |
+| **Ingestion** | Polls `getEvents` for the two registry contract IDs and the incentive-pool contract ID. Each page is applied in one Postgres transaction together with the new cursor, so a crash either keeps or discards the whole page, and events already stored are never applied twice. |
+| **Finality** | Records the ledger hash of every ingested ledger. On each page the hash of the resume ledger is compared with the RPC's view; on a mismatch (provider failover or restart serving a divergent tip) derived tables are rolled back to the common ancestor inside one transaction and the range is re-ingested. `finalized_ledger` is exposed in API responses. |
 | **Retention guard** | Before every page, compares the resume ledger with the RPC's `oldestLedger` (`getHealth`). If history has been pruned past the checkpoint, the process **exits non-zero** with a `retention gap` error naming the missing ledger range. It never skips ahead. |
 | **Backfill** | `lafiya-indexer backfill` loads archived events for ranges RPC no longer serves (see below). |
-| **Storage** | `raw_events` (append-only audit copy with ledger and tx hash; UPDATE/DELETE are rejected by a trigger), `attesters`, `attestations`, `revocations`, `admin_events`, `checkpoints`. Migrations run automatically on start (sqlx). |
+| **Storage** | `raw_events` (append-only audit copy with ledger and tx hash; UPDATE/DELETE are rejected by a trigger), `attesters`, `attestations`, `revocations`, `admin_events`, `pool_work_items`, `pool_payouts`, `pool_events`, `ledger_hashes`, `checkpoints`. Migrations run automatically on start (sqlx) and are forward-only. |
 | **Reconciler** | Every `LAFIYA_RECONCILE_INTERVAL_SECS`, samples attesters and records and compares derived state with `get_attester_status` / `get_attestation` (via `simulateTransaction`). Mismatches are logged and counted in metrics. It also fills in region and license hash after `AttesterInfoUpdated`, which carries no data. |
 | **API** | Read-only HTTP/JSON, keyset-paginated. Spec: `crates/lafiya-indexer/openapi.yaml`, also served at `/openapi.yaml`. |
 
@@ -42,6 +43,20 @@ the latest one not revoked; `attestation_revoked` marks all earlier rows
 revoked, because `revoke_attestation` deletes the record's whole on-chain
 history.
 
+### Incentive pool
+
+Pool events are decoded alongside registry events and stored in three tables:
+
+| Table | Contents |
+|---|---|
+| `pool_work_items` | One row per work item: submitter, attester, amount, status (`pending` / `approved` / `claimed` / `withdrawn`), and the ledger of the last state change. |
+| `pool_payouts` | One row per claim or withdrawal, with the attester, amount, ledger and tx hash. |
+| `pool_events` | Append-only log of every decoded pool event (approvals, claims, withdrawals, pauses, funding), used by the watchdog rules. |
+
+An approve-claim cycle therefore produces a `pending` work item, an
+`approved` work item plus an approval event, and finally a `claimed` work
+item plus a payout row.
+
 ## API
 
 | Endpoint | Query parameters |
@@ -49,12 +64,16 @@ history.
 | `GET /attesters` | `region`, `status` (`active` / `suspended` / `removed`), `limit`, `cursor` |
 | `GET /attestations` | `attester`, `record_hash`, `limit`, `cursor` |
 | `GET /records/{hash}/history` | `limit`, `cursor` |
-| `GET /health` | Returns 200 with checkpoint and lag, 503 if Postgres is unreachable. |
+| `GET /pool/work-items` | `attester`, `status` (`pending` / `approved` / `claimed` / `withdrawn`), `limit`, `cursor` |
+| `GET /pool/payouts` | `attester`, `limit`, `cursor` |
+| `GET /health` | Returns 200 with checkpoint, lag and `finalized_ledger`, 503 if Postgres is unreachable. |
 | `GET /metrics` | Prometheus text format. |
 | `GET /openapi.yaml` | OpenAPI 3 spec. |
 
-List responses are `{ "items": [...], "next_cursor": "..." | null }`; pass
-`next_cursor` as `cursor` to get the next page. `limit` defaults to 50 (max 500).
+List responses are `{ "items": [...], "next_cursor": "..." | null, "finalized_ledger": N }`;
+pass `next_cursor` as `cursor` to get the next page. `limit` defaults to 50
+(max 500). `finalized_ledger` is the highest ledger the indexer considers
+final; data at or below it will not be rolled back by a reorg.
 
 ## Configuration
 
@@ -64,6 +83,7 @@ List responses are `{ "items": [...], "next_cursor": "..." | null }`; pass
 | `LAFIYA_RPC_URL` | required | Soroban RPC endpoint. |
 | `LAFIYA_ATTESTER_REGISTRY` | required | `C...` contract ID. |
 | `LAFIYA_ATTESTATION_REGISTRY` | required | `C...` contract ID. |
+| `LAFIYA_INCENTIVE_POOL` | none | `C...` contract ID of the incentive pool. Pool events are indexed only when set. |
 | `LAFIYA_START_LEDGER` | none | First ledger to ingest on an empty database: the ledger the contracts were deployed in. Ignored once a checkpoint exists. |
 | `LAFIYA_LISTEN` | `0.0.0.0:8080` | API listen address. |
 | `LAFIYA_POLL_INTERVAL_SECS` | `5` | Delay between polls once caught up. |
@@ -110,7 +130,18 @@ restarts cannot fix it, only a backfill can.
 | `lafiya_indexer_ingest_errors_total` | Increasing steadily (RPC or database problems; retried with backoff). |
 | `lafiya_indexer_reconcile_mismatches_total{kind}` | Any sustained increase: derived state disagrees with chain. |
 | `lafiya_indexer_checkpoint_ledger` | Not advancing. |
+| `lafiya_indexer_reorg_detected_total` | Any increase: a provider served a divergent tip; confirm the rollback completed. |
+| `lafiya_indexer_reorg_last_depth_ledgers` | Rollback depth; a large or repeated value warrants investigation. |
 | process exit with `retention gap` | Page immediately: backfill needed. |
+
+### Reorg runbook
+
+A reorg is handled automatically: the indexer rolls back to the common
+ancestor and re-ingests. Manual intervention is only needed if
+`reorg_detected_total` keeps increasing without `checkpoint_ledger`
+advancing, which means the configured RPC providers disagree persistently.
+In that case pin `LAFIYA_RPC_URL` to a single trusted provider, restart, and
+verify `/health` reports a `finalized_ledger` that advances.
 
 ## Backfill from archived history
 
@@ -161,7 +192,7 @@ database and backfill again.
 # Unit tests (no database needed)
 cargo test -p lafiya-indexer
 
-# Database tests: restart/resume, retention-gap, backfill, API
+# Database tests: restart/resume, retention-gap, backfill, API, reorg rollback
 DATABASE_URL=postgres://postgres:pg@localhost:5432/postgres cargo test -p lafiya-indexer
 
 # End to end against a local quickstart (deploys contracts, drives a scenario,

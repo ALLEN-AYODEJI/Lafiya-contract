@@ -151,6 +151,61 @@ fn default_high() -> Severity {
     Severity::High
 }
 
+/// Thresholds for the incentive-pool rules. Each rule is disabled when its
+/// threshold is `None` (or, for the burst rule, when `max_count` is `None`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PoolRules {
+    /// Alert when a single withdrawal is at least this many stroops.
+    #[serde(default)]
+    pub large_withdrawal_stroops: Option<i128>,
+    #[serde(default = "default_large_withdrawal_severity")]
+    pub large_withdrawal_severity: Severity,
+    /// Alert when more than `max_count` approvals land within
+    /// `window_ledgers`.
+    #[serde(default)]
+    pub approval_burst: Option<PoolBurstRule>,
+    /// Alert when an attester claims within `window_ledgers` of being
+    /// (re-)added.
+    #[serde(default)]
+    pub claim_after_readd: Option<PoolReaddRule>,
+    /// Alert when the pool is paused.
+    #[serde(default = "default_pool_paused_severity")]
+    pub pool_paused_severity: Severity,
+}
+
+fn default_large_withdrawal_severity() -> Severity {
+    Severity::High
+}
+
+fn default_pool_paused_severity() -> Severity {
+    Severity::Critical
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PoolBurstRule {
+    pub max_count: usize,
+    #[serde(default = "default_burst_window")]
+    pub window_ledgers: u32,
+    #[serde(default = "default_high")]
+    pub severity: Severity,
+}
+
+fn default_burst_window() -> u32 {
+    50
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PoolReaddRule {
+    #[serde(default = "default_readd_window")]
+    pub window_ledgers: u32,
+    #[serde(default = "default_high")]
+    pub severity: Severity,
+}
+
+fn default_readd_window() -> u32 {
+    100
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Heartbeat {
     /// Alert when the watchdog falls this many ledgers behind the network.

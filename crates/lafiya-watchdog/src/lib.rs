@@ -11,6 +11,10 @@ pub mod rpc;
 pub mod rules;
 pub mod sinks;
 
+pub use rules::{
+    ApprovalBurstRule, ClaimByReaddedAttesterRule, LargeWithdrawalRule, PoolPausedRule,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// A decoded contract event, as seen by the rules engine.
