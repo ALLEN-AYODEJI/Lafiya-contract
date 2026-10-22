@@ -80,7 +80,65 @@ and `lafiya-web` displays the attester as removed (ADR-0006).
   and the admin suspends under the loss/theft SLA.
 - Reinstatement after duress is admin-only, after an in-person check.
 
-## 6. Mapping to contract features
+## 6. Signer backends (`lafiya-cli`, #538)
+
+`lafiya-cli` never reads a secret key from a plaintext environment variable or
+config file in normal operation. Signing keys are supplied through one of the
+backends below. Secret material is held in zeroizing buffers, the key types do
+not implement `Debug`, and log output is redacted before it is emitted.
+
+### 6.1 OS keyring
+
+- **Threat assumptions:** the OS keyring (Secret Service / Keychain / Credential
+  Manager) is unlocked for the operator's session; the host is not already
+  compromised by an attacker with the operator's session privileges.
+- **Mitigations:** the key never touches the CLI's config or environment; it is
+  fetched into a zeroizing buffer, used, and dropped. Access is gated by the OS
+  session unlock. Logs record only the backend name and key identifier, never
+  the secret.
+- **Residual risk:** malware running as the operator can query the keyring.
+  This is out of scope for the CLI and is covered by the device policy above.
+
+### 6.2 Passphrase-protected file
+
+- **Threat assumptions:** the encrypted key file may be copied (backups, sync
+  folders); the passphrase is supplied interactively or via a dedicated
+  passphrase source, not a general-purpose env var.
+- **Mitigations:** the file must have strict permissions (owner-only; the CLI
+  refuses to load a group/world-readable file). The passphrase is read without
+  echo and zeroized after use. Decryption failures do not reveal whether the
+  passphrase or the ciphertext was wrong.
+- **Residual risk:** a weak passphrase is brute-forceable offline. Operators are
+  directed to use a high-entropy passphrase.
+
+### 6.3 External signer process (JSON protocol)
+
+- **Threat assumptions:** the signer runs as a separate process (or on a
+  separate host) and the CLI only ever sees signatures, not the key.
+- **Mitigations:** the CLI sends a signing request over the JSON protocol and
+  receives only the signature and public key. The secret never enters the CLI
+  address space, so it cannot leak through CLI logs, panics, or core dumps. The
+  transport must be a local socket or an authenticated channel.
+- **Residual risk:** the external signer's own custody and logging are its
+  responsibility; it is held to the same redaction rules.
+
+### 6.4 Plaintext key opt-in
+
+- **Threat assumptions:** plaintext key input (env var or config) is inherently
+  exposed to shell history, process listings, crash dumps, and logs.
+- **Mitigations:** plaintext input is refused unless an explicit opt-in flag is
+  passed. When used, the CLI emits a warning and still redacts the value from
+  logs and error messages. This path is intended only for local development and
+  test harnesses, never for production attester keys.
+
+### 6.5 Compatibility with Ledger/HSM
+
+All backends implement a common signer trait that returns only public keys and
+signatures. The planned Ledger/HSM abstraction plugs in as another
+implementation of that trait, so callers do not change and the zeroization and
+redaction guarantees are preserved.
+
+## 7. Mapping to contract features
 
 See the dependency table in [ADR-0012](../adr/0012-chw-attester-key-custody.md#contract-feature-dependencies).
 Summary: rotation (#331, #355), compromise windows (#337), renouncement (#332),

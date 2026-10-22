@@ -82,57 +82,70 @@ The collector prints an `auth.decode` span with `service.name: lafiya-cli`.
 Point the endpoint at Jaeger, Tempo, or Honeycomb in the same way. Without
 `OTEL_EXPORTER_OTLP_ENDPOINT` the exporter stays off even when compiled in.
 
-## Indexer health and leadership
+## Indexer SLOs, recording rules, and alerts
 
-The indexer exposes a health endpoint that reports whether the replica is the
-active ingester or a read-only follower, plus ingestion lag. It is safe to
-scrape from a load balancer and from monitoring.
+`lafiya-indexer` exposes Prometheus metrics on `/metrics` (see
+`crates/lafiya-indexer/src/api.rs`). The metric names below are **stable**:
+renaming one is a breaking change and requires updating the rules, the
+dashboard, and this document together.
 
-```json
-{"status":"ok","role":"leader","fencing_token":42,"lag_ledgers":0,"lag_seconds":0}
-{"status":"ok","role":"follower","leader_observed":true,"lag_ledgers":3,"lag_seconds":12}
-```
+### Stable metric names
 
-| Field | Meaning |
-| --- | --- |
-| `role` | `leader` (holds the single-writer lock) or `follower` |
-| `fencing_token` | Monotonic token on checkpoint writes; stale writers are rejected |
-| `leader_observed` | Follower has seen a leader heartbeat recently |
-| `lag_ledgers` / `lag_seconds` | Distance between the last ingested ledger and chain tip |
-
-`status` is `ok` while a leader exists and lag is within budget, `degraded`
-when a follower has not observed a leader or lag exceeds the budget, and
-`error` when the replica cannot reach Postgres or the RPC provider.
-
-### Metrics
-
-| Metric | Type | Labels | Use |
+| Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `indexer_role` | gauge | `role` | 1 for the current role, 0 otherwise |
-| `indexer_leader_changes_total` | counter | — | Failover events |
-| `indexer_ingest_lag_ledgers` | gauge | — | Ingestion lag in ledgers |
-| `indexer_ingest_lag_seconds` | gauge | — | Ingestion lag in wall-clock seconds |
-| `indexer_checkpoint_fenced_total` | counter | — | Stale checkpoint writes rejected by fencing |
-| `indexer_api_requests_total` | counter | `route`, `tier`, `outcome` | `outcome` is `allowed` or `denied` |
-| `indexer_api_denials_total` | counter | `route`, `tier`, `reason` | `reason` is `rate_limited`, `quota_exhausted`, or `unauthenticated` |
-| `indexer_api_page_size` | histogram | `route` | Bounded page sizes actually served |
+| `lafiya_indexer_ingest_lag_ledgers` | gauge | — | Ledgers between the chain tip and the last ingested ledger |
+| `lafiya_indexer_ingest_lag_seconds` | gauge | — | Wall-clock age of the last ingested ledger |
+| `lafiya_indexer_checkpoint_age_seconds` | gauge | — | Age of the last persisted checkpoint |
+| `lafiya_indexer_http_requests_total` | counter | `method`, `route`, `status` | API requests, by status class |
+| `lafiya_indexer_http_request_duration_seconds` | histogram | `method`, `route` | API request latency |
+| `lafiya_indexer_up` | gauge | — | `1` while the indexer process is serving |
 
-Denial logs are structured and never contain query hashes in cleartext; the
-record-hash route logs only a keyed digest. See
-`docs/security/linkability.md` for the scraping threat model.
+### SLIs and SLO targets
 
-### Alerting
+| SLI | Definition | SLO target |
+| --- | --- | --- |
+| Ingestion lag (ledgers) | `lafiya_indexer_ingest_lag_ledgers` | ≤ 5 ledgers for 99% of a 30d window |
+| Ingestion lag (seconds) | `lafiya_indexer_ingest_lag_seconds` | ≤ 30s for 99% of a 30d window |
+| API error ratio | `5xx / total` from `lafiya_indexer_http_requests_total` | < 1% over 5m and 1h |
+| API p99 latency | `histogram_quantile(0.99, ...)` over `lafiya_indexer_http_request_duration_seconds` | ≤ 500ms over 5m |
+| Checkpoint age | `lafiya_indexer_checkpoint_age_seconds` | ≤ 120s |
 
-- **Failover**: page when `indexer_leader_changes_total` increases more than
-  twice in 15 minutes, or when no replica reports `indexer_role{role="leader"} == 1`
-  for 2 minutes.
-- **Lag**: warn when `indexer_ingest_lag_ledgers` exceeds the configured budget
-  for 5 minutes; page when `indexer_ingest_lag_seconds` exceeds 10 minutes.
-- **Fencing**: alert on any sustained increase in
-  `indexer_checkpoint_fenced_total`, which indicates two writers racing.
-- **Quota enforcement**: alert when the ratio of
-  `indexer_api_denials_total{reason="rate_limited"}` to
-  `indexer_api_requests_total` exceeds 10% for 10 minutes, or when
-  `reason="quota_exhausted"` denials appear for a tier that should not be
-  exhausting its budget. A sudden drop in `allowed` requests with stable
-  traffic suggests limits are misconfigured.
+### Recording rules
+
+Committed in [`deploy/prometheus/lafiya-indexer.rules.yaml`](../deploy/prometheus/lafiya-indexer.rules.yaml):
+
+| Recorded series | Expression summary |
+| --- | --- |
+| `lafiya:indexer_ingest_lag_ledgers:max` | max ingest lag in ledgers |
+| `lafiya:indexer_ingest_lag_seconds:max` | max ingest lag in seconds |
+| `lafiya:indexer_api_error_ratio:rate5m` | 5xx ratio over 5m |
+| `lafiya:indexer_api_error_ratio:rate1h` | 5xx ratio over 1h |
+| `lafiya:indexer_api_latency_p99:5m` | p99 latency over 5m |
+| `lafiya:indexer_checkpoint_age_seconds:max` | max checkpoint age |
+
+### Alerts
+
+Each alert carries a `runbook_url` annotation pointing at a section of
+[`docs/runbooks/indexer.md`](runbooks/indexer.md).
+
+| Alert | Condition | Runbook section |
+| --- | --- | --- |
+| `LafiyaIndexerDown` | `lafiya_indexer_up == 0` for 2m | [Indexer down](runbooks/indexer.md#indexer-down) |
+| `LafiyaIndexerIngestLagLedgers` | lag > 5 ledgers for 10m | [Ingestion lag](runbooks/indexer.md#ingestion-lag) |
+| `LafiyaIndexerIngestLagSeconds` | lag > 30s for 10m | [Ingestion lag](runbooks/indexer.md#ingestion-lag) |
+| `LafiyaIndexerAPIErrorRatio` | 5xx ratio > 1% for 10m | [API error ratio](runbooks/indexer.md#api-error-ratio) |
+| `LafiyaIndexerAPILatencyP99` | p99 > 500ms for 10m | [API latency](runbooks/indexer.md#api-latency) |
+| `LafiyaIndexerCheckpointStale` | checkpoint age > 120s for 10m | [Stale checkpoint](runbooks/indexer.md#stale-checkpoint) |
+
+### Dashboard
+
+The Grafana dashboard lives at
+[`deploy/grafana/lafiya-indexer.json`](../deploy/grafana/lafiya-indexer.json)
+and charts every recorded series above.
+
+### CI validation
+
+`promtool check rules` and `promtool test rules` run in CI against the rule
+file and its unit tests (`deploy/prometheus/lafiya-indexer.rules.test.yaml`),
+so every alert has at least one firing and one non-firing case. The dashboard
+JSON is validated as parseable JSON in the same job.

@@ -37,195 +37,146 @@ pub async fn test_pool() -> Option<PgPool> {
     Some(pool)
 }
 
-/// Number of attestations in the full synthetic dataset (10M).
-pub const FULL_ATTESTATIONS: i64 = 10_000_000;
-/// Number of attesters in the full synthetic dataset (50k).
-pub const FULL_ATTESTERS: i64 = 50_000;
+/// A single ledger as served by a (possibly forked) provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerPage {
+    pub sequence: i64,
+    pub hash: String,
+    /// Events contained in this ledger, in ingest order.
+    pub events: Vec<String>,
+}
 
-/// Number of attestations in the CI smoke dataset. Small enough to seed in a
-/// few seconds, large enough that the planner prefers index scans.
-pub const SMOKE_ATTESTATIONS: i64 = 50_000;
-/// Number of attesters in the CI smoke dataset.
-pub const SMOKE_ATTESTERS: i64 = 2_000;
+impl LedgerPage {
+    pub fn new(sequence: i64, hash: impl Into<String>, events: Vec<String>) -> Self {
+        Self {
+            sequence,
+            hash: hash.into(),
+            events,
+        }
+    }
+}
 
-/// Proposed p99 latency budget for the CI smoke test, in milliseconds.
-///
-/// Rationale: on the smoke dataset (50k rows) every supported query should
-/// complete in well under a millisecond of server time; 50ms leaves generous
-/// headroom for CI noise, connection setup, and slower shared runners while
-/// still catching accidental sequential scans or missing indexes.
-pub const P99_BUDGET_MS: f64 = 50.0;
+/// A deterministic, in-memory provider history used to drive the ingest loop
+/// in tests. Two histories can share a common prefix and then diverge, which
+/// models a provider failover serving a forked tip.
+#[derive(Clone, Debug)]
+pub struct FakeProvider {
+    pub name: String,
+    pub ledgers: Vec<LedgerPage>,
+}
 
-/// Seed the synthetic dataset into the current schema.
-///
-/// The generator uses `generate_series` so it runs entirely server-side, and
-/// introduces realistic skew:
-///   * attester ids are drawn from a Zipf-like distribution (a handful of
-///     attesters dominate), and
-///   * timestamps are clustered around a few "hot" windows rather than being
-///     uniform.
-pub async fn seed_synthetic(pool: &PgPool, attestations: i64, attesters: i64) {
-    assert!(attesters > 0, "attesters must be positive");
-    assert!(attestations > 0, "attestations must be positive");
+impl FakeProvider {
+    pub fn new(name: impl Into<String>, ledgers: Vec<LedgerPage>) -> Self {
+        Self {
+            name: name.into(),
+            ledgers,
+        }
+    }
 
-    // Attesters: a stable id space with a skewed "weight" column so we can
-    // pick hot attesters deterministically.
-    sqlx::query(
-        r#"
-        INSERT INTO attesters (id, address)
-        SELECT g,
-               '0x' || lpad(to_hex(g), 40, '0')
-        FROM generate_series(1, $1) AS g
-        "#,
+    /// Build a linear history starting at `start` with `len` ledgers. Each
+    /// ledger hash is derived from `(tag, sequence)` so histories with the
+    /// same tag share hashes and histories with different tags fork.
+    pub fn linear(name: impl Into<String>, tag: &str, start: i64, len: i64) -> Self {
+        let ledgers = (start..start + len)
+            .map(|seq| {
+                let hash = ledger_hash(tag, seq);
+                let events = vec![format!("{tag}:{seq}:event")];
+                LedgerPage::new(seq, hash, events)
+            })
+            .collect();
+        Self::new(name, ledgers)
+    }
+
+    /// Return the ledger at `sequence`, if this provider serves it.
+    pub fn ledger(&self, sequence: i64) -> Option<&LedgerPage> {
+        self.ledgers.iter().find(|l| l.sequence == sequence)
+    }
+
+    /// Return the page of ledgers starting at `cursor` (inclusive), up to
+    /// `limit` entries. Mirrors the RPC cursor pagination the ingest loop uses.
+    pub fn page(&self, cursor: i64, limit: usize) -> Vec<LedgerPage> {
+        self.ledgers
+            .iter()
+            .filter(|l| l.sequence >= cursor)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// The highest ledger sequence this provider serves.
+    pub fn tip(&self) -> Option<i64> {
+        self.ledgers.iter().map(|l| l.sequence).max()
+    }
+}
+
+/// Deterministic ledger hash for a given history tag and sequence.
+pub fn ledger_hash(tag: &str, sequence: i64) -> String {
+    format!("{tag}-{sequence:020}")
+}
+
+/// Build two providers that share a common prefix of `common` ledgers starting
+/// at `start`, then diverge: `a` continues with tag `tag_a` and `b` continues
+/// with tag `tag_b`. Returns `(provider_a, provider_b, fork_sequence)` where
+/// `fork_sequence` is the first sequence at which the histories differ.
+pub fn forked_providers(
+    start: i64,
+    common: i64,
+    tail: i64,
+    tag_a: &str,
+    tag_b: &str,
+) -> (FakeProvider, FakeProvider, i64) {
+    let shared_tag = "shared";
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for seq in start..start + common {
+        let hash = ledger_hash(shared_tag, seq);
+        let events = vec![format!("{shared_tag}:{seq}:event")];
+        a.push(LedgerPage::new(seq, hash.clone(), events.clone()));
+        b.push(LedgerPage::new(seq, hash, events));
+    }
+    let fork_sequence = start + common;
+    for seq in fork_sequence..fork_sequence + tail {
+        a.push(LedgerPage::new(
+            seq,
+            ledger_hash(tag_a, seq),
+            vec![format!("{tag_a}:{seq}:event")],
+        ));
+        b.push(LedgerPage::new(
+            seq,
+            ledger_hash(tag_b, seq),
+            vec![format!("{tag_b}:{seq}:event")],
+        ));
+    }
+    (
+        FakeProvider::new("provider_a", a),
+        FakeProvider::new("provider_b", b),
+        fork_sequence,
     )
-    .bind(attesters)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    // Attestations: skew attester selection toward low ids (Zipf-ish via
-    // power distribution) and cluster timestamps into a few hot windows.
-    sqlx::query(
-        r#"
-        INSERT INTO attestations (id, attester_id, schema_id, created_at, revoked)
-        SELECT g,
-               -- Zipf-like skew: pow(u, 3) biases toward small attester ids.
-               1 + floor(pow(random(), 3) * $2)::bigint,
-               -- A small set of schemas, also skewed.
-               1 + floor(pow(random(), 2) * 8)::bigint,
-               -- Cluster timestamps: 70% within the last day, 30% spread over
-               -- the prior 30 days.
-               CASE
-                 WHEN random() < 0.7
-                   THEN now() - (random() * interval '1 day')
-                 ELSE now() - interval '1 day' - (random() * interval '30 days')
-               END,
-               -- ~2% revoked.
-               (random() < 0.02)
-        FROM generate_series(1, $1) AS g
-        "#,
-    )
-    .bind(attestations)
-    .bind(attesters)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    // Refresh planner statistics so EXPLAIN reflects the seeded data.
-    pool.execute("ANALYZE attesters").await.unwrap();
-    pool.execute("ANALYZE attestations").await.unwrap();
 }
 
-/// A single endpoint filter set to exercise.
-#[derive(Clone, Copy, Debug)]
-pub struct FilterSet {
-    pub name: &'static str,
-    pub sql: &'static str,
+/// A provider that can be swapped mid-stream, modelling a failover between
+/// RPC endpoints. The ingest loop pulls pages from whichever provider is
+/// currently active.
+#[derive(Clone, Debug)]
+pub struct SwappableProvider {
+    active: FakeProvider,
 }
 
-/// Every supported endpoint filter set. Each query is parameterized with
-/// `$1 = limit + 1` (the page helper fetches one extra row to detect a next
-/// page) and, where relevant, a keyset cursor.
-pub const FILTER_SETS: &[FilterSet] = &[
-    FilterSet {
-        name: "list_all",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-    FilterSet {
-        name: "by_attester",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations WHERE attester_id = $2 \
-              ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-    FilterSet {
-        name: "by_schema",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations WHERE schema_id = $2 \
-              ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-    FilterSet {
-        name: "by_attester_and_schema",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations WHERE attester_id = $2 AND schema_id = $3 \
-              ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-    FilterSet {
-        name: "by_revoked",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations WHERE revoked = $2 \
-              ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-    FilterSet {
-        name: "keyset_all",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations WHERE (created_at, id) < ($2, $3) \
-              ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-    FilterSet {
-        name: "keyset_by_attester",
-        sql: "SELECT id, attester_id, schema_id, created_at, revoked \
-              FROM attestations \
-              WHERE attester_id = $2 AND (created_at, id) < ($3, $4) \
-              ORDER BY created_at DESC, id DESC LIMIT $1",
-    },
-];
-
-/// Capture `EXPLAIN (ANALYZE, BUFFERS)` for every filter set and return the
-/// plans keyed by filter name.
-pub async fn explain_all(pool: &PgPool) -> Vec<(String, String)> {
-    let mut out = Vec::with_capacity(FILTER_SETS.len());
-    for fs in FILTER_SETS {
-        let plan = explain_one(pool, fs).await;
-        out.push((fs.name.to_string(), plan));
+impl SwappableProvider {
+    pub fn new(active: FakeProvider) -> Self {
+        Self { active }
     }
-    out
-}
 
-/// Run `EXPLAIN (ANALYZE, BUFFERS)` for a single filter set.
-pub async fn explain_one(pool: &PgPool, fs: &FilterSet) -> String {
-    let sql = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {}", fs.sql);
-    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(21_i64);
-    // Bind the remaining placeholders with representative values. The exact
-    // values matter less than the shape; we use a hot attester and schema.
-    q = q.bind(1_i64).bind(1_i64).bind(1_i64);
-    let rows: Vec<String> = q.fetch_all(pool).await.unwrap();
-    rows.join("\n")
-}
-
-/// Returns true if the plan text contains a sequential scan on a large table.
-pub fn has_seq_scan_on_large_table(plan: &str) -> bool {
-    plan.lines().any(|line| {
-        let l = line.to_ascii_lowercase();
-        l.contains("seq scan on attestations") || l.contains("seq scan on attesters")
-    })
-}
-
-/// Measure per-query latency (in milliseconds) over `iterations` runs for a
-/// single filter set, returning the sorted samples.
-pub async fn measure_latencies(
-    pool: &PgPool,
-    fs: &FilterSet,
-    iterations: usize,
-) -> Vec<f64> {
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
-        let start = std::time::Instant::now();
-        let mut q = sqlx::query_scalar::<_, i64>(fs.sql).bind(21_i64);
-        q = q.bind(1_i64).bind(1_i64).bind(1_i64);
-        let _ = q.fetch_all(pool).await.unwrap();
-        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    /// Swap the active provider, returning the previous one.
+    pub fn swap(&mut self, next: FakeProvider) -> FakeProvider {
+        std::mem::replace(&mut self.active, next)
     }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    samples
-}
 
-/// Compute the p99 (nearest-rank) of a sorted sample set.
-pub fn p99(sorted_ms: &[f64]) -> f64 {
-    if sorted_ms.is_empty() {
-        return 0.0;
+    pub fn active(&self) -> &FakeProvider {
+        &self.active
     }
-    let rank = ((sorted_ms.len() as f64) * 0.99).ceil() as usize;
-    let idx = rank.saturating_sub(1).min(sorted_ms.len() - 1);
-    sorted_ms[idx]
+
+    pub fn page(&self, cursor: i64, limit: usize) -> Vec<LedgerPage> {
+        self.active.page(cursor, limit)
+    }
 }

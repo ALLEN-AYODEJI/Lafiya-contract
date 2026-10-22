@@ -7,13 +7,14 @@
 pub mod api;
 pub mod archive;
 pub mod decode;
+pub mod delivery;
 pub mod ingest;
 pub mod metrics;
 pub mod reconcile;
+pub mod reorg;
 pub mod rpc;
 pub mod store;
 
-pub use api::{ApiAuthConfig, RateLimitConfig, RateLimitTier};
-pub use archive::{ArchiveConfig, ArchiveEventSource, ArchiveVerification};
-pub use rpc::EventSource;
-pub use store::{FencingToken, LeaderLease, LeadershipConfig, LeadershipRole};
+pub use ingest::{IngestConfig, IngestError, Ingestor};
+pub use reorg::{FinalityInfo, ReorgDetector, ReorgError, RollbackOutcome};
+pub use store::{IndexerStore, StoreError};

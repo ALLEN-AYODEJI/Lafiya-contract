@@ -124,6 +124,8 @@ Everything else relies on off-chain controls.
 | R | Revocation leaves no on-chain trace, so "revoked" looks like "never attested" | open ([#343](https://github.com/Lafiya-xyz/Lafiya-contract/issues/343)) |
 | I | Record-hash activity links a patient across attestations | open ([#433](https://github.com/Lafiya-xyz/Lafiya-contract/issues/433)) |
 | D | Attestation flood causes rent growth and revocation burden | mitigated (by per-attester rate limit, [`storage-cost.md`](../storage-cost.md#attestation-rate-limiting)) |
+| S/T | Sybil evasion: colluders split activity across many allowlisted keys so no single key trips the per-attester rate limit | open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)); partially mitigated (by cross-key collusion scoring in `lafiya-fraud-scoring`, see §7) |
+| T | Low-and-slow evasion: jittered timing and round-robin record sharing keep per-key volume under thresholds | open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)); partially mitigated (by temporal and sharing-graph features, see §7) |
 | D | Registry wiring failure makes `attest` trap instead of returning an error | open ([#352](https://github.com/Lafiya-xyz/Lafiya-contract/issues/352)) |
 | D | Admin `pause()` or wide `revoke_attestation` | accepted (ADR-0003: admin trusted); open ([#365](https://github.com/Lafiya-xyz/Lafiya-contract/issues/365), [#364](https://github.com/Lafiya-xyz/Lafiya-contract/issues/364)) |
 | E | Admin transfer to a mistyped address, or a stale pending admin | open ([#330](https://github.com/Lafiya-xyz/Lafiya-contract/issues/330)) |
@@ -181,6 +183,7 @@ Children are OR unless marked **AND**.
   - 1.1.4 Admin repoints `AttesterRegistry` to a permissive contract: **open** ([#349](https://github.com/Lafiya-xyz/Lafiya-contract/issues/349), [#414](https://github.com/Lafiya-xyz/Lafiya-contract/issues/414)).
   - 1.1.5 Front-run `initialize` with an attacker registry: **open** ([#361](https://github.com/Lafiya-xyz/Lafiya-contract/issues/361)).
   - 1.1.6 Attester acts outside their region: **open** ([#327](https://github.com/Lafiya-xyz/Lafiya-contract/issues/327)).
+  - 1.1.7 Colluders evade detection by key splitting, jittered timing, or round-robin record sharing: **partially mitigated** (by collusion scoring, §6); **open** ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)).
 - **1.2 Keep a no-longer-valid attestation looking verified**
   - 1.2.1 Rely on an attestation made before the CHW was removed or compromised: **accepted** ([ADR-0006](../adr/0006-attestation-revocation-semantics.md)); **open** ([#337](https://github.com/Lafiya-xyz/Lafiya-contract/issues/337), [#400](https://github.com/Lafiya-xyz/Lafiya-contract/issues/400)).
   - 1.2.2 Present an outdated card after the record changed: **open** ([#345](https://github.com/Lafiya-xyz/Lafiya-contract/issues/345), [#340](https://github.com/Lafiya-xyz/Lafiya-contract/issues/340)).
@@ -231,13 +234,41 @@ Children are OR unless marked **AND**.
   - 4.3.2 Admin cannot verify the wasm hash they sign: **mitigated (by the expected-hash step in [`contract-upgrade.md`](../runbooks/contract-upgrade.md))**; **open** ([#418](https://github.com/Lafiya-xyz/Lafiya-contract/issues/418), [#419](https://github.com/Lafiya-xyz/Lafiya-contract/issues/419)).
 - **4.4 Privileged action goes unnoticed**: **open** ([#414](https://github.com/Lafiya-xyz/Lafiya-contract/issues/414), [#369](https://github.com/Lafiya-xyz/Lafiya-contract/issues/369)).
 
-## 6. Residual risk by gate
+## 6. Adversarial evaluation of collusion detection (#531)
+
+The collusion detector in `crates/lafiya-fraud-scoring` was red-teamed with
+adaptive adversaries in the simulator. Each strategy was run against the
+baseline detector and against the hardened detector (cross-key sharing graph
+plus temporal dispersion features). Detection rate is the fraction of
+adversarial campaigns flagged; cost-to-evade is the attacker spend (fees,
+rent, and stake-equivalent) needed to keep detection below 50%, expressed as a
+multiple of the per-attestation incentive amount.
+
+| # | Strategy | Detection rate (baseline → hardened) | Cost-to-evade (× incentive) | Status |
+|---|---|---|---|---|
+| E1 | **Key splitting**: spread attestations over N allowlisted keys | 12% → 71% | ~9× | partially mitigated (by sharing-graph scoring); residual open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)) |
+| E2 | **Jittered timing**: randomize inter-attestation delays to defeat burst rules | 24% → 63% | ~6× | partially mitigated (by temporal dispersion feature); residual open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)) |
+| E3 | **Round-robin record sharing**: rotate record hashes across colluding keys | 18% → 68% | ~7× | partially mitigated (by sharing-graph scoring); residual open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)) |
+| E4 | **Combined Sybil + low-and-slow** (E1+E2+E3) | 8% → 54% | ~14× | open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)); cost-to-evade exceeds incentive, so evasion is not free |
+| E5 | **Key churn**: rotate through freshly allowlisted keys to reset per-key history | 15% → 41% | ~11× | open ([#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531)); needs contract-side stake or enrolment quota |
+
+Findings: detection alone is insufficient against E4 and E5. Where the
+hardened detector still misses, the cost-to-evade is dominated by the number
+of allowlisted keys an attacker must hold, which is a contract-layer lever
+(allowlist quota, stake, and per-region rate limits) rather than a scoring
+lever. Contract-side mitigations are tracked as follow-up issues:
+[#531](https://github.com/Lafiya-xyz/Lafiya-contract/issues/531) (evaluation and
+detector hardening), plus follow-ups for attester stake and enrolment quota
+filed from that issue. Until those land, E4 and E5 remain **open** and are
+listed as residual risk at the mainnet gate below.
+
+## 7. Residual risk by gate
 
 | Gate | Must be closed before the gate | Residual risk accepted at the gate |
 |---|---|---|
 | **Pre-alpha** (now: local and unit-tested) | nothing | Everything marked open. Single admin (ADR-0003), unscoped multisig (ADR-0007), immutable attestations (ADR-0006). No real patient data may be used. |
 | **Testnet** (pilot with synthetic data) | #361 (initialize front-running), #339 (history eviction), #352 (trap on wiring failure), #396 (CLI injection), rate limits configured (#444) | Unscoped multisig (ADR-0007), no compromise window (#337), RPC integrity (1.3.1), no watchdog (#414). Mitigated by synthetic data and testnet resets. |
-| **Mainnet** (real patients) | All of the testnet list, plus multisig admin with hardware keys (#399, #398), watchdog (#414), salt enforcement (#383), linkability analysis (#433, #432), reproducible builds (#418), supply-chain hardening (#421), compromise handling (#337 or #400), verification-result model (#441), external audit (#434) | ADR-0007 only if #406 gives signers a human-readable review. RPC integrity through multi-provider cross-checks. Colluding CHWs (1.1.2) handled by human process. |
+| **Mainnet** (real patients) | All of the testnet list, plus multisig admin with hardware keys (#399, #398), watchdog (#414), salt enforcement (#383), linkability analysis (#433, #432), reproducible builds (#418), supply-chain hardening (#421), compromise handling (#337 or #400), verification-result model (#441), external audit (#434), contract-side mitigations for Sybil/low-and-slow evasion (#531, §6) | ADR-0007 only if #406 gives signers a human-readable review. RPC integrity through multi-provider cross-checks. Colluding CHWs (1.1.2) handled by human process. Residual Sybil/low-and-slow evasion (E4, E5 in §6) accepted only while cost-to-evade stays above the incentive amount; re-evaluate each milestone. |
 
 ## Maintenance
 

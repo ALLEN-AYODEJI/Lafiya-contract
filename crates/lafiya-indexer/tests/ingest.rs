@@ -20,6 +20,7 @@ use stellar_xdr::{
 struct MockSource {
     events: Arc<Mutex<Vec<RawEvent>>>,
     window: Arc<Mutex<(u32, u32)>>,
+    hashes: Arc<Mutex<Vec<(u32, String)>>>,
 }
 
 impl MockSource {
@@ -27,8 +28,33 @@ impl MockSource {
         Self {
             events: Arc::new(Mutex::new(events)),
             window: Arc::new(Mutex::new((oldest, latest))),
+            hashes: Arc::new(Mutex::new(Vec::new())),
         }
     }
+
+    /// Serve a ledger hash for every ledger in `oldest..=latest`.
+    fn with_hashes(mut self, oldest: u32, latest: u32) -> Self {
+        let hashes = (oldest..=latest)
+            .map(|l| (l, ledger_hash(l, 0)))
+            .collect();
+        self.hashes = Arc::new(Mutex::new(hashes));
+        self
+    }
+
+    /// Replace the served history with a fork from `fork_ledger` onwards.
+    fn fork_from(&self, fork_ledger: u32, events: Vec<RawEvent>) {
+        *self.events.lock().unwrap() = events;
+        let mut hashes = self.hashes.lock().unwrap();
+        for (ledger, hash) in hashes.iter_mut() {
+            if *ledger >= fork_ledger {
+                *hash = ledger_hash(*ledger, 1);
+            }
+        }
+    }
+}
+
+fn ledger_hash(ledger: u32, fork: u8) -> String {
+    format!("{ledger:08x}{fork:02x}").repeat(4)
 }
 
 fn event_id(ledger: u32, index: u32) -> String {
@@ -66,10 +92,12 @@ impl EventSource for MockSource {
             .cloned()
             .collect();
         let cursor = events.last().map(|e| e.id.clone()).unwrap_or(after);
+        let hashes = self.hashes.lock().unwrap().clone();
         Ok(EventPage {
             events,
             cursor,
             latest_ledger: latest,
+            ledger_hashes: hashes,
         })
     }
 }
@@ -446,4 +474,87 @@ async fn api_serves_derived_state() {
     assert_eq!(get("/records/nothex/history").await.0, 400);
     assert_eq!(get("/attesters?status=bogus").await.0, 400);
     assert_eq!(get("/health").await.1["status"], "ok");
+}
+
+#[tokio::test]
+async fn records_ledger_hashes_and_verifies_continuity() {
+    let Some(pool) = common::test_pool().await else {
+        return;
+    };
+    let source = MockSource::new(scenario(), 1, 110).with_hashes(1, 110);
+    let ingestor = ingestor(&pool, &source);
+    while !ingestor.step().await.unwrap().caught_up {}
+
+    // Every ingested ledger has its hash persisted.
+    let hashes: Vec<(i64, String)> =
+        sqlx::query_as("SELECT ledger, ledger_hash FROM ledger_hashes ORDER BY ledger")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(hashes.len(), 8);
+    for (ledger, hash) in &hashes {
+        assert_eq!(hash, &ledger_hash(*ledger as u32, 0));
+    }
+
+    // A provider that serves a divergent hash for an already-ingested ledger
+    // is detected as a reorg rather than silently accepted.
+    source.fork_from(105, scenario());
+    let err = ingestor.step().await.unwrap_err();
+    assert!(matches!(err, IngestError::Reorg { .. }), "{err}");
+    assert_eq!(
+        ingestor.metrics.reorg_detected_total(),
+        1,
+        "reorg must be counted"
+    );
+}
+
+#[tokio::test]
+async fn reorg_rolls_back_to_common_ancestor_and_reingests() {
+    let Some(pool) = common::test_pool().await else {
+        return;
+    };
+    let source = MockSource::new(scenario(), 1, 110).with_hashes(1, 110);
+    let ingestor = ingestor(&pool, &source);
+    while !ingestor.step().await.unwrap().caught_up {}
+    assert_final_state(&pool).await;
+
+    // The provider fails over to a node whose history forks at ledger 105:
+    // R2 is never attested and A is removed earlier.
+    let forked = vec![
+        attester_event(100, "attester_added", 1),
+        attester_event(101, "attester_added", 2),
+        attester_event(102, "attester_suspended", 2),
+        attested(103, 0xaa, 1, 1_000),
+        revoked(104, 0xaa),
+        attester_event(105, "attester_removed", 1),
+        attester_event(106, "attester_added", 2),
+    ];
+    source.fork_from(105, forked);
+
+    // The next step detects the mismatch, rolls back atomically and re-ingests.
+    let step = ingestor.step().await.unwrap();
+    assert!(step.reorged);
+    assert_eq!(ingestor.metrics.reorg_detected_total(), 1);
+    assert_eq!(ingestor.metrics.last_rollback_depth(), 3);
+
+    // Derived state reflects only the forked history.
+    let mut expected = vec![
+        (account(1).1, "removed".to_string()),
+        (account(2).1, "suspended".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(statuses(&pool).await, expected);
+    let attestations: Vec<String> =
+        sqlx::query_scalar("SELECT record_hash FROM attestations ORDER BY event_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attestations, vec!["aa".repeat(32)]);
+
+    // Re-running the rollback + re-ingest is idempotent.
+    let before = statuses(&pool).await;
+    let applied = store::rollback_to(&pool, 104).await.unwrap();
+    assert_eq!(applied, 0);
+    assert_eq!(statuses(&pool).await, before);
+    assert_eq!(ingestor.metrics.reorg_detected_total(), 1);
 }

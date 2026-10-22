@@ -54,57 +54,61 @@ format and no new infrastructure. The PoC shows the attack linking 1 event inste
 Pair it with relayed submission later for channel 5, and track batch anchoring as a
 research item for channels 2 and 4.
 
-## Indexer query surface as a probing oracle
+## Privacy review: dispute flags and status lists
 
-The public indexer API (`crates/lafiya-indexer/src/api.rs`) exposes
-`/attesters`, `/attestations`, and `/records/{hash}/history`. The history endpoint is a
-direct instance of channel 1: anyone holding a `record_hash` (from one card scan, or by
-scraping hashes out of the ledger) can query it to enumerate every attestation tied to
-that record, and can sweep candidate hashes to confirm which ones exist. Even without
-the history endpoint, the ability to test "does this hash have activity?" is a
-linkability oracle, so the query surface must be treated as part of the threat model,
-not just the ledger.
+Two planned features add new on-chain signals. Both are reviewed here against the
+channels above before implementation.
 
-### Guidance for operators
+### Patient-initiated dispute flags (issue #546)
 
-- **Do not expose the indexer directly.** Put it behind a reverse proxy that terminates
-  TLS, enforces its own connection limits, and forwards a trustworthy client IP
-  (`X-Forwarded-For` handling must be configured so the indexer sees the real peer, not
-  a spoofable header). The indexer's own limits are a backstop, not the only control.
-- **Keep the history endpoint private by default.** `/records/{hash}/history` should be
-  reachable only by authenticated clients (API key) and, where possible, only from
-  trusted networks. Public, unauthenticated history lookups are the highest-risk
-  configuration and should require an explicit opt-in.
-- **Never expose admin, metrics, or debug endpoints** (health detail, config dumps,
-  raw DB access) on the public listener; bind them to a separate internal interface.
-- **Defaults are safe:** rate limits and request budgets are enabled unless explicitly
-  disabled in configuration. Disabling them should be a deliberate, logged action.
+A patient-signed `Disputed` overlay (keyed by record hash and signer) lets a patient
+flag incorrect verified data without deleting it. The dispute itself is a new
+linkable signal:
 
-### Controls in the indexer
+- **Channel 1 (watch a hash) is re-opened for disputed records.** A dispute is
+  submitted against a specific record hash, so an observer who scanned the card can
+  see that the patient disputed it, and when. Under per-attestation blinded
+  commitments the disputed hash is the blinded value, which limits the leak to that
+  one attestation, but the dispute transaction still ties the patient's action to a
+  verification point in time.
+- **Dispute timing correlates with visits.** A dispute is typically filed shortly
+  after a patient learns of the bad record (often right after a visit), so dispute
+  timestamps leak coarse movement information (channel 2).
+- **Dispute spam is itself a signal.** Unbounded disputes would let an observer
+  distinguish active patients and would also be a griefing vector; disputes must be
+  bounded per signer/record and clearing must require attester or admin action
+  (anti-abuse requirement in #546).
 
-- **Token-bucket limits by IP and by API key**, with configurable tiers. Both buckets
-  apply; a request is denied if either is exhausted. Limits must hold under load
-  (target: no more than the configured rate sustained at 10x offered load).
-- **Bounded page size** on list endpoints, with a hard maximum and a stable default, so
-  a client cannot request an unbounded scan in one call.
-- **Constant-shape responses** to reduce enumeration signal: a miss and a hit should be
-  indistinguishable in status code, body shape, and (as far as practical) timing.
-  History responses for unknown hashes return the same empty-page shape as a known hash
-  with no visible entries, rather than a distinct 404.
-- **Structured denial logging without cleartext hashes.** When a request is denied
-  (rate limit, quota, auth failure), log a structured event with the client identity
-  (hashed or truncated), the route, the reason, and a timestamp. Do **not** log the
-  requested `record_hash` in cleartext; log a keyed hash or a truncated prefix so
-  operators can correlate abuse without turning logs into a linkability dataset.
+**Guidance:** disputes should be submitted through the same relayed-submission path
+as attestations (channel 5) where available, and the dispute signature domain must be
+separated from attestation and revocation domains so a dispute signature cannot be
+replayed as another action. Disputes are documented as an intentional, bounded
+linkability trade-off: the patient chooses to surface the signal.
 
-### Residual risk
+### Status-list contract (issue #547)
 
-Rate limits and constant-shape responses raise the cost of scraping but do not remove
-the oracle: a patient with a known hash can still be tracked by a determined observer
-who stays under the limits, and a slow sweep can still confirm hash existence. The
-durable fix remains per-attestation blinded commitments (ADR-0012), which removes the
-repeating hash the endpoint keys on. Until then, treat the indexer as a
-sensitive service and restrict it accordingly.
+A bitstring status list (aligned with W3C Bitstring Status List) lets verifiers sync
+revocation state in bulk instead of per-hash lookups. The privacy risk is **index
+correlation**:
+
+- **Index allocation must not reveal record identity.** If the status-list index were
+  derived directly from the record hash (or assigned in attestation order), an
+  observer could map list positions back to records and reconstruct which entries
+  were revoked, re-creating channel 1 at list granularity.
+- **Correlation across syncs.** A verifier that caches successive list versions can
+  diff them; if indices are stable and ordered by creation time, the diff reveals
+  *when* records were revoked and how many, which correlates with attester activity
+  (channel 4).
+- **Segment/commitment metadata.** Versioned segment commitments must not embed
+  record hashes or attester addresses in plaintext; only the signed root and segment
+  version are published.
+
+**Guidance:** allocate indices via a keyed, unpredictable mapping (e.g. a
+domain-separated PRF over the blinded record hash with a registry-held key) so
+positions carry no ordering or identity information; publish only versioned
+commitments and signed roots; and document the residual leak that the *count* of
+revocations per segment is public. The threat analysis and measured size/sync time
+for 1M entries are tracked in #547.
 
 ## Follow-up engineering issues
 
@@ -113,5 +117,5 @@ sensitive service and restrict it accordingly.
 3. Revocation by blinded hash, and an off-chain (patient-held) attestation history.
 4. Relayed submission for attesters (channel 5).
 5. Research spike: batch anchoring and CHW activity privacy (channels 2 and 4).
-6. Harden the indexer query surface: API keys, per-IP/per-key token buckets, bounded page
-   size, constant-shape responses, and redacted denial logging (see above).
+6. Dispute flags (#546): domain-separated patient signature, bounded disputes, attester/admin clearing.
+7. Status-list index allocation (#547): PRF-based indices, versioned commitments, index-correlation analysis.
