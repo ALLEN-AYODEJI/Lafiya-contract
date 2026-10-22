@@ -150,6 +150,11 @@ pub const ATTESTATION_REGISTRY: Requirement = Requirement {
     min_interface_version: 1,
 };
 
+pub const INCENTIVE_POOL: Requirement = Requirement {
+    contract_kind: "lafiya_incentive_pool",
+    min_interface_version: 1,
+};
+
 /// Check the raw `get_interface` output against `req`.
 ///
 /// `raw` is `None` when the call failed, which means the contract predates

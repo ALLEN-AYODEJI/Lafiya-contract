@@ -5,6 +5,19 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::decode::{cursor_ledger, decode, DecodeError, LafiyaEvent, RawEvent};
 
+/// Default number of rows deleted per batch by [`prune`].
+pub const PRUNE_BATCH_SIZE: i64 = 500;
+/// Default maximum number of batches [`prune`] will run per table per call.
+pub const PRUNE_MAX_BATCHES: i64 = 20;
+/// Default retention window (in seconds) for operational tables.
+pub const DEFAULT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+/// Maximum delivery attempts before a delivery is dead-lettered.
+pub const MAX_DELIVERY_ATTEMPTS: i32 = 8;
+/// Base backoff (seconds) for the first retry; doubles per attempt.
+pub const BACKOFF_BASE_SECS: i64 = 5;
+/// Cap on the exponential backoff (seconds).
+pub const BACKOFF_MAX_SECS: i64 = 60 * 60;
+
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 const LIVE: &str = "live";
@@ -61,6 +74,65 @@ pub struct Payout {
     pub tx_hash: String,
 }
 
+/// A push-delivery subscription. Filters are optional; `None` matches all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subscription {
+    pub id: i64,
+    pub url: String,
+    pub secret: String,
+    pub contract_id: Option<String>,
+    pub event_type: Option<String>,
+    pub attester: Option<String>,
+    pub active: bool,
+}
+
+/// A delivery claimed for sending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub id: i64,
+    pub subscription_id: i64,
+    pub event_id: String,
+    pub url: String,
+    pub secret: String,
+    pub attempts: i32,
+}
+
+/// Retention configuration for [`prune`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retention {
+    /// Delete deliveries/dead letters older than this many seconds.
+    pub retention_secs: i64,
+    /// Rows deleted per batch (bounded lock duration).
+    pub batch_size: i64,
+    /// Maximum batches per table per call.
+    pub max_batches: i64,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention {
+            retention_secs: DEFAULT_RETENTION_SECS,
+            batch_size: PRUNE_BATCH_SIZE,
+            max_batches: PRUNE_MAX_BATCHES,
+        }
+    }
+}
+
+/// Rows removed by a [`prune`] call, per table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pruned {
+    pub deliveries: u64,
+    pub dead_letters: u64,
+}
+
+/// Exponential backoff in seconds for a given attempt count (1-based).
+pub fn backoff_secs(attempts: i32) -> i64 {
+    let shift = attempts.saturating_sub(1).clamp(0, 20) as u32;
+    BACKOFF_BASE_SECS
+        .saturating_mul(1i64 << shift)
+        .min(BACKOFF_MAX_SECS)
+}
+
 pub async fn checkpoint(pool: &PgPool) -> Result<Option<Checkpoint>, sqlx::Error> {
     let row: Option<(Option<String>, i64)> =
         sqlx::query_as("SELECT cursor, ledger FROM checkpoints WHERE name = $1")
@@ -106,6 +178,7 @@ pub async fn apply_page(
         .rows_affected();
         if inserted == 1 {
             apply_event(&mut tx, raw, &event).await?;
+            enqueue_deliveries(&mut tx, raw, &event).await?;
             applied += 1;
         }
     }
@@ -536,4 +609,87 @@ async fn apply_event(
         LafiyaEvent::Unknown { .. } => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_secs(1), BACKOFF_BASE_SECS);
+        assert_eq!(backoff_secs(2), BACKOFF_BASE_SECS * 2);
+        assert_eq!(backoff_secs(3), BACKOFF_BASE_SECS * 4);
+        assert_eq!(backoff_secs(100), BACKOFF_MAX_SECS);
+    }
+
+    #[test]
+    fn retention_defaults_are_bounded() {
+        let r = Retention::default();
+        assert!(r.batch_size > 0);
+        assert!(r.max_batches > 0);
+        assert!(r.retention_secs > 0);
+    }
+
+    /// Pruning is idempotent and bounded: a second run over an already-pruned
+    /// table deletes nothing, and each call issues at most `max_batches`
+    /// statements (short locks).
+    #[sqlx::test]
+    async fn prune_is_idempotent_and_bounded(pool: PgPool) -> sqlx::Result<()> {
+        MIGRATOR.run(&pool).await.unwrap();
+        let sub = create_subscription(&pool, "https://example.test/hook", "s", None, None, None)
+            .await?;
+        for i in 0..10 {
+            sqlx::query(
+                "INSERT INTO deliveries (subscription_id, event_id, created_at)
+                 VALUES ($1, $2, now() - interval '30 days')",
+            )
+            .bind(sub)
+            .bind(format!("evt-{i}"))
+            .execute(&pool)
+            .await?;
+        }
+        let retention = Retention {
+            retention_secs: 60,
+            batch_size: 3,
+            max_batches: 10,
+        };
+        let first = prune(&pool, retention).await?;
+        assert_eq!(first.deliveries, 10);
+        let second = prune(&pool, retention).await?;
+        assert_eq!(second.deliveries, 0);
+        Ok(())
+    }
+
+    /// Enqueueing the same event twice for the same subscription is a no-op.
+    #[sqlx::test]
+    async fn enqueue_is_idempotent(pool: PgPool) -> sqlx::Result<()> {
+        MIGRATOR.run(&pool).await.unwrap();
+        let sub = create_subscription(&pool, "https://example.test/hook", "s", None, None, None)
+            .await?;
+        let mut tx = pool.begin().await?;
+        let raw = RawEvent {
+            id: "evt-1".into(),
+            contract_id: "C".into(),
+            ledger: 1,
+            ledger_closed_at: "2024-01-01T00:00:00Z".into(),
+            tx_hash: "tx".into(),
+            topic: vec![],
+            value: Value::Null,
+            in_successful_contract_call: true,
+        };
+        let event = LafiyaEvent::AttesterAdded {
+            attester: "G".into(),
+        };
+        assert_eq!(enqueue_deliveries(&mut tx, &raw, &event).await?, 1);
+        assert_eq!(enqueue_deliveries(&mut tx, &raw, &event).await?, 0);
+        tx.commit().await?;
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM deliveries WHERE subscription_id = $1")
+                .bind(sub)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
 }

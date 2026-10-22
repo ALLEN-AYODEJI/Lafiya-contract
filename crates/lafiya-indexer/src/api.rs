@@ -1,12 +1,15 @@
 //! Read-only HTTP/JSON API (spec: `openapi.yaml`, served at `/openapi.yaml`).
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -45,6 +48,7 @@ pub enum ApiError {
     BadRequest(String),
     NotFound(String),
     Db(sqlx::Error),
+    Delivery(String),
 }
 
 impl From<sqlx::Error> for ApiError {
