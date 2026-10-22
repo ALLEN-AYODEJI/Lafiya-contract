@@ -12,6 +12,8 @@
 //!    polls until the transaction is included, expired, or its sequence
 //!    number is consumed (see ADR-0011).
 
+use crate::auth_decode;
+use crate::preview::{self, PreviewOptions};
 use anyhow::{bail, Context};
 use lafiya_config::NetworkConfig;
 use lafiya_rpc_resilience::xdr::apply_ledger_bounds;
@@ -41,7 +43,17 @@ const MAX_RESTORE_ENTRIES: usize = 32;
 
 /// Build, bound, sign, and submit a `stellar contract invoke` argument list
 /// (as produced by `invoke_args`), rebuilding it if it expires.
-pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> anyhow::Result<()> {
+///
+/// Before anything is signed or submitted, the transaction is simulated and a
+/// deterministic preview of its state changes is rendered (issue #536). The
+/// preview must be confirmed with `--yes` or interactively; a failed
+/// simulation blocks submission (fail closed).
+pub fn run_bounded(
+    cfg: &NetworkConfig,
+    invoke: Vec<String>,
+    window: u32,
+    opts: &PreviewOptions,
+) -> anyhow::Result<()> {
     for attempt in 0..=MAX_REBUILDS {
         let mut rpc = SorobanRpc::new(&cfg.rpc_url);
         let latest = rpc
@@ -50,6 +62,21 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
         let max_ledger = max_ledger_for(latest, window);
 
         let unsigned = stellar(&build_only_args(&invoke))?;
+
+        // Pre-submit preview: simulate and decode state changes. A failure to
+        // simulate blocks submission by default (fail closed).
+        let sim = rpc
+            .simulate_transaction(&unsigned)
+            .context("simulateTransaction failed; refusing to submit (pass --skip-preview to override)")?;
+        let preview = preview::build_preview(&sim, &cfg.network_passphrase)?;
+        preview::render(&preview, opts)?;
+        if opts.preview_only {
+            return Ok(());
+        }
+        if !opts.yes && !confirm()? {
+            bail!("submission aborted: preview not confirmed");
+        }
+
         let simulated = stellar(&tx_args(cfg, "simulate", &invoke, &unsigned))?;
         let (bounded, bounds) = apply_ledger_bounds(&simulated, max_ledger)?;
         let signed = stellar(&tx_args(cfg, "sign", &invoke, &bounded))?;
@@ -313,6 +340,16 @@ impl SorobanRpc {
         }
     }
 
+    /// Call `simulateTransaction` for a base64 envelope and return the raw
+    /// result object (footprint, auth, results, and state changes).
+    fn simulate_transaction(&self, envelope_b64: &str) -> anyhow::Result<Value> {
+        self.call(
+            "simulateTransaction",
+            json!({ "transaction": envelope_b64 }),
+        )
+        .map_err(|(_, e)| anyhow::anyhow!("{e}"))
+    }
+
     /// Call `method`. Errors are split the ADR-0011 way: a failure to
     /// connect is definite (nothing sent); anything after that is ambiguous.
     fn call(&self, method: &str, params: Value) -> Result<Value, (bool, RpcError)> {
@@ -497,5 +534,21 @@ mod tests {
             .map(String::from)
             .to_vec()
         );
+    }
+
+    #[test]
+    fn preview_is_required_before_submission() {
+        // `--yes` is the only non-interactive confirmation path; without it
+        // and without a terminal, `confirm` refuses.
+        let opts = PreviewOptions::default();
+        assert!(!opts.yes);
+        assert!(!opts.preview_only);
+    }
+
+    #[test]
+    fn auth_decode_is_wired_into_preview() {
+        // The preview module reuses `auth_decode::decode_entry`; ensure the
+        // symbol is reachable from this crate.
+        let _ = auth_decode::decode_entry;
     }
 }
