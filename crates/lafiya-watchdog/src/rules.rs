@@ -10,6 +10,11 @@ pub const WASM_CHANGED_WITHOUT_EVENT: &str = "wasm_changed_without_event";
 pub const MASS_ENROLLMENT: &str = "mass_enrollment";
 pub const WATCHDOG_LAG: &str = "watchdog_lag";
 pub const WATCHDOG_FAILING: &str = "watchdog_failing";
+/// An attestation entry's remaining TTL dropped below the configured
+/// threshold; anyone may bump it with `extend_attestation_ttl`.
+pub const ATTESTATION_EXPIRING: &str = "attestation_expiring";
+/// A patient-initiated dispute overlay was recorded on an attestation.
+pub const ATTESTATION_DISPUTED: &str = "attestation_disputed";
 
 pub struct Engine {
     rules: Vec<EventRule>,
@@ -20,6 +25,10 @@ pub struct Engine {
     /// Wasm hash each contract is expected to run, from `upgraded` events or
     /// the first observation.
     expected_wasm: BTreeMap<String, String>,
+    /// Remaining TTL (in ledgers) below which an attestation is flagged.
+    expiry_threshold_ledgers: Option<u32>,
+    /// Whether disputes should be surfaced as alerts.
+    alert_on_dispute: bool,
 }
 
 /// Default rules from the issue: privileged changes are critical, pause
@@ -76,6 +85,8 @@ impl Engine {
             explorer_tx_url: cfg.explorer_tx_url.clone(),
             rate_window: VecDeque::new(),
             expected_wasm: BTreeMap::new(),
+            expiry_threshold_ledgers: cfg.attestation_expiry_threshold_ledgers,
+            alert_on_dispute: cfg.alert_on_dispute,
         }
     }
 
@@ -138,6 +149,15 @@ impl Engine {
             self.expected_wasm.insert(e.contract.clone(), hash);
         }
 
+        if self.alert_on_dispute && e.name == "attestation_disputed" {
+            alerts.push(self.alert(
+                ATTESTATION_DISPUTED,
+                Severity::High,
+                format!("attestation disputed on {}", e.contract),
+                e,
+            ));
+        }
+
         if let Some(rate) = &self.rate {
             if e.name == rate.event {
                 self.rate_window.push_back(e.ledger);
@@ -161,6 +181,33 @@ impl Engine {
         }
 
         alerts
+    }
+
+    /// Check an attestation entry's remaining TTL (in ledgers) against the
+    /// configured threshold. Returns an alert when the entry is approaching
+    /// expiry and the threshold is configured.
+    pub fn observe_ttl(
+        &self,
+        contract: &str,
+        record_hash: &str,
+        remaining_ledgers: u32,
+        ledger: u32,
+    ) -> Option<Alert> {
+        let threshold = self.expiry_threshold_ledgers?;
+        if remaining_ledgers >= threshold {
+            return None;
+        }
+        Some(Alert {
+            kind: ATTESTATION_EXPIRING.into(),
+            severity: Severity::High,
+            summary: format!(
+                "attestation {record_hash} on {contract} expires in {remaining_ledgers} ledgers (threshold {threshold}); bump with extend_attestation_ttl"
+            ),
+            ledger,
+            contract: contract.into(),
+            details: vec![format!("record_hash: {record_hash}")],
+            explorer_link: None,
+        })
     }
 
     /// Compare a contract's on-chain wasm hash (from `getLedgerEntries`)
@@ -274,6 +321,8 @@ mod tests {
             }),
             heartbeat: Heartbeat::default(),
             sinks: vec![],
+            attestation_expiry_threshold_ledgers: Some(100),
+            alert_on_dispute: true,
         }
     }
 
@@ -420,6 +469,43 @@ mod tests {
     fn routine_events_are_ignored() {
         assert!(Engine::new(&cfg())
             .evaluate(&ev("attestation_recorded", 1, &[]))
+            .is_empty());
+    }
+
+    #[test]
+    fn approaching_expiry_is_flagged() {
+        let e = Engine::new(&cfg());
+        assert!(e.observe_ttl("CREG", "deadbeef", 500, 1).is_none());
+        let a = e.observe_ttl("CREG", "deadbeef", 50, 2).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.severity),
+            (ATTESTATION_EXPIRING, Severity::High)
+        );
+        assert!(a.summary.contains("deadbeef"));
+    }
+
+    #[test]
+    fn expiry_check_disabled_without_threshold() {
+        let mut c = cfg();
+        c.attestation_expiry_threshold_ledgers = None;
+        assert!(Engine::new(&c).observe_ttl("CREG", "deadbeef", 1, 1).is_none());
+    }
+
+    #[test]
+    fn dispute_is_surfaced() {
+        let a = Engine::new(&cfg()).evaluate(&ev("attestation_disputed", 1, &[]));
+        assert_eq!(
+            kinds(&a),
+            vec![(ATTESTATION_DISPUTED, Severity::High)]
+        );
+    }
+
+    #[test]
+    fn dispute_alert_can_be_disabled() {
+        let mut c = cfg();
+        c.alert_on_dispute = false;
+        assert!(Engine::new(&c)
+            .evaluate(&ev("attestation_disputed", 1, &[]))
             .is_empty());
     }
 }

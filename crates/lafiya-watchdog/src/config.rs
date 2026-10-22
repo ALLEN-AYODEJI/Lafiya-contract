@@ -24,6 +24,12 @@ pub struct Config {
     pub rules: Vec<EventRule>,
     #[serde(default)]
     pub mass_enrollment: Option<RateRule>,
+    /// Alert when attestation entries approach expiry (issue #544).
+    #[serde(default)]
+    pub expiry_warning: ExpiryWarning,
+    /// Alert on patient-initiated dispute flags (issue #546).
+    #[serde(default)]
+    pub disputes: DisputeMonitoring,
     #[serde(default)]
     pub heartbeat: Heartbeat,
     #[serde(default)]
@@ -56,6 +62,89 @@ pub struct RateRule {
 
 fn default_rate_event() -> String {
     "attester_added".into()
+}
+
+/// Watchdog guidance for attestation TTLs: warn before entries archive so an
+/// operator can call `extend_attestation_ttl` (or `restore`) in time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExpiryWarning {
+    /// Emit a warning when an entry's remaining TTL falls below this many
+    /// ledgers.
+    #[serde(default = "default_expiry_warn_ledgers")]
+    pub warn_below_ledgers: u32,
+    /// Emit a critical alert when remaining TTL falls below this many ledgers.
+    #[serde(default = "default_expiry_critical_ledgers")]
+    pub critical_below_ledgers: u32,
+    /// How often to scan tracked attestation entries, in ledgers.
+    #[serde(default = "default_expiry_scan")]
+    pub scan_interval_ledgers: u32,
+    /// Record hashes (hex) whose TTL should be monitored. Empty means monitor
+    /// every entry the indexer reports.
+    #[serde(default)]
+    pub record_hashes: Vec<String>,
+}
+
+impl Default for ExpiryWarning {
+    fn default() -> Self {
+        ExpiryWarning {
+            warn_below_ledgers: default_expiry_warn_ledgers(),
+            critical_below_ledgers: default_expiry_critical_ledgers(),
+            scan_interval_ledgers: default_expiry_scan(),
+            record_hashes: Vec::new(),
+        }
+    }
+}
+
+fn default_expiry_warn_ledgers() -> u32 {
+    100_000
+}
+
+fn default_expiry_critical_ledgers() -> u32 {
+    20_000
+}
+
+fn default_expiry_scan() -> u32 {
+    1_000
+}
+
+/// Watchdog guidance for patient-initiated dispute flags: surface disputes so
+/// verifiers and responders act on them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DisputeMonitoring {
+    /// Alert on every newly observed dispute flag.
+    #[serde(default = "default_true")]
+    pub alert_on_new: bool,
+    /// Alert when a single signer raises more than this many disputes within
+    /// `window_ledgers` (anti-abuse / spam signal).
+    #[serde(default = "default_dispute_spam")]
+    pub max_disputes_per_signer: usize,
+    #[serde(default = "default_dispute_window")]
+    pub window_ledgers: u32,
+    #[serde(default = "default_high")]
+    pub severity: Severity,
+}
+
+impl Default for DisputeMonitoring {
+    fn default() -> Self {
+        DisputeMonitoring {
+            alert_on_new: true,
+            max_disputes_per_signer: default_dispute_spam(),
+            window_ledgers: default_dispute_window(),
+            severity: Severity::High,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_dispute_spam() -> usize {
+    5
+}
+
+fn default_dispute_window() -> u32 {
+    1_000
 }
 
 fn default_high() -> Severity {
