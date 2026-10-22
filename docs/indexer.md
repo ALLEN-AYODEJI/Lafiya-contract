@@ -91,14 +91,25 @@ final; data at or below it will not be rolled back by a reorg.
 | `LAFIYA_RECONCILE_INTERVAL_SECS` | `300` | Reconciliation period. |
 | `LAFIYA_RECONCILE_SAMPLE` | `50` | Attesters and records sampled per cycle. |
 | `LAFIYA_RECONCILE_MAX_LAG` | `2` | Skip the sample while ingestion lags more ledgers than this, so in-flight changes are not reported as mismatches. |
+| `LAFIYA_RETENTION_OPERATIONAL_DAYS` | `30` | Prune derived/operational rows (delivery attempts, dead letters, request logs) older than this. `0` disables pruning. |
+| `LAFIYA_RETENTION_PRUNE_INTERVAL_SECS` | `3600` | How often the pruning job runs. |
+| `LAFIYA_WEBHOOK_SECRET` | none | HMAC-SHA256 key for webhook signatures. Required to enable webhook delivery. |
+| `LAFIYA_WEBHOOK_MAX_ATTEMPTS` | `8` | Delivery attempts before a webhook is moved to the dead-letter table. |
 | `RUST_LOG` | `info` | Log filter. |
 
 ## Running
+
+The published image is built from `crates/lafiya-indexer/Dockerfile` on a
+distroless runtime, runs as a non-root user (UID 65532), and expects a
+read-only root filesystem. It writes nothing to disk: all state lives in
+Postgres, so the only writable mounts needed are a `tmpfs` at `/tmp`.
 
 ```sh
 docker build -f crates/lafiya-indexer/Dockerfile -t lafiya-indexer .
 
 docker run -d --name lafiya-indexer -p 8080:8080 \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --user 65532:65532 \
   -e DATABASE_URL=postgres://indexer:...@db:5432/lafiya \
   -e LAFIYA_RPC_URL=https://soroban-testnet.stellar.org \
   -e LAFIYA_ATTESTER_REGISTRY=C... \
@@ -106,6 +117,83 @@ docker run -d --name lafiya-indexer -p 8080:8080 \
   -e LAFIYA_START_LEDGER=<deployment ledger> \
   lafiya-indexer
 ```
+
+### Docker Compose
+
+```yaml
+services:
+  indexer:
+    image: ghcr.io/<org>/lafiya-indexer:<version>
+    read_only: true
+    user: "65532:65532"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      DATABASE_URL: postgres://indexer:...@db:5432/lafiya
+      LAFIYA_RPC_URL: https://soroban-testnet.stellar.org
+      LAFIYA_ATTESTER_REGISTRY: C...
+      LAFIYA_ATTESTATION_REGISTRY: C...
+    ports: ["8080:8080"]
+```
+
+### Kubernetes / Helm
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: indexer
+      image: ghcr.io/<org>/lafiya-indexer:<version>
+      securityContext:
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+  volumes:
+    - name: tmp
+      emptyDir: { medium: Memory, sizeLimit: 16Mi }
+```
+
+The image contains no shell, so `kubectl exec` debugging is not available;
+use logs and `/metrics` instead.
+
+### Verifying the published image
+
+Every release image is signed with cosign keyless (Sigstore Fulcio/Rekor),
+and ships a CycloneDX SBOM and SLSA provenance attestations. Verification
+is exercised in CI against the published image on each release.
+
+```sh
+IMAGE=ghcr.io/<org>/lafiya-indexer@sha256:<digest>
+
+# Signature, pinned to this repository's workflow identity
+cosign verify "$IMAGE" \
+  --certificate-identity-regexp '^https://github.com/<org>/<repo>/\.github/workflows/.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# CycloneDX SBOM
+cosign download attestation "$IMAGE" \
+  --predicate-type https://cyclonedx.org/bom | jq -r '.payload' | base64 -d | jq .
+
+# SLSA provenance
+cosign download attestation "$IMAGE" \
+  --predicate-type https://slsa.dev/provenance/v1 | jq -r '.payload' | base64 -d | jq .
+
+# Vulnerability scan gate (exceptions require justification in
+# .github/trivy-exceptions.yaml)
+trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE"
+```
+
+Always deploy by digest, not tag. Image size and CVE counts are reported on
+each release.
 
 Run one replica. Two replicas would not corrupt state, because pages and
 checkpoints are transactional and idempotent, but they duplicate RPC load.

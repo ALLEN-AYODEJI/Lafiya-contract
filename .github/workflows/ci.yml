@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      indexer: ${{ steps.filter.outputs.indexer }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
@@ -38,6 +39,15 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - '.config/nextest.toml'
+              - '.github/workflows/ci.yml'
+            indexer:
+              - 'crates/lafiya-indexer/**'
+              - 'deploy/observability/**'
+              - 'docs/compliance/**'
+              - 'docs/observability.md'
+              - 'docs/runbooks/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
   shell-lint:

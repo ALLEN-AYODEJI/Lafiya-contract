@@ -263,4 +263,3 @@ indexer cannot find a common ancestor.
    last-rollback depth at the time you intervened, and the checkpoint ledger you rolled back
    to. Note explicitly that this was a reorg/divergence case so the next operator does not
    re-walk §3a or §4 expecting a different answer.
-=======

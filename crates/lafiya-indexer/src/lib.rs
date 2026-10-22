@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod decode;
+pub mod delivery;
 pub mod ingest;
 pub mod metrics;
 pub mod reconcile;
