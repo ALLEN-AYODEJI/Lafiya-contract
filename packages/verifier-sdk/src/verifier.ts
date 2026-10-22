@@ -8,6 +8,11 @@ import type {
 import { commitV1, type FieldValue } from "./commitment.js";
 import { parseQrPayload, QrPayloadError, type QrPayload } from "./qr.js";
 import { BindingsChainReader } from "./rpc.js";
+import {
+  verifyForeignAttestation,
+  type FederationTrustAnchors,
+  type ForeignVerificationFailure,
+} from "./trust.js";
 import type { TrustAnchors } from "./trust.js";
 import { VERDICTS, verdictOf, type Reason, type Verdict } from "./verdict.js";
 
@@ -15,6 +20,13 @@ export interface VerifierOptions {
   /** Network this verifier accepts cards for, e.g. `"testnet"`. */
   network: string;
   trust: TrustAnchors;
+  /**
+   * Trust anchors for other deployments, keyed by jurisdiction code. When a
+   * card names a foreign jurisdiction, verification is delegated to
+   * `verifyForeignAttestation` instead of the local chain reader. Omit to
+   * behave exactly as a single-deployment verifier.
+   */
+  federation?: FederationTrustAnchors;
   /** Defaults to reading over RPC with the generated bindings. */
   chain?: ChainReader;
   /** Clock override (tests, offline replays). */
@@ -64,6 +76,20 @@ export interface VerificationResult {
 
 const DAY_SECONDS = 86_400n;
 
+/** Map a federation failure onto the shared verdict vocabulary. */
+function federationReason(failure: ForeignVerificationFailure): Reason {
+  switch (failure.code) {
+    case "unknown_jurisdiction":
+      return { code: "untrusted_contract", message: failure.message };
+    case "stale_anchor":
+      return { code: "untrusted_contract", message: failure.message };
+    case "signature_mismatch":
+      return { code: "commitment_mismatch", message: failure.message };
+    case "foreign_registry_unavailable":
+      return { code: "unavailable", message: failure.message };
+  }
+}
+
 export class LafiyaVerifier {
   private readonly chain: ChainReader;
   private readonly now: () => Date;
@@ -103,6 +129,32 @@ export class LafiyaVerifier {
       reasons.push({ code: "invalid_payload", message });
       return done();
     }
+    // 1a. Foreign jurisdiction: delegate to the federation trust-anchor check.
+    if (payload.jurisdiction !== undefined && payload.jurisdiction !== this.options.network) {
+      const federation = this.options.federation;
+      if (!federation) {
+        reasons.push({
+          code: "untrusted_contract",
+          message: `card is for jurisdiction "${payload.jurisdiction}", which this verifier does not federate with`,
+        });
+        return done({ payload });
+      }
+      const foreign = await verifyForeignAttestation(federation, payload, {
+        now: checkedAt,
+        ...(opts.disclosedFields ? { disclosedFields: opts.disclosedFields } : {}),
+        ...(opts.maxAgeDays !== undefined ? { maxAgeDays: opts.maxAgeDays } : {}),
+      });
+      if (!foreign.ok) {
+        reasons.push(federationReason(foreign.failure));
+        return done({ payload });
+      }
+      return done({
+        payload,
+        attestation: foreign.attestation,
+        attester: foreign.attester,
+      });
+    }
+
     const trust = this.options.trust[this.options.network];
     if (payload.network !== this.options.network || !trust) {
       reasons.push({

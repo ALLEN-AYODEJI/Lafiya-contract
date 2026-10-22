@@ -48,6 +48,34 @@ When a relevant change is announced, the owner opens a tracking issue labelled
 If any job fails on a scheduled run, the `report` job opens an issue, or
 comments on the one that is already open.
 
+### 2.1 Triaging a failed matrix run
+
+Start from the failed run's summary and identify **which leg** failed; the
+leg determines whether this is a real compatibility problem or an
+environment/pin problem.
+
+| Failed leg | First thing to check | Reproduce locally |
+|---|---|---|
+| `SDK (pinned)` | Toolchain or environment drift (Rust version, `Cargo.lock` not committed, cache). This leg should never fail for SDK reasons. | `git checkout <sha>` then `make check` with the pinned `rust-toolchain.toml`. |
+| `SDK (latest-patch)` | A new patch release changed behaviour or the spec. | `cargo update -p soroban-sdk` on a scratch branch, then `make check` and `make conformance`. |
+| `SDK (main)` | Expected to be noisy; treat as advance notice. Only escalate if the same failure persists for two or more weeks. | `cargo update -p soroban-sdk --git https://github.com/stellar/rs-soroban-sdk --branch main`, then `make check`. |
+| `Protocol (quickstart:testing)` | The next protocol changed host behaviour, resource limits, or fees. | `QUICKSTART_IMAGE=stellar/quickstart:testing make test-integration` (same image tag the workflow uses). |
+| `Protocol (quickstart:latest)` | Usually a broken image tag or a stale local network. | `QUICKSTART_IMAGE=stellar/quickstart:latest make test-integration`. |
+
+Record the outcome on the tracking issue: the failing leg, the first failing
+job/step, the local reproduction command, and the resolution (fix, pin bump, or
+"expected, tracking upstream"). If the fix changes a pin in
+`.github/workflows/compat-matrix.yml` (e.g. `STELLAR_CLI_VERSION` or a
+quickstart image tag), note the old and new value in the issue and in the PR
+description so the next rotation knows what moved.
+
+**#634 outcome:** the scheduled run failed on the `SDK (latest-patch)` leg
+after a new `soroban-sdk` patch release; the pinned and `main` legs were
+green. Reproduced locally with `cargo update -p soroban-sdk` followed by
+`make check` and `make conformance`. No version pins in
+`.github/workflows/compat-matrix.yml` were changed for this issue; the
+`STELLAR_CLI_VERSION` and quickstart image tags remain as documented above.
+
 ## 3. Timing relative to network votes
 
 | When | Action |

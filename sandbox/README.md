@@ -93,6 +93,64 @@ This is a demo schema, not a production record layout.
 Signing keys are stored as `stellar` CLI identities named `lafiya-sandbox-<name>`. Use
 them from your app or scripts with `--source lafiya-sandbox-chw-lagos-1`.
 
+## Two-deployment federation sandbox
+
+The `federation` scenario runs a second, independent mock deployment next to the
+primary one so you can exercise the cross-deployment trust-anchor flow described in
+[ADR 0012](../docs/adr/0012-multi-jurisdiction-deployment-topology.md) and the
+federation trust-anchor spec. It is additive: `minimal`, `pilot`, and `edge-cases`
+are unchanged and still run as single-deployment sandboxes.
+
+```bash
+cargo xtask sandbox up --scenario federation
+cargo xtask sandbox verify --scenario federation
+```
+
+`up` deploys a second pair of registries (attester + attestation) under a separate
+admin and governance key, writes a governance-signed trust-anchor document for that
+deployment, and pins the primary deployment's anchor. It also seeds one foreign
+attestation so the verifier has something to resolve.
+
+### Generated federation files (git-ignored)
+
+- **`sandbox/.env.federation.local`** adds `LAFIYA_FOREIGN_RPC_URL`,
+  `LAFIYA_FOREIGN_NETWORK_PASSPHRASE`, `LAFIYA_FOREIGN_ATTESTER_REGISTRY_ID`,
+  `LAFIYA_FOREIGN_ATTESTATION_REGISTRY_ID`, and `LAFIYA_FOREIGN_GOVERNANCE_ADDRESS`.
+- **`sandbox/trust-anchors/`** holds the signed trust-anchor documents:
+  `primary.anchor.json` (pinned by the verifier) and `foreign.anchor.json`
+  (produced by the mock second deployment's governance).
+- **`sandbox/fixtures.federation.json`** maps foreign records to their
+  `record_hash`, attesting deployment, and the anchor that vouches for them.
+
+### How the verifier resolves a foreign jurisdiction
+
+1. Read the attestation's anchoring deployment ID from the on-chain record.
+2. Look up that deployment's trust-anchor document in the verifier's pinned set
+   (`sandbox/trust-anchors/`). An anchor that is not pinned is rejected.
+3. Verify the anchor's governance signature against the pinned governance key for
+   that deployment, and check it has not expired or been revoked.
+4. Verify the foreign attestation against the foreign registry using the keys and
+   endpoints named in the anchor.
+5. Report the result as `trusted`, `untrusted`, or `unknown-deployment`.
+
+### Expected read-only cross-registry check
+
+`cargo xtask sandbox verify --scenario federation` performs a read-only check and
+asserts:
+
+- the seeded foreign attestation resolves to `trusted` via the pinned foreign anchor;
+- a record attested only on the primary deployment resolves to `trusted` locally and
+  is not misattributed to the foreign deployment;
+- no state is written to either registry during the check.
+
+### Rogue-deployment scenario
+
+The scenario also stages a rogue mock deployment whose anchor is self-signed (its
+governance key is not in the verifier's pinned set). The cross-registry check must
+reject its attestations as `untrusted` and must not fall back to trusting the
+self-signed anchor. `verify` fails if the rogue attestation is ever reported as
+`trusted`.
+
 ## For `lafiya-web` developers
 
 1. `cargo xtask sandbox up --scenario edge-cases`
