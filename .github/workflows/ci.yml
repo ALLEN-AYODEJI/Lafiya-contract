@@ -14,9 +14,6 @@ env:
   # interface` JSON shape must match scripts/conformance/snapshots/.
   STELLAR_CLI_VERSION: "25.2.0"
 
-permissions:
-  contents: read
-
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -27,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      indexer: ${{ steps.filter.outputs.indexer }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
@@ -41,6 +39,15 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - '.config/nextest.toml'
+              - '.github/workflows/ci.yml'
+            indexer:
+              - 'crates/lafiya-indexer/**'
+              - 'deploy/observability/**'
+              - 'docs/compliance/**'
+              - 'docs/observability.md'
+              - 'docs/runbooks/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
   shell-lint:
@@ -183,6 +190,95 @@ jobs:
           path: junit/**/junit.xml
           reporter: java-junit
 
+  # First-class workspace members: lafiya-indexer and lafiya-qr are built,
+  # linted, and tested on every PR so they cannot rot or drift from shared
+  # dependency versions.
+  crates-build:
+    name: Crates build (indexer, qr)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p lafiya-indexer -p lafiya-qr
+
+  crates-clippy:
+    name: Crates clippy (indexer, qr)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -p lafiya-indexer -p lafiya-qr --all-targets -- -D warnings
+
+  crates-test:
+    name: Crates test (indexer e2e, qr)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lafiya
+          POSTGRES_PASSWORD: lafiya
+          POSTGRES_DB: lafiya_indexer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lafiya"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://lafiya:lafiya@localhost:5432/lafiya_indexer_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test lafiya-qr
+        run: cargo test --locked -p lafiya-qr
+      - name: Test lafiya-indexer (includes Postgres e2e)
+        run: cargo test --locked -p lafiya-indexer --all-targets
+
+  crates-deny:
+    name: Cargo deny
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
+
+  # Drift gate for the incentive-pool bindings: regenerate from the contract
+  # interface and fail if the committed bindings differ.
+  bindings-drift:
+    name: Bindings drift (incentive-pool)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install stellar-cli
+        run: |
+          curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin stellar
+          stellar --version
+      - name: Regenerate bindings
+        run: bash scripts/generate_bindings.sh
+      - name: Fail on drift
+        run: git diff --exit-code bindings/
+
   build-wasm:
     name: Build (wasm32v1-none)
     needs: changes
@@ -206,6 +302,55 @@ jobs:
           name: release-wasm
           path: target/wasm32v1-none/release/*.wasm
           retention-days: 7
+
+  # Builds the shared QR codec for the browser verifier and enforces the
+  # bundle size budget. The budget lives in the SDK package so PRs that
+  # regress it fail here.
+  build-qr-wasm:
+    name: Build (lafiya-qr wasm32-unknown-unknown)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build lafiya-qr for wasm32-unknown-unknown
+        run: cargo build --release --locked --target wasm32-unknown-unknown -p lafiya-qr
+      - name: Report bundle size and enforce budget
+        run: python3 packages/verifier-sdk/scripts/check_wasm_budget.py \
+          --wasm target/wasm32-unknown-unknown/release/lafiya_qr.wasm \
+          --budget packages/verifier-sdk/wasm-size-budget.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lafiya-qr-wasm
+          path: target/wasm32-unknown-unknown/release/lafiya_qr.wasm
+          retention-days: 7
+
+  # Runs the shared vector suite against both the Rust codec (via the WASM
+  # artifact) and the TypeScript codec until the latter is retired.
+  qr-vector-parity:
+    name: QR vector parity (Rust vs TypeScript)
+    needs: [changes, build-qr-wasm]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/download-artifact@v4
+        with:
+          name: lafiya-qr-wasm
+          path: target/wasm32-unknown-unknown/release
+      - name: Install SDK dependencies
+        working-directory: packages/verifier-sdk
+        run: npm ci
+      - name: Run shared vector suite against both codecs
+        working-directory: packages/verifier-sdk
+        run: npm run test:qr-vectors
 
   docs-checks:
     name: Docs & catalog checks
@@ -273,7 +418,7 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [shell-lint, changes, fmt, clippy, build-tests, test, test-report, build-wasm, docs-checks, fraud-scoring-eval, qr-robustness]
+    needs: [shell-lint, changes, fmt, clippy, build-tests, test, test-report, crates-build, crates-clippy, crates-test, crates-deny, bindings-drift, build-wasm, docs-checks]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate results

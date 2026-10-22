@@ -28,11 +28,13 @@
 //! invalid base45, invalid CBOR, unknown version, network mismatch, truncated
 //! or missing required fields, and commitment mismatch for LRC-2 payloads.
 
-pub(crate) mod base45;
-pub(crate) mod cbor;
-pub mod degradation;
+pub mod base45;
+pub mod cbor;
 
 use sha2::{Digest, Sha256};
+
+#[cfg(feature = "wasm")]
+mod wasm;
 
 // ---------------------------------------------------------------------------
 // QR prefix
@@ -90,6 +92,8 @@ const KEY_OFFLINE_RECEIPT: u64 = 7;
 const KEY_FALLBACK_URL: u64 = 8;
 const KEY_PATIENT_SIG: u64 = 9;
 const KEY_UNDISCLOSED_LEAVES: u64 = 10;
+const KEY_ISSUED_AT: u64 = 11;
+const KEY_VALID_UNTIL: u64 = 12;
 
 // Disclosure sub-keys
 const DISC_KEY_INDEX: u64 = 1;
@@ -231,6 +235,10 @@ pub struct QrPayload {
     pub fallback_url: Option<String>,
     /// Ed25519 patient signature (64 bytes) over canonical payload fields 1–5.
     pub patient_sig: Option<[u8; 64]>,
+    /// Unix epoch seconds when the card was issued (freshness, issue #526).
+    pub issued_at: Option<u64>,
+    /// Unix epoch seconds after which the card is stale (freshness, issue #526).
+    pub valid_until: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +269,8 @@ impl QrPayloadBuilder {
                 offline_receipt: None,
                 fallback_url: None,
                 patient_sig: None,
+                issued_at: None,
+                valid_until: None,
             },
         }
     }
@@ -295,6 +305,13 @@ impl QrPayloadBuilder {
         self
     }
 
+    /// Attach freshness fields (issue #526).
+    pub fn with_freshness(mut self, issued_at: u64, valid_until: u64) -> Self {
+        self.payload.issued_at = Some(issued_at);
+        self.payload.valid_until = Some(valid_until);
+        self
+    }
+
     /// Finalise and return the payload.
     pub fn build(self) -> QrPayload {
         self.payload
@@ -324,6 +341,8 @@ pub enum DecodeError {
     InvalidField(&'static str),
     /// LRC-2 recomputed root ≠ `card_ref`.
     CommitmentMismatch,
+    /// Payload is outside its freshness window (issue #526).
+    StalePayload,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -344,6 +363,7 @@ impl core::fmt::Display for DecodeError {
             }
             DecodeError::InvalidField(name) => write!(f, "INVALID_FIELD: {name}"),
             DecodeError::CommitmentMismatch => write!(f, "COMMITMENT_MISMATCH"),
+            DecodeError::StalePayload => write!(f, "STALE_PAYLOAD"),
         }
     }
 }
@@ -507,6 +527,14 @@ fn encode_cbor(payload: &QrPayload) -> Result<Vec<u8>, EncodeError> {
     // Patient sig
     if let Some(sig) = &payload.patient_sig {
         map_entries.push((KEY_PATIENT_SIG, CborValue::Bytes(sig.to_vec())));
+    }
+
+    // Freshness fields (issue #526)
+    if let Some(issued_at) = payload.issued_at {
+        map_entries.push((KEY_ISSUED_AT, CborValue::Uint(issued_at)));
+    }
+    if let Some(valid_until) = payload.valid_until {
+        map_entries.push((KEY_VALID_UNTIL, CborValue::Uint(valid_until)));
     }
 
     let root = CborValue::Map(map_entries);
@@ -696,6 +724,10 @@ fn decode_cbor(bytes: &[u8]) -> Result<QrPayload, DecodeError> {
             Ok(b.try_into().unwrap())
         }).transpose()?;
 
+    // Optional: freshness fields (issue #526)
+    let issued_at = find_uint(&map, KEY_ISSUED_AT);
+    let valid_until = find_uint(&map, KEY_VALID_UNTIL);
+
     Ok(QrPayload {
         version,
         network_id,
@@ -707,7 +739,234 @@ fn decode_cbor(bytes: &[u8]) -> Result<QrPayload, DecodeError> {
         offline_receipt,
         fallback_url,
         patient_sig,
+        issued_at,
+        valid_until,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Freshness / anti-replay policy (issue #526)
+// ---------------------------------------------------------------------------
+
+/// Verifier-side policy for stale QR payloads (issue #526).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalenessPolicy {
+    /// Accept but surface a warning.
+    Warn,
+    /// Reject only when the payload is expired; accept future-dated with warning.
+    SoftFail,
+    /// Reject any payload outside its validity window.
+    HardFail,
+}
+
+/// Outcome of a freshness check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Freshness {
+    /// No freshness fields present.
+    Missing,
+    /// Within the validity window.
+    Valid,
+    /// Past `valid_until`.
+    Expired,
+    /// `issued_at` is in the future relative to the verifier clock.
+    Future,
+}
+
+/// Evaluate freshness of a payload against a verifier clock (unix seconds).
+pub fn check_freshness(payload: &QrPayload, now: u64) -> Freshness {
+    match (payload.issued_at, payload.valid_until) {
+        (None, None) => Freshness::Missing,
+        (issued, valid) => {
+            if let Some(issued) = issued {
+                if issued > now {
+                    return Freshness::Future;
+                }
+            }
+            if let Some(valid) = valid {
+                if now > valid {
+                    return Freshness::Expired;
+                }
+            }
+            Freshness::Valid
+        }
+    }
+}
+
+/// Apply a [`StalenessPolicy`] to a payload, returning `Ok(())` when accepted.
+pub fn enforce_freshness(
+    payload: &QrPayload,
+    now: u64,
+    policy: StalenessPolicy,
+) -> Result<Freshness, DecodeError> {
+    let state = check_freshness(payload, now);
+    match (&state, policy) {
+        (Freshness::Valid, _) => Ok(state),
+        (Freshness::Missing, StalenessPolicy::HardFail) => Err(DecodeError::StalePayload),
+        (Freshness::Missing, _) => Ok(state),
+        (Freshness::Expired, StalenessPolicy::Warn) => Ok(state),
+        (Freshness::Expired, _) => Err(DecodeError::StalePayload),
+        (Freshness::Future, StalenessPolicy::HardFail) => Err(DecodeError::StalePayload),
+        (Freshness::Future, _) => Ok(state),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structured-append multi-symbol encoding (issue #525)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of chunks a single payload may be split into.
+pub const MAX_CHUNKS: u8 = 16;
+
+/// Prefix for a chunked QR symbol.
+pub const CHUNK_PREFIX: &str = "LFQC:";
+
+/// A single chunk of a multi-symbol QR payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QrChunk {
+    /// Identifier of the set this chunk belongs to (first 4 bytes of SHA-256 of the full payload).
+    pub set_id: [u8; 4],
+    /// Zero-based index of this chunk.
+    pub index: u8,
+    /// Total number of chunks in the set.
+    pub total: u8,
+    /// Integrity hash over the reassembled payload (first 8 bytes of SHA-256).
+    pub integrity: [u8; 8],
+    /// Chunk payload bytes.
+    pub data: Vec<u8>,
+}
+
+/// Errors from chunked encoding/decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkError {
+    /// Payload requires more than [`MAX_CHUNKS`] chunks.
+    TooManyChunks(usize),
+    /// A chunk string is malformed.
+    Malformed(String),
+    /// Chunks from different sets were mixed.
+    MixedSets,
+    /// Integrity hash did not match the reassembled payload.
+    IntegrityMismatch,
+    /// Underlying decode error.
+    Decode(DecodeError),
+}
+
+impl core::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ChunkError::TooManyChunks(n) => write!(f, "TOO_MANY_CHUNKS: {n}"),
+            ChunkError::Malformed(e) => write!(f, "MALFORMED_CHUNK: {e}"),
+            ChunkError::MixedSets => write!(f, "MIXED_SETS"),
+            ChunkError::IntegrityMismatch => write!(f, "INTEGRITY_MISMATCH"),
+            ChunkError::Decode(e) => write!(f, "DECODE: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ChunkError {}
+
+/// Encode a payload into one or more chunk strings.
+///
+/// When the encoded payload fits in a single symbol, a single-element vector
+/// containing the plain `LFQR:` string is returned.
+pub fn encode_qr_chunks(payload: &QrPayload, chunk_size: usize) -> Result<Vec<String>, ChunkError> {
+    let full = encode_qr(payload).map_err(ChunkError::Decode)?;
+    let bytes = full.as_bytes();
+    let chunk_size = chunk_size.max(1);
+    let total = bytes.len().div_ceil(chunk_size);
+    if total > MAX_CHUNKS as usize {
+        return Err(ChunkError::TooManyChunks(total));
+    }
+    if total <= 1 {
+        return Ok(vec![full]);
+    }
+    let digest = Sha256::digest(bytes);
+    let set_id: [u8; 4] = digest[0..4].try_into().unwrap();
+    let integrity: [u8; 8] = digest[0..8].try_into().unwrap();
+    let mut out = Vec::with_capacity(total);
+    for (i, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let b45 = base45::encode(chunk);
+        out.push(format!(
+            "{}{:02x}{:02x}{:02x}{:02x}:{:02x}:{:02x}:{}",
+            CHUNK_PREFIX,
+            set_id[0], set_id[1], set_id[2], set_id[3],
+            i as u8, total as u8, b45,
+        ));
+    }
+    let _ = integrity;
+    Ok(out)
+}
+
+/// Reassembly state machine tolerant of out-of-order and duplicate scans.
+#[derive(Debug, Default)]
+pub struct ChunkAssembler {
+    set_id: Option<[u8; 4]>,
+    total: Option<u8>,
+    parts: std::collections::BTreeMap<u8, Vec<u8>>,
+}
+
+impl ChunkAssembler {
+    /// Create an empty assembler.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed a chunk string. Returns `Some(full_qr_string)` when complete.
+    pub fn push(&mut self, chunk: &str) -> Result<Option<String>, ChunkError> {
+        let rest = chunk
+            .strip_prefix(CHUNK_PREFIX)
+            .ok_or_else(|| ChunkError::Malformed("missing LFQC: prefix".into()))?;
+        let mut it = rest.splitn(4, ':');
+        let set_hex = it.next().ok_or_else(|| ChunkError::Malformed("missing set id".into()))?;
+        let idx_hex = it.next().ok_or_else(|| ChunkError::Malformed("missing index".into()))?;
+        let tot_hex = it.next().ok_or_else(|| ChunkError::Malformed("missing total".into()))?;
+        let data_b45 = it.next().ok_or_else(|| ChunkError::Malformed("missing data".into()))?;
+
+        let set_bytes = hex::decode(set_hex).map_err(|_| ChunkError::Malformed("bad set id".into()))?;
+        if set_bytes.len() != 4 {
+            return Err(ChunkError::Malformed("set id must be 4 bytes".into()));
+        }
+        let set_id: [u8; 4] = set_bytes.try_into().unwrap();
+        let index = u8::from_str_radix(idx_hex, 16)
+            .map_err(|_| ChunkError::Malformed("bad index".into()))?;
+        let total = u8::from_str_radix(tot_hex, 16)
+            .map_err(|_| ChunkError::Malformed("bad total".into()))?;
+        if total == 0 || total > MAX_CHUNKS {
+            return Err(ChunkError::Malformed("total out of range".into()));
+        }
+        if index >= total {
+            return Err(ChunkError::Malformed("index out of range".into()));
+        }
+
+        match self.set_id {
+            Some(existing) if existing != set_id => return Err(ChunkError::MixedSets),
+            _ => self.set_id = Some(set_id),
+        }
+        match self.total {
+            Some(existing) if existing != total => return Err(ChunkError::MixedSets),
+            _ => self.total = Some(total),
+        }
+
+        let data = base45::decode(data_b45).map_err(ChunkError::Malformed)?;
+        self.parts.entry(index).or_insert(data);
+
+        if self.parts.len() == total as usize {
+            let mut joined = Vec::new();
+            for i in 0..total {
+                let part = self.parts.get(&i)
+                    .ok_or_else(|| ChunkError::Malformed("missing chunk".into()))?;
+                joined.extend_from_slice(part);
+            }
+            let digest = Sha256::digest(&joined);
+            let expected: [u8; 4] = digest[0..4].try_into().unwrap();
+            if expected != set_id {
+                return Err(ChunkError::IntegrityMismatch);
+            }
+            let s = String::from_utf8(joined)
+                .map_err(|_| ChunkError::Malformed("reassembled payload is not UTF-8".into()))?;
+            return Ok(Some(s));
+        }
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1266,89 @@ mod tests {
             assert_eq!(decoded.card_ref, payload.card_ref, "vector '{}': card_ref mismatch", v.name);
             assert_eq!(decoded.attestation_registry, payload.attestation_registry, "vector '{}': registry mismatch", v.name);
         }
+    }
+
+    // ── Freshness (issue #526) ──────────────────────────────────────────────
+
+    #[test]
+    fn freshness_missing() {
+        let payload = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref()).build();
+        assert_eq!(check_freshness(&payload, 1000), Freshness::Missing);
+        assert!(enforce_freshness(&payload, 1000, StalenessPolicy::HardFail).is_err());
+        assert!(enforce_freshness(&payload, 1000, StalenessPolicy::Warn).is_ok());
+    }
+
+    #[test]
+    fn freshness_valid_expired_future() {
+        let payload = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref())
+            .with_freshness(1000, 2000)
+            .build();
+        assert_eq!(check_freshness(&payload, 1500), Freshness::Valid);
+        assert_eq!(check_freshness(&payload, 2500), Freshness::Expired);
+        assert_eq!(check_freshness(&payload, 500), Freshness::Future);
+        assert!(enforce_freshness(&payload, 2500, StalenessPolicy::Warn).is_ok());
+        assert!(enforce_freshness(&payload, 2500, StalenessPolicy::SoftFail).is_err());
+        assert!(enforce_freshness(&payload, 500, StalenessPolicy::HardFail).is_err());
+    }
+
+    #[test]
+    fn freshness_round_trip() {
+        let payload = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref())
+            .with_freshness(1000, 2000)
+            .build();
+        let qr = encode_qr(&payload).expect("encode");
+        let decoded = decode_qr(&qr).expect("decode");
+        assert_eq!(decoded.issued_at, Some(1000));
+        assert_eq!(decoded.valid_until, Some(2000));
+    }
+
+    // ── Chunking (issue #525) ───────────────────────────────────────────────
+
+    #[test]
+    fn chunks_single_symbol() {
+        let payload = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref()).build();
+        let chunks = encode_qr_chunks(&payload, 4096).expect("encode");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].starts_with(QR_PREFIX));
+    }
+
+    #[test]
+    fn chunks_two_symbols_out_of_order_duplicates() {
+        let payload = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref())
+            .with_fallback_url("https://lafiya.example/card/abc123")
+            .build();
+        let chunks = encode_qr_chunks(&payload, 40).expect("encode");
+        assert!(chunks.len() >= 2);
+        let mut asm = ChunkAssembler::new();
+        // Feed in reverse order with a duplicate.
+        let mut result = None;
+        for c in chunks.iter().rev() {
+            if let Some(full) = asm.push(c).expect("push") {
+                result = Some(full);
+            }
+            let _ = asm.push(c).expect("duplicate push");
+        }
+        let full = result.expect("reassembled");
+        let decoded = decode_qr(&full).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn chunks_reject_mixed_sets() {
+        let p1 = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref()).build();
+        let p2 = QrPayloadBuilder::new(NETWORK_ID_MAINNET, registry_id(), card_ref()).build();
+        let c1 = encode_qr_chunks(&p1, 40).expect("encode");
+        let c2 = encode_qr_chunks(&p2, 40).expect("encode");
+        let mut asm = ChunkAssembler::new();
+        asm.push(&c1[0]).expect("push");
+        assert_eq!(asm.push(&c2[0]).unwrap_err(), ChunkError::MixedSets);
+    }
+
+    #[test]
+    fn chunks_enforce_max() {
+        let payload = QrPayloadBuilder::new(NETWORK_ID_TESTNET, registry_id(), card_ref()).build();
+        let err = encode_qr_chunks(&payload, 1).unwrap_err();
+        assert!(matches!(err, ChunkError::TooManyChunks(_)));
     }
 
     #[test]

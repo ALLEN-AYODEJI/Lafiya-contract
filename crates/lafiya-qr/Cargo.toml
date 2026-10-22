@@ -13,17 +13,9 @@ default = []
 robustness = ["dep:rqrr", "dep:rand", "dep:rand_chacha", "dep:image", "dep:jpeg-decoder"]
 
 [dependencies]
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [dev-dependencies]
-hex = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-# Open-source QR decoder used to measure decode success.
-rqrr = { version = "0.7", optional = true }
-# Seeded RNG for deterministic degradation.
-rand = { version = "0.8", optional = true }
-rand_chacha = { version = "0.3", optional = true }
-# Image helpers for blur/perspective/noise/occlusion/JPEG pipeline.
-image = { version = "0.24", default-features = false, features = ["jpeg"], optional = true }
-jpeg-decoder = { version = "0.3", optional = true }
+hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

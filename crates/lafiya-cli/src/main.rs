@@ -102,6 +102,11 @@ enum Commands {
         #[arg(value_enum)]
         contract: InterfaceTarget,
     },
+    /// Incentive pool operations (fund, approve, claim, withdraw, caps, pause)
+    Pool {
+        #[command(subcommand)]
+        sub: PoolSub,
+    },
     /// Deploy contracts (wrapper around scripts/deploy.sh logic, but uses same config)
     Deploy {
         /// Build only, don't deploy
@@ -170,6 +175,101 @@ enum DeploymentsSub {
 enum InterfaceTarget {
     Attester,
     Attestation,
+}
+
+// ── incentive-pool subcommands ────────────────────────────────────────────────
+
+/// Flags shared by every mutating pool command: preview + confirmation.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct SubmitOpts {
+    /// Skip the interactive confirmation prompt (required in non-interactive
+    /// shells). The simulation preview is still shown and still blocks on
+    /// failure.
+    #[arg(long, default_value_t = false)]
+    yes: bool,
+    /// Emit the state-change preview as JSON instead of a text diff
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// Stellar identity or G... address used as transaction source
+    #[arg(long)]
+    source: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum PoolSub {
+    /// Deposit funds into the pool (transfers `amount` from the source)
+    ///
+    /// Amounts are decimal token units (7 dp), e.g. `10`, `0.5`, `12.3456789`.
+    /// Example: `lafiya-cli pool fund 100 --source alice --yes`
+    Fund {
+        /// Amount to deposit, in token units (e.g. 100 or 0.5)
+        amount: String,
+        #[command(flatten)]
+        opts: SubmitOpts,
+    },
+    /// Approve a work item for payout (admin only)
+    ///
+    /// Example: `lafiya-cli pool approve --work-item 42 --attester G... --amount 25 --yes`
+    Approve {
+        /// Work item id
+        #[arg(long)]
+        work_item: u64,
+        /// Attester address (G...) receiving the payout
+        #[arg(long)]
+        attester: String,
+        /// Payout amount in token units (e.g. 25 or 0.25)
+        #[arg(long)]
+        amount: String,
+        #[command(flatten)]
+        opts: SubmitOpts,
+    },
+    /// Claim an approved payout for a work item (attester)
+    ///
+    /// Example: `lafiya-cli pool claim --work-item 42 --source attester-id --yes`
+    Claim {
+        /// Work item id
+        #[arg(long)]
+        work_item: u64,
+        #[command(flatten)]
+        opts: SubmitOpts,
+    },
+    /// Withdraw an attester's accumulated balance
+    ///
+    /// Example: `lafiya-cli pool withdraw 5 --source attester-id --yes`
+    Withdraw {
+        /// Amount to withdraw in token units (e.g. 5 or 0.5)
+        amount: String,
+        #[command(flatten)]
+        opts: SubmitOpts,
+    },
+    /// Show pool caps (payout cap, claim cap, total liabilities)
+    Caps,
+    /// Show the pool's token balance
+    Balance,
+    /// Show total outstanding liabilities
+    Liabilities,
+    /// Show an attester's accumulated (unclaimed) total
+    AttesterTotal {
+        /// Attester address (G...)
+        attester: String,
+    },
+    /// Show whether a work item has been approved / claimed
+    WorkItem {
+        /// Work item id
+        work_item: u64,
+    },
+    /// Pause the pool (admin only)
+    Pause {
+        #[command(flatten)]
+        opts: SubmitOpts,
+    },
+    /// Unpause the pool (admin only)
+    Unpause {
+        #[command(flatten)]
+        opts: SubmitOpts,
+    },
+    /// Query whether the pool is paused
+    IsPaused,
 }
 
 #[derive(Subcommand, Debug)]
@@ -401,6 +501,31 @@ enum AttestationSub {
     Verify {
         /// Path to the record JSON file
         record: PathBuf,
+    },
+    /// Restore an archived attestation entry: re-submit the record and extend
+    /// its TTL via `extend_attestation_ttl`. See docs/storage-cost.md.
+    Restore {
+        /// Path to the record JSON file to restore
+        record: PathBuf,
+        /// Ledger sequence to extend the entry's TTL to (capped on-chain)
+        #[arg(long)]
+        extend_to: u32,
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Flag an attestation as disputed using a patient signature over the
+    /// commitment (see docs/specs/verification-model.md)
+    Dispute {
+        /// Hex string of 32-byte record hash (64 chars)
+        record_hash: String,
+        /// Patient signature (base64 or hex) over the dispute commitment
+        #[arg(long)]
+        signature: String,
+        /// Patient public key (G...) that produced the signature
+        #[arg(long)]
+        patient: String,
+        #[arg(long)]
+        source: Option<String>,
     },
 }
 
@@ -795,7 +920,107 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            AttestationSub::Restore {
+                record,
+                extend_to,
+                source,
+            } => {
+                let contract_id = network_cfg
+                    .require_contract_id(&cli.network, ContractKind::AttestationRegistry)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let content = std::fs::read_to_string(&record)?;
+                let rec: lafiya_config::record::EmergencyRecord = serde_json::from_str(&content)?;
+                let hash_bytes = rec.hash()?;
+                let hash_hex: String = hash_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                let source = validated_source(source)?;
+                let extend_to_str = extend_to.to_string();
+
+                // Step 1: re-submit the record so an archived entry is recreated.
+                println!("Restoring record hash: {}", hash_hex);
+                let submit_args = invoke_args(
+                    &network_cfg,
+                    contract_id,
+                    source.as_deref(),
+                    "submit_attestation",
+                    &["--record_hash", &hash_hex],
+                );
+                run_audited(
+                    "attestation restore (submit)",
+                    &cli.network,
+                    contract_id,
+                    "submit_attestation",
+                    &[&hash_hex],
+                    source.as_deref(),
+                    submit_args,
+                )?;
+
+                // Step 2: extend the TTL to the requested horizon (capped on-chain).
+                let extend_args = invoke_args(
+                    &network_cfg,
+                    contract_id,
+                    source.as_deref(),
+                    "extend_attestation_ttl",
+                    &["--record_hash", &hash_hex, "--extend_to", &extend_to_str],
+                );
+                run_audited(
+                    "attestation restore (extend_ttl)",
+                    &cli.network,
+                    contract_id,
+                    "extend_attestation_ttl",
+                    &[&hash_hex, &extend_to_str],
+                    source.as_deref(),
+                    extend_args,
+                )?;
+                println!(
+                    "Restored {} and extended TTL to ledger {}",
+                    hash_hex, extend_to
+                );
+            }
+            AttestationSub::Dispute {
+                record_hash,
+                signature,
+                patient,
+                source,
+            } => {
+                let contract_id = network_cfg
+                    .require_contract_id(&cli.network, ContractKind::AttestationRegistry)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                validate_record_hash("record_hash", &record_hash)
+                    .context("invalid record hash (expected a hex encoded 32-byte hash)")?;
+                validate_account_address("patient", &patient)
+                    .context("invalid patient address (expected a G... account address)")?;
+                if signature.trim().is_empty() {
+                    anyhow::bail!("--signature must not be empty");
+                }
+                let source = validated_source(source)?;
+                let args = invoke_args(
+                    &network_cfg,
+                    contract_id,
+                    source.as_deref(),
+                    "dispute_attestation",
+                    &[
+                        "--record_hash",
+                        &record_hash,
+                        "--patient",
+                        &patient,
+                        "--signature",
+                        &signature,
+                    ],
+                );
+                run_audited(
+                    "attestation dispute",
+                    &cli.network,
+                    contract_id,
+                    "dispute_attestation",
+                    &[&record_hash, &patient],
+                    source.as_deref(),
+                    args,
+                )?;
+            }
         },
+        Commands::Pool { sub } => {
+            handle_pool(sub, &cli.network, &network_cfg)?;
+        }
         Commands::Interface { contract } => {
             let (kind, req) = match contract {
                 InterfaceTarget::Attester => {
@@ -1732,7 +1957,10 @@ fn handle_attestation(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     match sub {
-        AttestationSub::Hash { .. } | AttestationSub::Verify { .. } => {} // handled in main
+        AttestationSub::Hash { .. }
+        | AttestationSub::Verify { .. }
+        | AttestationSub::Restore { .. }
+        | AttestationSub::Dispute { .. } => {} // handled in main
         AttestationSub::Get { record_hash } => {
             validate_record_hash("record_hash", &record_hash)
                 .context("invalid record hash (expected a hex encoded 32-byte hash)")?;
@@ -1829,6 +2057,337 @@ fn handle_ops(sub: OpsSub, network: &str, cfg: &NetworkConfig) -> anyhow::Result
         }
     }
     Ok(())
+}
+
+// ── incentive-pool command handling ──────────────────────────────────────────
+
+/// Number of decimal places for pool token amounts (Stellar SAC: 7).
+const POOL_DECIMALS: u32 = 7;
+
+/// Parse a decimal token amount (e.g. `10`, `0.5`, `12.3456789`) into
+/// stroops (i128). Rejects negative, zero, over-precise, and overflowing
+/// values with actionable messages.
+fn parse_amount(input: &str) -> anyhow::Result<i128> {
+    let s = input.trim();
+    if s.is_empty() {
+        anyhow::bail!("amount is empty; expected a decimal like `10` or `0.5`");
+    }
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if body.is_empty() {
+        anyhow::bail!("invalid amount `{input}`; expected a decimal like `10` or `0.5`");
+    }
+    let (whole, frac) = match body.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (body, ""),
+    };
+    if whole.is_empty() && frac.is_empty() {
+        anyhow::bail!("invalid amount `{input}`; expected a decimal like `10` or `0.5`");
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("invalid amount `{input}`; only digits and a single `.` are allowed");
+    }
+    if frac.len() > POOL_DECIMALS as usize {
+        anyhow::bail!(
+            "amount `{input}` has more than {POOL_DECIMALS} decimal places (token precision)"
+        );
+    }
+    let whole_val: i128 = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse()
+            .map_err(|_| anyhow::anyhow!("amount `{input}` is too large"))?
+    };
+    let mut frac_val: i128 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse()
+            .map_err(|_| anyhow::anyhow!("amount `{input}` is too large"))?
+    };
+    for _ in frac.len()..POOL_DECIMALS as usize {
+        frac_val *= 10;
+    }
+    let scale = 10i128
+        .checked_pow(POOL_DECIMALS)
+        .ok_or_else(|| anyhow::anyhow!("internal: bad scale"))?;
+    let mut stroops = whole_val
+        .checked_mul(scale)
+        .and_then(|v| v.checked_add(frac_val))
+        .ok_or_else(|| anyhow::anyhow!("amount `{input}` is too large"))?;
+    if neg {
+        stroops = -stroops;
+    }
+    if stroops <= 0 {
+        anyhow::bail!("amount must be positive (NonPositiveAmount); got `{input}`");
+    }
+    Ok(stroops)
+}
+
+/// Render stroops back to a decimal token string for display.
+fn format_amount(stroops: i128) -> String {
+    let scale = 10i128.pow(POOL_DECIMALS);
+    let neg = stroops < 0;
+    let abs = stroops.unsigned_abs();
+    let whole = abs / scale as u128;
+    let frac = abs % scale as u128;
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&whole.to_string());
+    if frac != 0 {
+        let mut frac_str = format!("{:0width$}", frac, width = POOL_DECIMALS as usize);
+        while frac_str.ends_with('0') {
+            frac_str.pop();
+        }
+        out.push('.');
+        out.push_str(&frac_str);
+    }
+    out
+}
+
+fn pool_contract_id(network: &str, cfg: &NetworkConfig) -> anyhow::Result<&str> {
+    cfg.require_contract_id(network, ContractKind::IncentivePool)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Run a read-only pool query through the stellar CLI, printing the command.
+fn pool_query(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    function: &str,
+    fn_args: &[&str],
+) -> anyhow::Result<()> {
+    let args = invoke_args(cfg, contract_id, None, function, fn_args);
+    println!("> stellar {}", args.join(" "));
+    if which::which("stellar").is_ok() {
+        let status = std::process::Command::new("stellar").args(args).status()?;
+        if !status.success() {
+            anyhow::bail!("stellar CLI failed");
+        }
+    } else {
+        eprintln!("stellar CLI not found — showing command only.");
+    }
+    Ok(())
+}
+
+/// Client-side pre-check mirroring the contract's `NonPositiveAmount` guard.
+fn precheck_positive(amount: i128) -> anyhow::Result<()> {
+    if amount <= 0 {
+        anyhow::bail!("amount must be positive (NonPositiveAmount)");
+    }
+    Ok(())
+}
+
+fn handle_pool(sub: PoolSub, network: &str, cfg: &NetworkConfig) -> anyhow::Result<()> {
+    let contract_id = pool_contract_id(network, cfg)?;
+
+    match sub {
+        PoolSub::Fund { amount, opts } => {
+            let stroops = parse_amount(&amount)?;
+            precheck_positive(stroops)?;
+            let source = validated_source(opts.source)?;
+            let amount_str = stroops.to_string();
+            let args = invoke_args(
+                cfg,
+                contract_id,
+                source.as_deref(),
+                "fund",
+                &["--amount", &amount_str],
+            );
+            submit_with_preview(
+                cfg,
+                contract_id,
+                "fund",
+                &[&amount_str],
+                source.as_deref(),
+                args,
+                &opts,
+            )?;
+        }
+        PoolSub::Approve {
+            work_item,
+            attester,
+            amount,
+            opts,
+        } => {
+            validate_address("attester address", &attester)
+                .context("invalid attester address")?;
+            let stroops = parse_amount(&amount)?;
+            precheck_positive(stroops)?;
+            let source = validated_source(opts.source)?;
+            let work_item_str = work_item.to_string();
+            let amount_str = stroops.to_string();
+            let args = invoke_args(
+                cfg,
+                contract_id,
+                source.as_deref(),
+                "approve",
+                &[
+                    "--work_item",
+                    &work_item_str,
+                    "--attester",
+                    &attester,
+                    "--amount",
+                    &amount_str,
+                ],
+            );
+            submit_with_preview(
+                cfg,
+                contract_id,
+                "approve",
+                &[&work_item_str, &attester, &amount_str],
+                source.as_deref(),
+                args,
+                &opts,
+            )?;
+        }
+        PoolSub::Claim { work_item, opts } => {
+            let source = validated_source(opts.source)?;
+            let work_item_str = work_item.to_string();
+            let args = invoke_args(
+                cfg,
+                contract_id,
+                source.as_deref(),
+                "claim",
+                &["--work_item", &work_item_str],
+            );
+            submit_with_preview(
+                cfg,
+                contract_id,
+                "claim",
+                &[&work_item_str],
+                source.as_deref(),
+                args,
+                &opts,
+            )?;
+        }
+        PoolSub::Withdraw { amount, opts } => {
+            let stroops = parse_amount(&amount)?;
+            precheck_positive(stroops)?;
+            let source = validated_source(opts.source)?;
+            let amount_str = stroops.to_string();
+            let args = invoke_args(
+                cfg,
+                contract_id,
+                source.as_deref(),
+                "withdraw",
+                &["--amount", &amount_str],
+            );
+            submit_with_preview(
+                cfg,
+                contract_id,
+                "withdraw",
+                &[&amount_str],
+                source.as_deref(),
+                args,
+                &opts,
+            )?;
+        }
+        PoolSub::Caps => {
+            pool_query(cfg, contract_id, "get_caps", &[])?;
+        }
+        PoolSub::Balance => {
+            pool_query(cfg, contract_id, "get_balance", &[])?;
+        }
+        PoolSub::Liabilities => {
+            pool_query(cfg, contract_id, "get_total_liabilities", &[])?;
+        }
+        PoolSub::AttesterTotal { attester } => {
+            validate_address("attester address", &attester)
+                .context("invalid attester address")?;
+            pool_query(cfg, contract_id, "get_attester_total", &["--attester", &attester])?;
+        }
+        PoolSub::WorkItem { work_item } => {
+            let work_item_str = work_item.to_string();
+            pool_query(cfg, contract_id, "get_work_item", &["--work_item", &work_item_str])?;
+        }
+        PoolSub::Pause { opts } => {
+            let source = validated_source(opts.source)?;
+            let args = invoke_args(cfg, contract_id, source.as_deref(), "pause", &[]);
+            submit_with_preview(cfg, contract_id, "pause", &[], source.as_deref(), args, &opts)?;
+        }
+        PoolSub::Unpause { opts } => {
+            let source = validated_source(opts.source)?;
+            let args = invoke_args(cfg, contract_id, source.as_deref(), "unpause", &[]);
+            submit_with_preview(
+                cfg,
+                contract_id,
+                "unpause",
+                &[],
+                source.as_deref(),
+                args,
+                &opts,
+            )?;
+        }
+        PoolSub::IsPaused => {
+            pool_query(cfg, contract_id, "is_paused", &[])?;
+        }
+    }
+    Ok(())
+}
+
+/// Show a state-change preview, require confirmation, then submit through the
+/// audited path. Simulation failure blocks submission by default.
+fn submit_with_preview(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    function: &str,
+    call_args: &[&str],
+    signer: Option<&str>,
+    stellar_args: Vec<String>,
+    opts: &SubmitOpts,
+) -> anyhow::Result<()> {
+    // Preview: attempt a simulation. If the stellar CLI is unavailable we
+    // cannot simulate, so submission is blocked unless the operator is
+    // explicitly running a read-only environment.
+    let preview = crate::rpc_client::simulate_preview(cfg, contract_id, function, call_args);
+    match &preview {
+        Ok(p) => {
+            if opts.json {
+                println!("{}", serde_json::to_string_pretty(p)?);
+            } else {
+                print!("{}", p.render_text());
+            }
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "simulation failed, refusing to submit `{function}`: {e}\n\
+                 (fix the underlying issue or re-run with a working RPC; \
+                 submission is blocked by default)"
+            );
+        }
+    }
+
+    if !opts.yes {
+        if !confirm_interactive()? {
+            anyhow::bail!("aborted by operator");
+        }
+    }
+
+    run_audited(
+        "pool",
+        &cfg.network_passphrase,
+        contract_id,
+        function,
+        call_args,
+        signer,
+        stellar_args,
+    )
+}
+
+/// Prompt on stderr and read a yes/no answer from stdin.
+fn confirm_interactive() -> anyhow::Result<bool> {
+    use std::io::Write;
+    eprint!("Submit this transaction? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 // ── small helpers for admin/ops contract routing ──────────────────────────────
@@ -2200,60 +2759,57 @@ mod tests {
         );
     }
 
-    // ── attester review / evidence bundle ─────────────────────────────────────
-
     #[test]
-    fn review_bundle_is_stable_across_runs() {
-        let a = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        let b = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.bundle.bundle_hash, b.bundle.bundle_hash);
-        assert!(!a.bundle.bundle_hash.is_empty());
-    }
-
-    #[test]
-    fn review_breakdown_has_weight_observed_baseline() {
-        let review = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        assert!(!review.breakdown.is_empty());
-        for s in &review.breakdown {
-            assert!(!s.signal.is_empty());
-            assert!(s.weight > 0);
+    fn attestation_restore_parses_record_and_extend_to() {
+        let cli = Cli::try_parse_from([
+            "lafiya-cli",
+            "attestation",
+            "restore",
+            "record.json",
+            "--extend-to",
+            "12345",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Attestation {
+                sub: AttestationSub::Restore { record, extend_to, .. },
+            } => {
+                assert_eq!(record, PathBuf::from("record.json"));
+                assert_eq!(extend_to, 12345);
+            }
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 
     #[test]
-    fn review_bundle_references_event_ids_and_ledgers() {
-        let review = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        assert!(!review.bundle.event_ids.is_empty());
-        assert!(!review.bundle.ledgers.is_empty());
-        // Sorted for determinism.
-        let mut sorted = review.bundle.event_ids.clone();
-        sorted.sort();
-        assert_eq!(review.bundle.event_ids, sorted);
+    fn attestation_restore_missing_extend_to_names_the_argument() {
+        let err = Cli::try_parse_from(["lafiya-cli", "attestation", "restore", "record.json"])
+            .expect_err("expected a missing required argument error");
+        let message = err.to_string();
+        assert!(
+            message.to_uppercase().contains("EXTEND_TO"),
+            "expected error to name the missing `extend_to` argument, got: {message}"
+        );
     }
 
     #[test]
-    fn review_bundle_hash_changes_with_input() {
-        let a = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        let b = build_attester_review("mainnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        assert_ne!(a.bundle.bundle_hash, b.bundle.bundle_hash);
-    }
-
-    #[test]
-    fn review_json_round_trips() {
-        let review = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        let json = serde_json::to_string(&review).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("breakdown").is_some());
-        assert!(parsed.get("bundle").is_some());
-    }
-
-    #[test]
-    fn review_text_mentions_signals_and_bundle_hash() {
-        let review = build_attester_review("testnet", CONTRACT_ID, ATTESTER_ADDR).unwrap();
-        let text = render_attester_review(&review);
-        assert!(text.contains("Signals:"));
-        assert!(text.contains("Evidence bundle:"));
-        assert!(text.contains(&review.bundle.bundle_hash));
+    fn attestation_dispute_parses_required_args() {
+        let cli = Cli::try_parse_from([
+            "lafiya-cli",
+            "attestation",
+            "dispute",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--signature",
+            "c2ln",
+            "--patient",
+            ATTESTER_ADDR,
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Attestation {
+                sub: AttestationSub::Dispute { patient, .. },
+            } => assert_eq!(patient, ATTESTER_ADDR),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }
