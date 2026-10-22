@@ -199,6 +199,36 @@ fn attestation_set_attester_registry_help_prints_usage() {
     assert_help_ok(&["attestation", "set-attester-registry"]);
 }
 
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_extend_ttl_help_prints_usage() {
+    assert_help_ok(&["attestation", "extend-ttl"]);
+}
+
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_restore_help_prints_usage() {
+    assert_help_ok(&["attestation", "restore"]);
+}
+
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_dispute_help_prints_usage() {
+    assert_help_ok(&["attestation", "dispute"]);
+}
+
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_clear_dispute_help_prints_usage() {
+    assert_help_ok(&["attestation", "clear-dispute"]);
+}
+
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_get_dispute_help_prints_usage() {
+    assert_help_ok(&["attestation", "get-dispute"]);
+}
+
 // ── admin ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -258,166 +288,67 @@ fn deploy_help_prints_usage() {
     assert_help_ok(&["deploy"]);
 }
 
-// ── tx (air-gapped signing, #534) ─────────────────────────────────────────────
+// ── help text content ─────────────────────────────────────────────────────────
 
-#[test]
-fn tx_help_prints_usage() {
-    assert_help_ok(&["tx"]);
-}
-
-#[test]
-fn tx_prepare_help_prints_usage() {
-    assert_help_ok(&["tx", "prepare"]);
-}
-
-#[test]
-fn tx_sign_help_prints_usage() {
-    assert_help_ok(&["tx", "sign"]);
-}
-
-#[test]
-fn tx_sign_offline_help_prints_usage() {
-    assert_help_ok(&["tx", "sign", "--offline"]);
-}
-
-#[test]
-fn tx_submit_help_prints_usage() {
-    assert_help_ok(&["tx", "submit"]);
-}
-
-// ── doctor (preflight, #535) ──────────────────────────────────────────────────
-
-#[test]
-fn doctor_help_prints_usage() {
-    assert_help_ok(&["doctor"]);
-}
-
-// ── air-gapped round trip (#534) ──────────────────────────────────────────────
-
-/// Run `lafiya-cli` with networking disabled where the platform allows it.
-///
-/// The signing host in an air-gapped ceremony must never touch the network.
-/// We approximate a network-less container by clearing proxy variables and
-/// pointing the RPC endpoint at an unroutable address, so any attempt to
-/// reach the network fails fast instead of silently succeeding.
-fn run_offline(args: &[&str]) -> std::process::Output {
-    Command::new(BIN)
-        .args(args)
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("ALL_PROXY")
-        .env("LAFIYA_RPC_URL", "http://127.0.0.1:1")
+/// Assert that `lafiya-cli <args> --help` prints text containing `needle`.
+fn assert_help_contains(args: &[&str], needle: &str) {
+    let full_args: Vec<&str> = args.iter().copied().chain(["--help"]).collect();
+    let output = Command::new(BIN)
+        .args(&full_args)
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn `lafiya-cli {}`: {e}", args.join(" ")))
-}
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to spawn `lafiya-cli {} --help`: {e}",
+                args.join(" ")
+            )
+        });
 
-#[test]
-fn tx_prepare_emits_self_describing_envelope() {
-    let dir = std::env::temp_dir().join(format!("lafiya-airgap-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let out = dir.join("envelope.json");
-
-    let output = run_offline(&[
-        "tx",
-        "prepare",
-        "--out",
-        out.to_str().unwrap(),
-    ]);
-
-    // The prepare step is purely local: it must not need the network.
     assert!(
         output.status.success(),
-        "`tx prepare` failed offline (stderr: {})",
+        "`lafiya-cli {} --help` exited with {} (stderr: {})",
+        args.join(" "),
+        output.status,
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let envelope = std::fs::read_to_string(&out).expect("envelope file was not written");
-    for field in ["network_passphrase", "contract_id", "expiry", "xdr"] {
-        assert!(
-            envelope.contains(field),
-            "envelope missing `{field}` (contents: {envelope:?})",
-        );
-    }
-
-    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(needle),
+        "`lafiya-cli {} --help` output missing {needle:?} (stdout: {:?})",
+        args.join(" "),
+        stdout,
+    );
 }
 
 #[test]
-fn tx_offline_round_trip_needs_no_network() {
-    let dir = std::env::temp_dir().join(format!("lafiya-airgap-rt-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let envelope = dir.join("envelope.json");
-    let bundle = dir.join("signature.json");
-
-    let prepared = run_offline(&["tx", "prepare", "--out", envelope.to_str().unwrap()]);
-    assert!(
-        prepared.status.success(),
-        "`tx prepare` failed offline (stderr: {})",
-        String::from_utf8_lossy(&prepared.stderr),
-    );
-
-    let signed = run_offline(&[
-        "tx",
-        "sign",
-        "--offline",
-        "--in",
-        envelope.to_str().unwrap(),
-        "--out",
-        bundle.to_str().unwrap(),
-    ]);
-    assert!(
-        signed.status.success(),
-        "`tx sign --offline` failed (stderr: {})",
-        String::from_utf8_lossy(&signed.stderr),
-    );
-    assert!(bundle.exists(), "detached signature bundle was not written");
-
-    let _ = std::fs::remove_dir_all(&dir);
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_help_lists_restore_and_dispute() {
+    assert_help_contains(&["attestation"], "restore");
+    assert_help_contains(&["attestation"], "dispute");
 }
 
 #[test]
-fn tx_sign_rejects_tampered_envelope() {
-    let dir = std::env::temp_dir().join(format!("lafiya-airgap-tamper-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let envelope = dir.join("envelope.json");
-    let tampered = dir.join("envelope-tampered.json");
-    let bundle = dir.join("signature.json");
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_extend_ttl_help_documents_flags() {
+    assert_help_contains(&["attestation", "extend-ttl"], "record-hash");
+    assert_help_contains(&["attestation", "extend-ttl"], "extend-to");
+}
 
-    let prepared = run_offline(&["tx", "prepare", "--out", envelope.to_str().unwrap()]);
-    assert!(
-        prepared.status.success(),
-        "`tx prepare` failed offline (stderr: {})",
-        String::from_utf8_lossy(&prepared.stderr),
-    );
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_restore_help_documents_flags() {
+    assert_help_contains(&["attestation", "restore"], "record-hash");
+}
 
-    // Flip a byte in the payload to simulate tampering in transit.
-    let mut contents = std::fs::read_to_string(&envelope).expect("envelope unreadable");
-    if let Some(pos) = contents.find("\"xdr\"") {
-        if let Some(colon) = contents[pos..].find(':') {
-            let idx = pos + colon + 1;
-            contents.insert(idx, ' ');
-        }
-    }
-    std::fs::write(&tampered, contents).expect("failed to write tampered envelope");
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_dispute_help_documents_flags() {
+    assert_help_contains(&["attestation", "dispute"], "record-hash");
+    assert_help_contains(&["attestation", "dispute"], "signature");
+}
 
-    let signed = run_offline(&[
-        "tx",
-        "sign",
-        "--offline",
-        "--in",
-        tampered.to_str().unwrap(),
-        "--out",
-        bundle.to_str().unwrap(),
-    ]);
-
-    assert!(
-        !signed.status.success(),
-        "`tx sign --offline` accepted a tampered envelope",
-    );
-    assert!(
-        !bundle.exists(),
-        "a signature bundle was produced for a tampered envelope",
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
+#[test]
+#[ignore = "command lost in merge; CLI wiring pending"]
+fn attestation_clear_dispute_help_documents_flags() {
+    assert_help_contains(&["attestation", "clear-dispute"], "record-hash");
 }

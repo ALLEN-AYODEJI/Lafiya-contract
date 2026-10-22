@@ -184,6 +184,20 @@ pub trait RpcClient: Send + Sync {
         max_attempts: u32,
     ) -> Result<TxResult, RpcClientError>;
 
+    /// Query `getTransaction` once for the current status of `tx_hash`.
+    ///
+    /// Unlike [`RpcClient::poll`], this never retries: it returns
+    /// [`TxStatus::NotFound`] when the node has not yet ingested the
+    /// transaction.  Reconciliation uses this to distinguish "still
+    /// in-flight" from a terminal outcome without blocking.
+    fn get_transaction(&self, tx_hash: &str) -> Result<TxResult, RpcClientError>;
+
+    /// Return the latest ledger sequence known to the RPC node.
+    ///
+    /// Reconciliation compares this against the submission intent's expiry
+    /// ledger to prove that an ambiguous transaction can no longer land.
+    fn latest_ledger(&self) -> Result<u32, RpcClientError>;
+
     /// Read ledger entries by their XDR-encoded keys.
     fn get_ledger_entries(
         &self,
@@ -256,6 +270,20 @@ impl RpcClient for NativeRpcClient {
     fn poll(&self, _tx_hash: &str, _max_attempts: u32) -> Result<TxResult, RpcClientError> {
         Err(RpcClientError::NotImplemented {
             detail: "NativeRpcClient::poll — add stellar-xdr + HTTP client (issue #395)"
+                .to_string(),
+        })
+    }
+
+    fn get_transaction(&self, _tx_hash: &str) -> Result<TxResult, RpcClientError> {
+        Err(RpcClientError::NotImplemented {
+            detail: "NativeRpcClient::get_transaction — add stellar-xdr + HTTP client (issue #395)"
+                .to_string(),
+        })
+    }
+
+    fn latest_ledger(&self) -> Result<u32, RpcClientError> {
+        Err(RpcClientError::NotImplemented {
+            detail: "NativeRpcClient::latest_ledger — add stellar-xdr + HTTP client (issue #395)"
                 .to_string(),
         })
     }
@@ -340,6 +368,20 @@ impl RpcClient for StellarCliClient {
     fn poll(&self, _tx_hash: &str, _max_attempts: u32) -> Result<TxResult, RpcClientError> {
         Err(RpcClientError::StellarCli {
             detail: "poll is not available via the stellar CLI subprocess path".to_string(),
+        })
+    }
+
+    fn get_transaction(&self, _tx_hash: &str) -> Result<TxResult, RpcClientError> {
+        Err(RpcClientError::StellarCli {
+            detail: "get_transaction is not available via the stellar CLI subprocess path"
+                .to_string(),
+        })
+    }
+
+    fn latest_ledger(&self) -> Result<u32, RpcClientError> {
+        Err(RpcClientError::StellarCli {
+            detail: "latest_ledger is not available via the stellar CLI subprocess path"
+                .to_string(),
         })
     }
 
@@ -771,6 +813,19 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_ops_not_available_on_stellar_cli() {
+        let client = make_rpc_client("https://example.org", "Test Net", true);
+        assert!(matches!(
+            client.get_transaction("hash").unwrap_err(),
+            RpcClientError::StellarCli { .. }
+        ));
+        assert!(matches!(
+            client.latest_ledger().unwrap_err(),
+            RpcClientError::StellarCli { .. }
+        ));
+    }
+
+    #[test]
     fn poll_and_send_not_implemented_on_native() {
         let client = NativeRpcClient::new("https://example.org", "Test Net");
         assert!(matches!(
@@ -779,6 +834,14 @@ mod tests {
         ));
         assert!(matches!(
             client.poll("hash", 10).unwrap_err(),
+            RpcClientError::NotImplemented { .. }
+        ));
+        assert!(matches!(
+            client.get_transaction("hash").unwrap_err(),
+            RpcClientError::NotImplemented { .. }
+        ));
+        assert!(matches!(
+            client.latest_ledger().unwrap_err(),
             RpcClientError::NotImplemented { .. }
         ));
         assert!(matches!(

@@ -29,6 +29,7 @@ opentelemetry_sdk = { version = "0.31", optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"], optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tempfile = "3.10"
 
 [features]
 # OTLP trace export for long-running deployments (see docs/observability.md).

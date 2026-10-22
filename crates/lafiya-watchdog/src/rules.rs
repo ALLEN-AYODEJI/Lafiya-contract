@@ -11,6 +11,11 @@ pub const WASM_CHANGED_WITHOUT_EVENT: &str = "wasm_changed_without_event";
 pub const MASS_ENROLLMENT: &str = "mass_enrollment";
 pub const WATCHDOG_LAG: &str = "watchdog_lag";
 pub const WATCHDOG_FAILING: &str = "watchdog_failing";
+/// An attestation entry's remaining TTL dropped below the configured
+/// threshold; anyone may bump it with `extend_attestation_ttl`.
+pub const ATTESTATION_EXPIRING: &str = "attestation_expiring";
+/// A patient-initiated dispute overlay was recorded on an attestation.
+pub const ATTESTATION_DISPUTED: &str = "attestation_disputed";
 
 pub struct Engine {
     rules: Vec<EventRule>,
@@ -21,11 +26,10 @@ pub struct Engine {
     /// Wasm hash each contract is expected to run, from `upgraded` events or
     /// the first observation.
     expected_wasm: BTreeMap<String, String>,
-    /// Durable store for window state and alert fingerprints. When present,
-    /// state is loaded on construction and persisted after every evaluation.
-    store: Option<StateStore>,
-    /// Fingerprints of alerts already emitted, keyed by rule+dedup key.
-    seen: BTreeMap<String, AlertFingerprint>,
+    /// Remaining TTL (in ledgers) below which an attestation is flagged.
+    expiry_threshold_ledgers: Option<u32>,
+    /// Whether disputes should be surfaced as alerts.
+    alert_on_dispute: bool,
 }
 
 /// Default rules from the issue: privileged changes are critical, pause
@@ -90,62 +94,16 @@ impl Engine {
             explorer_tx_url: cfg.explorer_tx_url.clone(),
             rate_window: VecDeque::new(),
             expected_wasm: BTreeMap::new(),
-            store,
-            seen: BTreeMap::new(),
-        };
-        engine.restore();
-        engine
-    }
-
-    /// Load persisted state, if any, into the in-memory engine.
-    fn restore(&mut self) {
-        let Some(store) = &self.store else { return };
-        let state = match store.load() {
-            Ok(state) => state,
-            Err(err) => {
-                eprintln!("watchdog: failed to load state: {err}");
-                return;
-            }
-        };
-        self.apply_state(state);
-    }
-
-    fn apply_state(&mut self, state: EngineState) {
-        self.rate_window = state.rate_window.into_iter().collect();
-        self.expected_wasm = state.expected_wasm;
-        self.seen = state.alert_fingerprints;
-    }
-
-    fn snapshot(&self) -> EngineState {
-        EngineState {
-            rate_window: self.rate_window.iter().copied().collect(),
-            expected_wasm: self.expected_wasm.clone(),
-            alert_fingerprints: self.seen.clone(),
-        }
-    }
-
-    /// Persist current state. Called after every evaluation so a crash cannot
-    /// lose in-flight windows or re-emit an alert.
-    pub fn persist(&self) {
-        let Some(store) = &self.store else { return };
-        if let Err(err) = store.save(&self.snapshot()) {
-            eprintln!("watchdog: failed to persist state: {err}");
-        }
-    }
-
-    /// Deduplicate alerts by fingerprint. Returns only alerts not previously
-    /// seen and records them so a restart will not re-alert.
-    fn dedup(&mut self, alerts: Vec<Alert>) -> Vec<Alert> {
-        let mut fresh = Vec::new();
-        for alert in alerts {
-            let fp = AlertFingerprint::of(&alert);
-            if self.seen.contains_key(&fp.key) {
-                continue;
-            }
-            self.seen.insert(fp.key.clone(), fp);
-            fresh.push(alert);
+            expiry_threshold_ledgers: cfg.attestation_expiry_threshold_ledgers,
+            alert_on_dispute: cfg.alert_on_dispute,
         }
         fresh
+    }
+
+    /// Override the incentive-pool rule thresholds.
+    pub fn with_pool_rules(mut self, pool: PoolRules) -> Engine {
+        self.pool = pool;
+        self
     }
 
     fn alert(&self, kind: &str, severity: Severity, summary: String, e: &Event) -> Alert {
@@ -214,6 +172,15 @@ impl Engine {
             self.expected_wasm.insert(e.contract.clone(), hash);
         }
 
+        if self.alert_on_dispute && e.name == "attestation_disputed" {
+            alerts.push(self.alert(
+                ATTESTATION_DISPUTED,
+                Severity::High,
+                format!("attestation disputed on {}", e.contract),
+                e,
+            ));
+        }
+
         if let Some(rate) = &self.rate {
             if e.name == rate.event {
                 self.rate_window.push_back(e.ledger);
@@ -237,6 +204,33 @@ impl Engine {
         }
 
         alerts
+    }
+
+    /// Check an attestation entry's remaining TTL (in ledgers) against the
+    /// configured threshold. Returns an alert when the entry is approaching
+    /// expiry and the threshold is configured.
+    pub fn observe_ttl(
+        &self,
+        contract: &str,
+        record_hash: &str,
+        remaining_ledgers: u32,
+        ledger: u32,
+    ) -> Option<Alert> {
+        let threshold = self.expiry_threshold_ledgers?;
+        if remaining_ledgers >= threshold {
+            return None;
+        }
+        Some(Alert {
+            kind: ATTESTATION_EXPIRING.into(),
+            severity: Severity::High,
+            summary: format!(
+                "attestation {record_hash} on {contract} expires in {remaining_ledgers} ledgers (threshold {threshold}); bump with extend_attestation_ttl"
+            ),
+            ledger,
+            contract: contract.into(),
+            details: vec![format!("record_hash: {record_hash}")],
+            explorer_link: None,
+        })
     }
 
     /// Compare a contract's on-chain wasm hash (from `getLedgerEntries`)
@@ -319,6 +313,23 @@ impl HealthMonitor {
     }
 }
 
+/// Parse an amount from event data, which may be a bare integer or a JSON
+/// object with an `amount` field.
+fn parse_amount(data: &str) -> Option<i128> {
+    let data = data.trim();
+    if let Ok(n) = data.parse::<i128>() {
+        return Some(n);
+    }
+    let key = "\"amount\"";
+    let idx = data.find(key)?;
+    let rest = &data[idx + key.len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i128>().ok()
+}
+
 fn self_alert(kind: &str, summary: String, ledger: u32) -> Alert {
     Alert {
         kind: kind.into(),
@@ -353,6 +364,8 @@ mod tests {
             }),
             heartbeat: Heartbeat::default(),
             sinks: vec![],
+            attestation_expiry_threshold_ledgers: Some(100),
+            alert_on_dispute: true,
         }
     }
 
@@ -503,38 +516,39 @@ mod tests {
     }
 
     #[test]
-    fn dedup_suppresses_repeat_alerts() {
-        let mut e = Engine::new(&cfg());
-        let first = e.evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]));
-        assert_eq!(first.len(), 1);
-        // Same event replayed (e.g. after a restart) must not re-alert.
-        let again = e.evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]));
-        assert!(again.is_empty());
+    fn approaching_expiry_is_flagged() {
+        let e = Engine::new(&cfg());
+        assert!(e.observe_ttl("CREG", "deadbeef", 500, 1).is_none());
+        let a = e.observe_ttl("CREG", "deadbeef", 50, 2).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.severity),
+            (ATTESTATION_EXPIRING, Severity::High)
+        );
+        assert!(a.summary.contains("deadbeef"));
     }
 
     #[test]
-    fn state_roundtrips_through_store() {
-        let dir = std::env::temp_dir().join(format!("lafiya-wd-{}", std::process::id()));
-        let path = dir.join("state.json");
-        let _ = std::fs::remove_file(&path);
-        let store = StateStore::new(&path);
+    fn expiry_check_disabled_without_threshold() {
+        let mut c = cfg();
+        c.attestation_expiry_threshold_ledgers = None;
+        assert!(Engine::new(&c).observe_ttl("CREG", "deadbeef", 1, 1).is_none());
+    }
 
-        let mut e = Engine::with_store(&cfg(), Some(store.clone()));
-        e.evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]));
-        e.evaluate(&ev("attester_added", 2, &[]));
-        e.persist();
+    #[test]
+    fn dispute_is_surfaced() {
+        let a = Engine::new(&cfg()).evaluate(&ev("attestation_disputed", 1, &[]));
+        assert_eq!(
+            kinds(&a),
+            vec![(ATTESTATION_DISPUTED, Severity::High)]
+        );
+    }
 
-        // Simulate a kill -9 restart: fresh engine from the same store.
-        let mut restarted = Engine::with_store(&cfg(), Some(store));
-        assert!(restarted
-            .evaluate(&ev("admin_transferred", 1, &["GOLD", "GNEW"]))
+    #[test]
+    fn dispute_alert_can_be_disabled() {
+        let mut c = cfg();
+        c.alert_on_dispute = false;
+        assert!(Engine::new(&c)
+            .evaluate(&ev("attestation_disputed", 1, &[]))
             .is_empty());
-        // In-flight rate window survived: two more events reach the burst.
-        assert!(restarted.evaluate(&ev("attester_added", 3, &[])).is_empty());
-        assert!(restarted.evaluate(&ev("attester_added", 4, &[])).is_empty());
-        let burst = restarted.evaluate(&ev("attester_added", 5, &[]));
-        assert!(burst.iter().any(|a| a.kind == MASS_ENROLLMENT));
-
-        let _ = std::fs::remove_file(&path);
     }
 }

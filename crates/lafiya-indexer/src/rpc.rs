@@ -47,6 +47,11 @@ pub struct EventPage {
     pub events: Vec<RawEvent>,
     pub cursor: String,
     pub latest_ledger: u32,
+    /// Hash of the ledger the page was served from, when the provider
+    /// reports it. Used by ingest to verify chain continuity across pages
+    /// and providers.
+    #[serde(default)]
+    pub latest_ledger_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -64,6 +69,14 @@ pub trait EventSource {
         start: &Start,
         limit: u32,
     ) -> impl Future<Output = Result<EventPage, RpcError>> + Send;
+
+    /// Fetch the hash of `ledger`, or `None` if the provider does not retain
+    /// it. Ingest uses this to verify continuity and to locate the common
+    /// ancestor when a reorg is detected.
+    fn ledger_hash(
+        &self,
+        ledger: u32,
+    ) -> impl Future<Output = Result<Option<String>, RpcError>> + Send;
 }
 
 #[derive(Clone)]
@@ -198,5 +211,22 @@ impl EventSource for RpcClient {
             }),
         };
         self.call("getEvents", params).await
+    }
+
+    async fn ledger_hash(&self, ledger: u32) -> Result<Option<String>, RpcError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LedgerInfo {
+            hash: Option<String>,
+        }
+        let info: LedgerInfo = self
+            .call("getLedgerEntries", json!({ "ledger": ledger }))
+            .await
+            .or_else(|_| {
+                // Fall back to `getLedgers` for providers that expose the
+                // ledger header through the newer method.
+                self.call("getLedgers", json!({ "startLedger": ledger, "pagination": { "limit": 1 } }))
+            })?;
+        Ok(info.hash)
     }
 }

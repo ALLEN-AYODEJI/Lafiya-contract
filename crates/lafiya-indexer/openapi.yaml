@@ -91,6 +91,48 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/HistoryEntry" } }
                   next_cursor: { type: string, nullable: true }
         "400": { $ref: "#/components/responses/Error" }
+  /work-items:
+    get:
+      summary: List incentive-pool work items
+      parameters:
+        - { name: attester, in: query, schema: { type: string } }
+        - name: status
+          in: query
+          schema: { type: string, enum: [approved, claimed, withdrawn] }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: A page of work items, in chain order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/WorkItem" } }
+                  next_cursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/Error" }
+  /payouts:
+    get:
+      summary: List incentive-pool payouts
+      parameters:
+        - { name: attester, in: query, schema: { type: string } }
+        - { name: work_item_id, in: query, schema: { type: string } }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: A page of payouts, in chain order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Payout" } }
+                  next_cursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/Error" }
 components:
   parameters:
     limit:
@@ -123,6 +165,27 @@ components:
         license_hash: { type: string, nullable: true }
         first_seen_ledger: { type: integer }
         updated_ledger: { type: integer }
+    WorkItem:
+      type: object
+      properties:
+        work_item_id: { type: string }
+        attester: { type: string }
+        status: { type: string, enum: [approved, claimed, withdrawn] }
+        amount: { type: string, description: Token amount as a decimal string }
+        approved_ledger: { type: integer, nullable: true }
+        claimed_ledger: { type: integer, nullable: true }
+        finalized_ledger: { type: integer, description: Last ledger considered final for this row }
+    Payout:
+      type: object
+      properties:
+        event_id: { type: string }
+        work_item_id: { type: string }
+        attester: { type: string }
+        amount: { type: string, description: Token amount as a decimal string }
+        timestamp: { type: integer, description: Ledger close time (Unix seconds) }
+        ledger: { type: integer }
+        tx_hash: { type: string }
+        finalized_ledger: { type: integer, description: Last ledger considered final for this row }
     Attestation:
       type: object
       properties:
@@ -133,6 +196,7 @@ components:
         ledger: { type: integer }
         tx_hash: { type: string }
         revoked: { type: boolean }
+        finalized_ledger: { type: integer, description: Last ledger considered final for this row }
     HistoryEntry:
       type: object
       properties:
@@ -142,3 +206,4 @@ components:
         timestamp: { type: integer, nullable: true }
         ledger: { type: integer }
         tx_hash: { type: string }
+        finalized_ledger: { type: integer, description: Last ledger considered final for this row }

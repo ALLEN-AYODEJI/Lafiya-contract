@@ -22,6 +22,9 @@ use lafiya_rpc_resilience::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
@@ -33,297 +36,8 @@ use stellar_xdr::{
 /// How many times an expired transaction is rebuilt before giving up.
 const MAX_REBUILDS: u32 = 2;
 
-/// Version tag for the air-gapped transaction envelope (issue #534).
-pub const ENVELOPE_VERSION: u32 = 1;
-
-/// Version tag for the detached signature bundle (issue #534).
-pub const BUNDLE_VERSION: u32 = 1;
-
-/// A self-describing, transportable envelope carrying an unsigned
-/// transaction between an online host and an offline signer.
-///
-/// The `checksum` covers every other field (see [`Envelope::checksum`]) so
-/// that any tampering in transit -- including a swapped network passphrase,
-/// contract id, or expiry -- is detected before the offline device signs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Envelope {
-    /// Envelope format version; must equal [`ENVELOPE_VERSION`].
-    pub version: u32,
-    /// Network passphrase the transaction is bound to.
-    pub network_passphrase: String,
-    /// Contract id the invocation targets, if any.
-    pub contract_id: Option<String>,
-    /// Ledger after which the transaction can never be included.
-    pub max_ledger: u32,
-    /// Sequence number of the source account.
-    pub sequence: i64,
-    /// Source account (G...).
-    pub source_account: String,
-    /// Base64 unsigned transaction envelope XDR.
-    pub xdr: String,
-    /// Human-readable decode of the invocation, for offline review.
-    pub human_readable: String,
-    /// Hex SHA-256 over the canonical encoding of all fields above.
-    pub checksum: String,
-}
-
-impl Envelope {
-    /// Build an envelope, computing its checksum.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        network_passphrase: impl Into<String>,
-        contract_id: Option<String>,
-        max_ledger: u32,
-        sequence: i64,
-        source_account: impl Into<String>,
-        xdr: impl Into<String>,
-        human_readable: impl Into<String>,
-    ) -> Self {
-        let mut envelope = Envelope {
-            version: ENVELOPE_VERSION,
-            network_passphrase: network_passphrase.into(),
-            contract_id,
-            max_ledger,
-            sequence,
-            source_account: source_account.into(),
-            xdr: xdr.into(),
-            human_readable: human_readable.into(),
-            checksum: String::new(),
-        };
-        envelope.checksum = envelope.checksum();
-        envelope
-    }
-
-    /// Hex SHA-256 over the canonical encoding of every field except
-    /// `checksum`. Field order and separators are fixed so the value is
-    /// stable across hosts and serialization formats.
-    pub fn checksum(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.version.to_le_bytes());
-        hash_field(&mut hasher, &self.network_passphrase);
-        hash_field(&mut hasher, self.contract_id.as_deref().unwrap_or(""));
-        hasher.update(self.max_ledger.to_le_bytes());
-        hasher.update(self.sequence.to_le_bytes());
-        hash_field(&mut hasher, &self.source_account);
-        hash_field(&mut hasher, &self.xdr);
-        hash_field(&mut hasher, &self.human_readable);
-        hex::encode(hasher.finalize())
-    }
-
-    /// Recompute the checksum and reject the envelope if it does not match.
-    /// Call this on the offline device *before* signing.
-    pub fn verify(&self) -> anyhow::Result<()> {
-        if self.version != ENVELOPE_VERSION {
-            bail!(
-                "unsupported envelope version {} (expected {ENVELOPE_VERSION})",
-                self.version
-            );
-        }
-        let expected = self.checksum();
-        if !constant_time_eq(expected.as_bytes(), self.checksum.as_bytes()) {
-            bail!(
-                "envelope checksum mismatch: expected {expected}, found {} -- the envelope was modified in transit",
-                self.checksum
-            );
-        }
-        Ok(())
-    }
-
-    /// Verify the checksum, then reject an envelope whose `max_ledger` has
-    /// already passed. `latest_ledger` is supplied by the caller so the
-    /// offline device can be told the current ledger out of band.
-    pub fn verify_for_signing(&self, latest_ledger: u32) -> anyhow::Result<()> {
-        self.verify()?;
-        if latest_ledger > self.max_ledger {
-            bail!(
-                "envelope expired: max ledger {} is before current ledger {latest_ledger}",
-                self.max_ledger
-            );
-        }
-        Ok(())
-    }
-
-    /// Serialize to a single-line JSON string suitable for a file or QR
-    /// transport.
-    pub fn to_json(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
-    }
-
-    /// Parse an envelope from JSON and verify its checksum.
-    pub fn from_json(json: &str) -> anyhow::Result<Self> {
-        let envelope: Envelope =
-            serde_json::from_str(json).context("failed to parse transaction envelope")?;
-        envelope.verify()?;
-        Ok(envelope)
-    }
-}
-
-/// A detached signature bundle produced by `tx sign --offline`.
-///
-/// It carries the signed envelope XDR plus the checksum of the envelope it
-/// was produced from, so `tx submit` can confirm it is assembling the
-/// signature onto the exact envelope that was reviewed offline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignatureBundle {
-    /// Bundle format version; must equal [`BUNDLE_VERSION`].
-    pub version: u32,
-    /// Checksum of the [`Envelope`] this bundle signs.
-    pub envelope_checksum: String,
-    /// Base64 signed transaction envelope XDR.
-    pub signed_xdr: String,
-    /// Hex transaction hash of the signed envelope.
-    pub tx_hash: String,
-    /// Hex-encoded decorated signatures, for inspection/audit.
-    pub signatures: Vec<String>,
-    /// Hex SHA-256 over the canonical encoding of all fields above.
-    pub checksum: String,
-}
-
-impl SignatureBundle {
-    /// Build a bundle from a signed envelope, computing its checksum.
-    pub fn new(
-        envelope_checksum: impl Into<String>,
-        signed_xdr: impl Into<String>,
-        tx_hash: impl Into<String>,
-        signatures: Vec<String>,
-    ) -> Self {
-        let mut bundle = SignatureBundle {
-            version: BUNDLE_VERSION,
-            envelope_checksum: envelope_checksum.into(),
-            signed_xdr: signed_xdr.into(),
-            tx_hash: tx_hash.into(),
-            signatures,
-            checksum: String::new(),
-        };
-        bundle.checksum = bundle.checksum();
-        bundle
-    }
-
-    /// Hex SHA-256 over the canonical encoding of every field except
-    /// `checksum`.
-    pub fn checksum(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.version.to_le_bytes());
-        hash_field(&mut hasher, &self.envelope_checksum);
-        hash_field(&mut hasher, &self.signed_xdr);
-        hash_field(&mut hasher, &self.tx_hash);
-        hasher.update((self.signatures.len() as u64).to_le_bytes());
-        for sig in &self.signatures {
-            hash_field(&mut hasher, sig);
-        }
-        hex::encode(hasher.finalize())
-    }
-
-    /// Recompute the checksum and reject the bundle if it does not match.
-    pub fn verify(&self) -> anyhow::Result<()> {
-        if self.version != BUNDLE_VERSION {
-            bail!(
-                "unsupported signature bundle version {} (expected {BUNDLE_VERSION})",
-                self.version
-            );
-        }
-        let expected = self.checksum();
-        if !constant_time_eq(expected.as_bytes(), self.checksum.as_bytes()) {
-            bail!(
-                "signature bundle checksum mismatch: expected {expected}, found {}",
-                self.checksum
-            );
-        }
-        Ok(())
-    }
-
-    /// Serialize to a single-line JSON string.
-    pub fn to_json(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
-    }
-
-    /// Parse a bundle from JSON and verify its checksum.
-    pub fn from_json(json: &str) -> anyhow::Result<Self> {
-        let bundle: SignatureBundle =
-            serde_json::from_str(json).context("failed to parse signature bundle")?;
-        bundle.verify()?;
-        Ok(bundle)
-    }
-
-    /// Assemble the signed envelope for submission, confirming that the
-    /// bundle signs `envelope` and that the resulting transaction hash
-    /// matches the one recorded in the bundle.
-    pub fn assemble(&self, envelope: &Envelope, passphrase: &str) -> anyhow::Result<String> {
-        self.verify()?;
-        envelope.verify()?;
-        if self.envelope_checksum != envelope.checksum {
-            bail!(
-                "signature bundle signs envelope {}, but the supplied envelope is {}",
-                self.envelope_checksum,
-                envelope.checksum
-            );
-        }
-        let actual = tx_hash(&self.signed_xdr, passphrase)?;
-        if actual != self.tx_hash {
-            bail!(
-                "signed envelope hash {actual} does not match bundle hash {}",
-                self.tx_hash
-            );
-        }
-        Ok(self.signed_xdr.clone())
-    }
-}
-
-/// Feed a length-prefixed field into `hasher` so concatenation is unambiguous.
-fn hash_field(hasher: &mut Sha256, field: &str) {
-    hasher.update((field.len() as u64).to_le_bytes());
-    hasher.update(field.as_bytes());
-}
-
-/// Compare two byte slices without early exit.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Extract the hex-encoded decorated signatures from a signed envelope.
-pub fn envelope_signatures(envelope_b64: &str) -> anyhow::Result<Vec<String>> {
-    let envelope = TransactionEnvelope::from_xdr_base64(envelope_b64, Limits::none())?;
-    let signatures: &[DecoratedSignature] = match &envelope {
-        TransactionEnvelope::Tx(v1) => &v1.signatures,
-        TransactionEnvelope::TxV0(v0) => &v0.signatures,
-        TransactionEnvelope::TxFeeBump(fb) => &fb.signatures,
-    };
-    Ok(signatures
-        .iter()
-        .map(|sig| hex::encode(sig.signature.0.as_slice()))
-        .collect())
-}
-
-/// Attach a detached signature (hex) to an unsigned envelope, producing a
-/// signed envelope XDR. Used by `tx sign --offline` when assembling the
-/// bundle from a raw signature.
-pub fn attach_signature(
-    envelope_b64: &str,
-    hint: [u8; 4],
-    signature_hex: &str,
-) -> anyhow::Result<String> {
-    let mut envelope = TransactionEnvelope::from_xdr_base64(envelope_b64, Limits::none())?;
-    let bytes = hex::decode(signature_hex).context("signature is not valid hex")?;
-    let decorated = DecoratedSignature {
-        hint: stellar_xdr::SignatureHint(hint),
-        signature: Signature(bytes.try_into().map_err(|_| {
-            anyhow::anyhow!("signature must be exactly 64 bytes, got {}", signature_hex.len() / 2)
-        })?),
-    };
-    match &mut envelope {
-        TransactionEnvelope::Tx(v1) => v1.signatures.push(decorated),
-        TransactionEnvelope::TxV0(v0) => v0.signatures.push(decorated),
-        TransactionEnvelope::TxFeeBump(fb) => fb.signatures.push(decorated),
-    }
-    Ok(envelope.to_xdr_base64(Limits::none())?)
-}
+/// Maximum number of ledger entries a single restore footprint may cover.
+const MAX_RESTORE_ENTRIES: usize = 32;
 
 /// Build, bound, sign, and submit a `stellar contract invoke` argument list
 /// (as produced by `invoke_args`), rebuilding it if it expires.
@@ -345,6 +59,19 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
             bounds.sequence
         );
 
+        // Persist the intent *before* sending so an ambiguous outcome can be
+        // reconciled later without double submission.
+        let dir = state_dir();
+        let mut intent = SubmissionIntent {
+            tx_hash: tx_hash.clone(),
+            max_ledger,
+            sequence: bounds.sequence,
+            source_account: bounds.source_account.clone(),
+            recorded_at_ledger: latest,
+            final_state: None,
+        };
+        save_intent(&dir, &intent)?;
+
         rpc.envelope = Some(signed);
         let mut client = FailoverClient::new(vec![Box::new(rpc)], RetryPolicy::default());
         let mut log = RecoveryLog::new();
@@ -354,32 +81,161 @@ pub fn run_bounded(cfg: &NetworkConfig, invoke: Vec<String>, window: u32) -> any
         }
         match result {
             RecoveryResult::Accepted { ledger, .. } => {
+                intent.final_state = Some(FinalState::Succeeded { ledger });
+                save_intent(&dir, &intent)?;
                 println!("Transaction {tx_hash} succeeded in ledger {ledger}");
                 return Ok(());
             }
             RecoveryResult::RejectedOnChain { reason } => {
+                intent.final_state = Some(FinalState::Failed {
+                    reason: reason.clone(),
+                });
+                save_intent(&dir, &intent)?;
                 bail!("transaction {tx_hash} failed on-chain: {reason}")
             }
             RecoveryResult::Expired { latest_ledger, .. } if attempt < MAX_REBUILDS => {
+                intent.final_state = Some(FinalState::Expired { latest_ledger });
+                save_intent(&dir, &intent)?;
                 eprintln!(
                     "Transaction {tx_hash} expired (ledger {latest_ledger} > {max_ledger}); it can never be included -- rebuilding"
                 );
             }
             RecoveryResult::Expired { latest_ledger, .. } => {
+                intent.final_state = Some(FinalState::Expired { latest_ledger });
+                save_intent(&dir, &intent)?;
                 bail!("transaction {tx_hash} expired at ledger {latest_ledger} after {MAX_REBUILDS} rebuilds; nothing was applied")
             }
-            RecoveryResult::SequenceConsumed { consumed_by } => bail!(
-                "sequence {} of {} was consumed by {}; transaction {tx_hash} can never be included. Check whether that transaction already made this change before retrying.",
-                bounds.sequence,
-                bounds.source_account,
-                consumed_by.as_deref().unwrap_or("another transaction")
-            ),
+            RecoveryResult::SequenceConsumed { consumed_by } => {
+                intent.final_state = Some(FinalState::SequenceConsumed {
+                    consumed_by: consumed_by.clone(),
+                });
+                save_intent(&dir, &intent)?;
+                bail!(
+                    "sequence {} of {} was consumed by {}; transaction {tx_hash} can never be included. Check whether that transaction already made this change before retrying.",
+                    bounds.sequence,
+                    bounds.source_account,
+                    consumed_by.as_deref().unwrap_or("another transaction")
+                )
+            }
             RecoveryResult::ExhaustedNeedsOperator { last_known } => bail!(
-                "could not determine the outcome of {tx_hash} (last known: {last_known:?}); see docs/runbooks/rpc-outage-recovery.md"
+                "could not determine the outcome of {tx_hash} (last known: {last_known:?}); the intent is recorded at {} -- run `tx status {tx_hash}` to reconcile; see docs/runbooks/rpc-outage-recovery.md",
+                intent_path(&dir, &tx_hash).display()
             ),
         }
     }
     unreachable!("the final attempt always returns")
+}
+
+/// Build, bound, sign, and submit an `extend_attestation_ttl` invocation.
+///
+/// This is permissionless: any account may pay rent to extend an attestation
+/// (issue #544). The contract caps `extend_to` to its maximum horizon, so the
+/// CLI only validates that the value is a plausible ledger sequence.
+pub fn run_extend_ttl(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    extend_to: u32,
+    window: u32,
+) -> anyhow::Result<()> {
+    if extend_to == 0 {
+        bail!("extend_to must be a positive ledger sequence");
+    }
+    let invoke = invoke_args(
+        contract_id,
+        source,
+        "extend_attestation_ttl",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--extend_to".to_string(),
+            extend_to.to_string(),
+        ],
+    );
+    run_bounded(cfg, invoke, window)
+}
+
+/// Build, bound, sign, and submit a patient-initiated `dispute` invocation.
+///
+/// The dispute overlay is keyed by record hash and signer; the patient signs
+/// the commitment with the QR-spec scheme, so the signature is passed through
+/// verbatim (issue #546).
+pub fn run_dispute(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    patient: &str,
+    signature: &str,
+    window: u32,
+) -> anyhow::Result<()> {
+    if signature.is_empty() {
+        bail!("dispute requires a patient signature over the commitment");
+    }
+    let invoke = invoke_args(
+        contract_id,
+        source,
+        "dispute",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--patient".to_string(),
+            patient.to_string(),
+            "--signature".to_string(),
+            signature.to_string(),
+        ],
+    );
+    run_bounded(cfg, invoke, window)
+}
+
+/// Restore archived attestation entries, then extend their TTL.
+///
+/// Archived entries must be restored into the live footprint before they can
+/// be extended. The restore transaction is submitted first (bounded like any
+/// other write); only once it is accepted do we submit the TTL extension.
+pub fn run_restore(
+    cfg: &NetworkConfig,
+    contract_id: &str,
+    source: &str,
+    record_hash: &str,
+    extend_to: u32,
+    window: u32,
+) -> anyhow::Result<()> {
+    if extend_to == 0 {
+        bail!("extend_to must be a positive ledger sequence");
+    }
+    let restore = invoke_args(
+        contract_id,
+        source,
+        "restore_attestation",
+        &[
+            "--record_hash".to_string(),
+            record_hash.to_string(),
+            "--max_entries".to_string(),
+            MAX_RESTORE_ENTRIES.to_string(),
+        ],
+    );
+    run_bounded(cfg, restore, window)
+        .with_context(|| format!("restoring archived attestation {record_hash} failed"))?;
+    println!("Attestation {record_hash} restored; extending TTL to ledger {extend_to}");
+    run_extend_ttl(cfg, contract_id, source, record_hash, extend_to, window)
+}
+
+/// Assemble a `stellar contract invoke` argument list.
+fn invoke_args(contract_id: &str, source: &str, function: &str, args: &[String]) -> Vec<String> {
+    let mut invoke = vec![
+        "contract".to_string(),
+        "invoke".to_string(),
+        "--id".to_string(),
+        contract_id.to_string(),
+        "--source".to_string(),
+        source.to_string(),
+        "--".to_string(),
+        function.to_string(),
+    ];
+    invoke.extend(args.iter().cloned());
+    invoke
 }
 
 /// `stellar contract invoke ... --build-only -- fn args`
@@ -629,6 +485,64 @@ mod tests {
         let envelope = sample_envelope();
         let bundle = SignatureBundle::new("not-the-checksum", "AAAAAA==", "deadbeef", vec![]);
         assert!(bundle.assemble(&envelope, "Test SDF Network ; September 2015").is_err());
+    }
+
+    #[test]
+    fn invoke_args_places_function_after_separator() {
+        let args = invoke_args(
+            "C1",
+            "GSOURCE",
+            "extend_attestation_ttl",
+            &[
+                "--record_hash".to_string(),
+                "abc".to_string(),
+                "--extend_to".to_string(),
+                "42".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            [
+                "contract",
+                "invoke",
+                "--id",
+                "C1",
+                "--source",
+                "GSOURCE",
+                "--",
+                "extend_attestation_ttl",
+                "--record_hash",
+                "abc",
+                "--extend_to",
+                "42",
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn dispute_requires_signature() {
+        let cfg = NetworkConfig {
+            rpc_url: "http://localhost".into(),
+            network_passphrase: "Test SDF Network ; September 2015".into(),
+            ..Default::default()
+        };
+        let err = run_dispute(&cfg, "C1", "GSOURCE", "abc", "GPATIENT", "", 10)
+            .expect_err("empty signature must be rejected");
+        assert!(err.to_string().contains("signature"));
+    }
+
+    #[test]
+    fn extend_ttl_rejects_zero_horizon() {
+        let cfg = NetworkConfig {
+            rpc_url: "http://localhost".into(),
+            network_passphrase: "Test SDF Network ; September 2015".into(),
+            ..Default::default()
+        };
+        let err = run_extend_ttl(&cfg, "C1", "GSOURCE", "abc", 0, 10)
+            .expect_err("zero extend_to must be rejected");
+        assert!(err.to_string().contains("extend_to"));
     }
 
     #[test]

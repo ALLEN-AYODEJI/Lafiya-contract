@@ -27,6 +27,10 @@ pub use heartbeat::{Heartbeat, HeartbeatConfig};
 pub use proposal::{PauseProposal, ProposalPolicy};
 pub use state::{AlertFingerprint, PersistentState, RuleWindowState, StateStore};
 
+pub use rules::{
+    ApprovalBurstRule, ClaimByReaddedAttesterRule, LargeWithdrawalRule, PoolPausedRule,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// A decoded contract event, as seen by the rules engine.

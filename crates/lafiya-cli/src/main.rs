@@ -443,6 +443,31 @@ enum AttestationSub {
         /// Path to the record JSON file
         record: PathBuf,
     },
+    /// Restore an archived attestation entry: re-submit the record and extend
+    /// its TTL via `extend_attestation_ttl`. See docs/storage-cost.md.
+    Restore {
+        /// Path to the record JSON file to restore
+        record: PathBuf,
+        /// Ledger sequence to extend the entry's TTL to (capped on-chain)
+        #[arg(long)]
+        extend_to: u32,
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Flag an attestation as disputed using a patient signature over the
+    /// commitment (see docs/specs/verification-model.md)
+    Dispute {
+        /// Hex string of 32-byte record hash (64 chars)
+        record_hash: String,
+        /// Patient signature (base64 or hex) over the dispute commitment
+        #[arg(long)]
+        signature: String,
+        /// Patient public key (G...) that produced the signature
+        #[arg(long)]
+        patient: String,
+        #[arg(long)]
+        source: Option<String>,
+    },
 }
 
 // ── admin transfer subcommands ────────────────────────────────────────────────
@@ -821,6 +846,103 @@ fn main() -> anyhow::Result<()> {
                         "stellar CLI not found — install with cargo install --locked stellar-cli"
                     );
                 }
+            }
+            AttestationSub::Restore {
+                record,
+                extend_to,
+                source,
+            } => {
+                let contract_id = network_cfg
+                    .require_contract_id(&cli.network, ContractKind::AttestationRegistry)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let content = std::fs::read_to_string(&record)?;
+                let rec: lafiya_config::record::EmergencyRecord = serde_json::from_str(&content)?;
+                let hash_bytes = rec.hash()?;
+                let hash_hex: String = hash_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                let source = validated_source(source)?;
+                let extend_to_str = extend_to.to_string();
+
+                // Step 1: re-submit the record so an archived entry is recreated.
+                println!("Restoring record hash: {}", hash_hex);
+                let submit_args = invoke_args(
+                    &network_cfg,
+                    contract_id,
+                    source.as_deref(),
+                    "submit_attestation",
+                    &["--record_hash", &hash_hex],
+                );
+                run_audited(
+                    "attestation restore (submit)",
+                    &cli.network,
+                    contract_id,
+                    "submit_attestation",
+                    &[&hash_hex],
+                    source.as_deref(),
+                    submit_args,
+                )?;
+
+                // Step 2: extend the TTL to the requested horizon (capped on-chain).
+                let extend_args = invoke_args(
+                    &network_cfg,
+                    contract_id,
+                    source.as_deref(),
+                    "extend_attestation_ttl",
+                    &["--record_hash", &hash_hex, "--extend_to", &extend_to_str],
+                );
+                run_audited(
+                    "attestation restore (extend_ttl)",
+                    &cli.network,
+                    contract_id,
+                    "extend_attestation_ttl",
+                    &[&hash_hex, &extend_to_str],
+                    source.as_deref(),
+                    extend_args,
+                )?;
+                println!(
+                    "Restored {} and extended TTL to ledger {}",
+                    hash_hex, extend_to
+                );
+            }
+            AttestationSub::Dispute {
+                record_hash,
+                signature,
+                patient,
+                source,
+            } => {
+                let contract_id = network_cfg
+                    .require_contract_id(&cli.network, ContractKind::AttestationRegistry)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                validate_record_hash("record_hash", &record_hash)
+                    .context("invalid record hash (expected a hex encoded 32-byte hash)")?;
+                validate_account_address("patient", &patient)
+                    .context("invalid patient address (expected a G... account address)")?;
+                if signature.trim().is_empty() {
+                    anyhow::bail!("--signature must not be empty");
+                }
+                let source = validated_source(source)?;
+                let args = invoke_args(
+                    &network_cfg,
+                    contract_id,
+                    source.as_deref(),
+                    "dispute_attestation",
+                    &[
+                        "--record_hash",
+                        &record_hash,
+                        "--patient",
+                        &patient,
+                        "--signature",
+                        &signature,
+                    ],
+                );
+                run_audited(
+                    "attestation dispute",
+                    &cli.network,
+                    contract_id,
+                    "dispute_attestation",
+                    &[&record_hash, &patient],
+                    source.as_deref(),
+                    args,
+                )?;
             }
         },
         Commands::Interface { contract } => {
@@ -1689,7 +1811,10 @@ fn handle_attestation(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     match sub {
-        AttestationSub::Hash { .. } | AttestationSub::Verify { .. } => {} // handled in main
+        AttestationSub::Hash { .. }
+        | AttestationSub::Verify { .. }
+        | AttestationSub::Restore { .. }
+        | AttestationSub::Dispute { .. } => {} // handled in main
         AttestationSub::Get { record_hash } => {
             validate_record_hash("record_hash", &record_hash)
                 .context("invalid record hash (expected a hex encoded 32-byte hash)")?;
@@ -2157,79 +2282,56 @@ mod tests {
         );
     }
 
-    // ── tx subcommands ────────────────────────────────────────────────────────
-
     #[test]
-    fn tx_prepare_parses_required_flags() {
+    fn attestation_restore_parses_record_and_extend_to() {
         let cli = Cli::try_parse_from([
             "lafiya-cli",
-            "tx",
-            "prepare",
-            "--xdr",
-            "AAAA",
-            "--contract-id",
-            CONTRACT_ID,
-            "--expiry-ledger",
-            "1234",
+            "attestation",
+            "restore",
+            "record.json",
+            "--extend-to",
+            "12345",
         ])
         .unwrap();
         match cli.command {
-            Commands::Tx {
-                sub:
-                    TxSub::Prepare {
-                        xdr,
-                        contract_id,
-                        expiry_ledger,
-                        out,
-                        qr,
-                    },
+            Commands::Attestation {
+                sub: AttestationSub::Restore { record, extend_to, .. },
             } => {
-                assert_eq!(xdr, "AAAA");
-                assert_eq!(contract_id, CONTRACT_ID);
-                assert_eq!(expiry_ledger, 1234);
-                assert!(out.is_none());
-                assert!(!qr);
+                assert_eq!(record, PathBuf::from("record.json"));
+                assert_eq!(extend_to, 12345);
             }
             other => panic!("unexpected command: {other:?}"),
         }
     }
 
     #[test]
-    fn tx_sign_requires_offline_flag() {
-        let cli = Cli::try_parse_from([
-            "lafiya-cli",
-            "tx",
-            "sign",
-            "--envelope",
-            "env.json",
-            "--signer",
-            "alice",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Tx {
-                sub: TxSub::Sign { offline, .. },
-            } => assert!(!offline),
-            other => panic!("unexpected command: {other:?}"),
-        }
+    fn attestation_restore_missing_extend_to_names_the_argument() {
+        let err = Cli::try_parse_from(["lafiya-cli", "attestation", "restore", "record.json"])
+            .expect_err("expected a missing required argument error");
+        let message = err.to_string();
+        assert!(
+            message.to_uppercase().contains("EXTEND_TO"),
+            "expected error to name the missing `extend_to` argument, got: {message}"
+        );
     }
 
     #[test]
-    fn tx_submit_parses_paths() {
+    fn attestation_dispute_parses_required_args() {
         let cli = Cli::try_parse_from([
             "lafiya-cli",
-            "tx",
-            "submit",
-            "--envelope",
-            "env.json",
-            "--signatures",
-            "sig.json",
+            "attestation",
+            "dispute",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--signature",
+            "c2ln",
+            "--patient",
+            ATTESTER_ADDR,
         ])
         .unwrap();
         match cli.command {
-            Commands::Tx {
-                sub: TxSub::Submit { envelope, .. },
-            } => assert_eq!(envelope, PathBuf::from("env.json")),
+            Commands::Attestation {
+                sub: AttestationSub::Dispute { patient, .. },
+            } => assert_eq!(patient, ATTESTER_ADDR),
             other => panic!("unexpected command: {other:?}"),
         }
     }

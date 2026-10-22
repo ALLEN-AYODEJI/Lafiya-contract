@@ -83,6 +83,30 @@ alert_signing_pubkey = "REPLACE_ME"
 # Where ready-to-sign proposals are written for the multisig tooling.
 proposal_dir = "./watchdog-proposals"
 
+# Expiry watchdog for attestation-registry entries (see docs/storage-cost.md).
+# Warns when an attestation's TTL horizon falls below the threshold so that
+# anyone can permissionlessly bump it via `extend_attestation_ttl`.
+[expiry_watch]
+# Ledgers remaining before an entry is considered "approaching expiry".
+warn_ledgers_remaining = 17280
+# Escalate to critical when this close to archival.
+critical_ledgers_remaining = 4320
+# How often to scan attestation entries, in seconds.
+scan_interval_secs = 3600
+severity = "high"
+
+# Dispute monitoring for patient-initiated dispute flags (#546).
+# Disputes are an overlay; they never delete data and require attester/admin
+# action to clear. Alert on new disputes so responders can review them.
+[dispute_watch]
+# Emit an alert whenever a new dispute is recorded.
+alert_on_new_dispute = true
+# Alert if a single signer opens more than this many disputes within the window.
+max_disputes_per_signer = 5
+window_ledgers = 1000
+severity = "high"
+=======
+
 [[sinks]]
 type = "webhook"
 format = "slack"
