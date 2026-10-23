@@ -11,3 +11,13 @@ export {
   type OnChainAttestation,
 } from "./chain.js";
 export { BindingsChainReader } from "./rpc.js";
+export {
+  StatusListClient,
+  StatusListError,
+  verifyInclusion,
+  type StatusListSegment,
+  type StatusListRoot,
+  type StatusListSyncResult,
+  type StatusListClientOptions,
+  type InclusionProof,
+} from "./status-list.js";

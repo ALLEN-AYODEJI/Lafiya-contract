@@ -58,6 +58,15 @@ For programmatic decoding, use the generated [`catalog/errors.json`](../catalog/
 | `22` | `InvalidRecordVersion` | The supplied previous hash or version relationship is invalid. |
 | `23` | `BatchTooLarge` | The batch contains more requests than the supported maximum. |
 | `24` | `InvalidCommitmentVersion` | The commitment scheme version does not fit in one byte. |
+| `25` | `InvalidTtlExtension` | `extend_attestation_ttl` was called with an `extend_to` that is not strictly greater than the attestation's current expiry, or that exceeds the maximum TTL horizon. TTL can only be extended, never shortened. |
+| `26` | `QuorumPolicyNotFound` | No quorum policy is configured for the record class of the referenced attestation. |
+| `27` | `InvalidQuorumPolicy` | The quorum policy is invalid (e.g. required attester count is zero or exceeds the supported maximum). |
+| `28` | `DuplicateAttester` | The same attester attempted to co-attest the same record twice; distinct attesters are required to satisfy a quorum. |
+| `29` | `DisputeAlreadyExists` | A dispute is already recorded for this record hash and signer; the existing dispute must be cleared by an attester or admin before a new one can be filed. |
+| `30` | `InvalidDisputeSignature` | The patient dispute signature failed verification against the commitment, or the signature domain separator is invalid (replay protection). |
+| `31` | `DisputeLimitExceeded` | The per-record dispute spam bound has been reached; further disputes are rejected until existing ones are cleared. |
+| `32` | `InvalidStatusListProof` | The supplied status-list inclusion proof does not validate against the signed segment root. |
+| `33` | `StatusListSegmentNotFound` | No status-list segment exists for the requested version or index. |
 
 ## `multisig-account`
 
