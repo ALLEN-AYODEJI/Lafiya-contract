@@ -22,6 +22,7 @@
 #![no_std]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
     String, Symbol, Vec,
@@ -1515,6 +1516,14 @@ impl AttesterRegistry {
     /// Whether `attester` is allowlisted, not suspended, and within its validity
     /// window. Callable by anyone, including other contracts.
     pub fn is_attester(env: Env, attester: Address) -> bool {
+        let issuer_revoked = env
+            .storage()
+            .persistent()
+            .get::<_, BytesN<32>>(&DataKey::AttesterIssuer(attester.clone()))
+            .is_some_and(|issuer| !Self::is_credential_issuer(env.clone(), issuer));
+        if issuer_revoked {
+            return false;
+        }
         let active = env
             .storage()
             .persistent()
