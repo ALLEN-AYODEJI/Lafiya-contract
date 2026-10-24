@@ -59,6 +59,22 @@ pub fn default_rules() -> Vec<EventRule> {
         ),
         rule("pause_toggled", &["paused", "unpaused"], Severity::High),
         rule("bulk_revocation", &["attestation_revoked"], Severity::Info),
+        // incentive-pool: approval authority and blast-radius controls.
+        rule(
+            "approver_reconfigured",
+            &["approver_set_changed", "rate_limit_set"],
+            Severity::Critical,
+        ),
+        rule(
+            "approver_rate_limit_hit",
+            &["approver_rate_limit_hit"],
+            Severity::High,
+        ),
+        rule(
+            "work_item_endorsement",
+            &["work_item_proposed", "work_item_endorsed"],
+            Severity::Info,
+        ),
     ]
 }
 

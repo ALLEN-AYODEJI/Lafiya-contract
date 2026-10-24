@@ -217,6 +217,48 @@ pub struct Reconciliation {
     pub drift: i128,
 }
 
+/// Pending M-of-N approval of a work item.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Proposal {
+    pub attester: Address,
+    pub payout_amount: i128,
+    pub programme: Option<Symbol>,
+    pub endorsements: Vec<Address>,
+    pub expires_at: u64,
+}
+
+/// Per-approver rate limit applied to every approval or endorsement.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimit {
+    pub window_seconds: u64,
+    pub max_count: u32,
+    pub max_value: i128,
+}
+
+/// One compact counter per approver; reset when the window rolls over,
+/// so storage never grows beyond one entry per approver.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApproverWindow {
+    pub window_start: u64,
+    pub count: u32,
+    pub value: i128,
+}
+
+/// Funding totals exposed for reconciliation. Invariant:
+/// `custody == programmes_total + unallocated`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundingTotals {
+    pub deposited: i128,
+    pub paid: i128,
+    pub custody: i128,
+    pub programmes_total: i128,
+    pub unallocated: i128,
+}
+
 // ──────────────────────────── Events ────────────────────────────
 
 #[contractevent]
@@ -335,6 +377,91 @@ pub struct AttesterRegistryRepointed {
     pub previous: Address,
     #[topic]
     pub new: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ApproverSetChanged {
+    #[topic]
+    pub by: Address,
+    pub approvers: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WorkItemProposed {
+    #[topic]
+    pub work_item_id: BytesN<32>,
+    #[topic]
+    pub proposer: Address,
+    pub attester: Address,
+    pub payout_amount: i128,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WorkItemEndorsed {
+    #[topic]
+    pub work_item_id: BytesN<32>,
+    #[topic]
+    pub endorser: Address,
+    pub endorsements: u32,
+    pub threshold: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RateLimitSet {
+    #[topic]
+    pub by: Address,
+    pub window_seconds: u64,
+    pub max_count: u32,
+    pub max_value: i128,
+}
+
+/// Published on the approval that fills an approver's window; later
+/// attempts in the same window fail with `ApproverRateLimited`.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ApproverRateLimitHit {
+    #[topic]
+    pub approver: Address,
+    pub count: u32,
+    pub value: i128,
+    pub window_resets_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProgrammeFunded {
+    #[topic]
+    pub donor: Address,
+    #[topic]
+    pub programme: Symbol,
+    pub amount: i128,
+}
+
+/// Links an approved work item to the programme it draws from, so
+/// indexers can attribute `payout_claimed` amounts to programmes.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WorkItemProgrammeLinked {
+    #[topic]
+    pub work_item_id: BytesN<32>,
+    #[topic]
+    pub programme: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProgrammeRefunded {
+    #[topic]
+    pub donor: Address,
+    #[topic]
+    pub programme: Symbol,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -1063,6 +1190,9 @@ impl IncentivePool {
         {
             return Err(Error::WorkItemAlreadyApproved);
         }
+        .publish(&env);
+        Ok(())
+    }
 
         // Verify attester is currently allowlisted (memoized per call).
         let allowed = match ctx.allowlisted.get(attester.clone()) {
@@ -1077,6 +1207,11 @@ impl IncentivePool {
         if !allowed {
             return Err(Error::AttesterNotAllowlisted);
         }
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalTtl, &seconds);
+        Ok(())
+    }
 
         // Proof of work: an active attestation by this attester.
         let status = AttestationRegistryClient::new(env, &ctx.attestation_registry)
@@ -1097,7 +1232,9 @@ impl IncentivePool {
         let work_item = WorkItem {
             attester: attester.clone(),
             payout_amount,
-            approved_at: env.ledger().timestamp(),
+            programme,
+            endorsements,
+            expires_at,
         };
         env.storage()
             .persistent()
@@ -1373,9 +1510,11 @@ impl IncentivePool {
             Self::release_reservation(&env, work_item.payout_amount)?;
         }
 
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        // The claimant pays to keep replay-protection and cap entries live.
+        Self::bump_persistent(&env, &DataKey::WorkItem(work_item_id.clone()));
+        Self::bump_persistent(&env, &DataKey::WorkItemClaimed(work_item_id.clone()));
+        Self::bump_persistent(&env, &DataKey::AttesterTotalClaimed(attester.clone()));
+        Self::bump_instance(&env);
 
         PayoutClaimed {
             work_item_id,
