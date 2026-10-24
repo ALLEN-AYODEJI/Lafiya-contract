@@ -14,7 +14,10 @@ place, so consumers cannot get a step subtly wrong:
 4. Read the attester's **current** status from `attester-registry`
    (ADR-0006).
 5. Apply revocation, supersession, and maximum-age rules.
-6. Return a single UI-ready verdict with ordered reasons.
+6. Aggregate co-attestations against the record class's quorum policy
+   (distinct attesters only) and surface the count and policy result.
+7. Surface any patient-initiated `Disputed` overlay for the record.
+8. Return a single UI-ready verdict with ordered reasons.
 
 ## Usage
 
@@ -92,7 +95,52 @@ or SEP-1 discovery, where the home domain's `stellar.toml` publishes
 
 Pass `chain: new OfflineChainReader(bundle)` to verify from a previously
 downloaded bundle of attestations and attester states instead of RPC.
-Results then report `source: "offline"`.
+Results then report `source: "offline"` and `staleAsOf` (the snapshot's
+capture time).
+
+Persist bundles with `SnapshotCache` over a pluggable store
+(`MemorySnapshotStore`, `FileSnapshotStore` for Node, `IndexedDbSnapshotStore`
+for browsers). Each saved snapshot is sealed with a SHA-256 hash chain over the
+bundle, ledger, and previous hash (plus an optional publisher signature
+checked by `verifySignature`); the cache refuses ledger rollbacks, and
+corrupt or unknown-schema records load as a miss.
+
+Staleness is governed by `staleness: { defaultMaxSeconds, byRiskClass, onStale }`
+(default: 24 hours, `"fail"`) and `verifyCard(..., { riskClass })`. A stale
+snapshot returns `unavailable` in `"fail"` mode; in `"warn"` mode negative
+verdicts are still reported and only a would-be `verified` becomes
+`unavailable`. See [Snapshot staleness](specs/verification-model.md#snapshot-staleness).
+
+### Router resolution (optional)
+
+`resolveContract(reader, store, routerId, name, { minInterfaceVersion })`
+resolves a contract id through the optional stable-address router
+([ADR-0018](adr/0018-stable-address-registry-router.md)), remembering the
+last-known state and rejecting rollbacks. Direct contract ids in trust anchors
+remain supported.
+
+### Status-list sync
+
+For bandwidth-constrained or offline verifiers, revocation can be checked
+against the compact bitstring status list instead of per-record RPC calls.
+The SDK syncs the list, validates its versioned commitment against the
+signed root, and caches it:
+
+```ts
+import { StatusListSync } from "@lafiya/verifier";
+
+const sync = new StatusListSync({ network: "testnet", trust });
+await sync.refresh();                       // fetch + verify signed root
+const revoked = sync.isRevoked(recordHash); // local bitstring lookup
+```
+
+`refresh()` throws `TrustError` if the signed root does not match the
+fetched segments. Pass `statusList: sync` to `LafiyaVerifier` to use the
+cached list for revocation checks; results then report
+`source: "status-list"`. The list never reveals record identity — indices
+are allocated independently of record hashes — so a status-list hit must
+still be confirmed against `attestation-registry` before showing `revoked`
+to a user.
 
 ## Verdicts
 
@@ -110,66 +158,39 @@ apply, the highest-precedence one wins. All reasons are still returned.
 | `superseded` | A newer attestation exists than the one on the card. |
 | `attester_removed` | The attesting health worker is no longer on the allowlist. |
 | `attester_suspended` | The attesting health worker is currently suspended. |
+| `disputed` | The patient has flagged this record as disputed. |
+| `quorum_not_met` | Fewer distinct attesters than the record class's quorum policy requires. |
 | `expired` | The attestation is older than `maxAgeDays`. |
-| `verified` | Attested by a currently trusted health worker. |
+| `verified` | Attested by a currently trusted health worker (and quorum met, if required). |
 
 Only `verified` should be shown to a user as a pass.
 
-## Localized responder strings
+### Quorum fields
 
-Reason codes such as `attester_suspended` mean nothing to a nurse at 3 a.m.
-`localizeVerdict(verdict, locale)` (and `localizeReason(reason, locale)`;
-reason codes share the verdict keys) returns plain-language text for
-responders in English (`en`), Hausa (`ha`), Yoruba (`yo`), Igbo (`ig`), and
-Nigerian Pidgin (`pcm`):
+When the record class has a quorum policy, the result includes:
 
 ```ts
-const text = await localizeVerdict(result.verdict, "ha-NG");
-// { title, guidance, action, severity: "ok" | "caution" | "stop",
-//   locale, requested, fallback, provenance }
+result.quorum // { required: number, distinctAttesters: number, satisfied: boolean }
 ```
 
-- **Lazy loading.** Each locale catalog is its own module under
-  `dist/*/locales/`, imported on first use, so the core bundle (and its size
-  budget) carries none of them.
-- **Deterministic fallback.** An unsupported locale, a missing entry, or (by
-  default) an entry without clinical review returns the English text with
-  `fallback: true`, so a UI can say so. Pass `{ requireReviewed: false }` only
-  for review tooling; never in production clinical screens.
-- **Provenance.** Every entry records `status` (`reviewed` /
-  `pending_review`), `author`, `reviewer`, and `date`.
-- **Coverage lint.** `pnpm lint:i18n` (CI) fails unless every verdict has an
-  entry in every locale or an explicit waiver in `i18n/waivers.json`
-  (`{ "<locale>": { "<verdict>": "<why>" } }`), flags stale waivers, checks
-  provenance, and rejects reason codes leaking into text.
+`distinctAttesters` counts unique attester addresses only; a repeated
+co-attestation from the same attester does not increase the count. Quorum
+is evaluated after revocation and supersession, so revoking one attester's
+co-attestation can drop a record below quorum and flip the verdict to
+`quorum_not_met`. `quorum` is `undefined` for record classes without a
+policy.
 
-### Review process
+### Disputed records
 
-The Hausa, Yoruba, Igbo, and Pidgin catalogs ship as **drafts**
-(`pending_review`) and are therefore not shown by default. To approve an
-entry, a native speaker of the language with clinical experience (nurse,
-CHW supervisor, or physician):
-
-1. Checks the text against the English source *and* the verdict definition
-   above, for meaning, not word-for-word, and for the action it implies.
-2. Reads it aloud: it must be understood at first hearing.
-3. Commits the change in `src/locales/<locale>.ts` with the entry's
-   `provenance` set to `status: "reviewed"`, their name or handle as
-   `reviewer`, and the review date. The lint rejects `reviewed` without a
-   reviewer. Any later text change resets the entry to `pending_review`.
-
-### Accessibility
-
-- **Reading level.** Target CEFR A2 / US grade 5: short, common words, one
-  idea per sentence, and the next action stated as a command. The lint
-  enforces proxies on the English source (titles of at most 5 words,
-  sentences of at most 15 words, words of at most 12 letters); translations
-  follow the same rules in review.
-- **Icon independence.** The text carries the whole meaning: never rely on a
-  colour, icon, or sound alone. `severity` (`ok`, `caution`, `stop`) is there
-  for screen readers, haptics, and monochrome displays. Only `verified` is
-  `ok`. Always show `title` and `action` together.
-- **No codes.** Do not show `verdict` or reason codes to responders; log them.
+A `disputed` verdict means the patient signed a dispute over the record
+commitment. Disputes are an overlay: they never delete the attestation and
+are cleared only by an attester or admin. The result includes
+`result.dispute // { disputedAt, clearedAt? }` when present. Responder
+guidance: treat `disputed` as a soft failure — do not delete the record,
+but require re-verification by a health worker before relying on it.
+Disputes are a linkability signal (they tie a patient signature to a
+record), so do not log or display dispute metadata beyond what the UI
+needs.
 
 ## Example app
 
@@ -200,5 +221,7 @@ fails if that table and the tested targets drift apart.
   contracts when `LAFIYA_IT_RPC_URL`, `LAFIYA_IT_ATTESTATION_REGISTRY`,
   `LAFIYA_IT_ATTESTER_REGISTRY`, and `LAFIYA_IT_RECORD_HASH` are set, and is
   skipped otherwise.
-- `pnpm size` enforces the gzipped core bundle budget (12 KiB, locale
-  catalogs excluded) in CI.
+- `pnpm size` enforces the gzipped bundle budget (8 KiB) in CI.
+- `test/status-list.test.ts` covers signed-root validation and cached
+  bitstring lookups; `test/quorum.test.ts` covers distinct-attester
+  counting and quorum monotonicity under revocation.

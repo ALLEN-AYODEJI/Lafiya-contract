@@ -68,7 +68,7 @@ jobs:
         run: make wasm-reproducible
 
       - name: Assert provenance metadata in every wasm
-        run: python3 scripts/check_wasm_meta.py --commit "$(git rev-parse HEAD)" target/wasm32v1-none/release/*.wasm
+        run: python3 scripts/check_wasm_meta.py --require-all --commit "$(git rev-parse HEAD)" target/wasm32v1-none/release/*.wasm
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -82,6 +82,28 @@ jobs:
           python3 scripts/check_manifest_compatibility.py \
             release-manifest.json \
             docs/release-manifest/examples/lafiya-web.requirements.json
+
+      - name: Assert incentive-pool artifact in release manifest
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("release-manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+
+          artifacts = manifest.get("artifacts", manifest.get("contracts", []))
+          names = {
+              a.get("name") or a.get("contract") or a.get("id")
+              for a in artifacts
+              if isinstance(a, dict)
+          }
+          if "incentive-pool" not in names:
+              sys.exit(
+                  "release manifest is missing the incentive-pool artifact; "
+                  f"found: {sorted(n for n in names if n)}"
+              )
+          PY
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

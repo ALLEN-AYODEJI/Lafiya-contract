@@ -28,17 +28,18 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node scripts/mark-cjs.mjs",
+    "build:wasm": "node scripts/build-wasm.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "size": "node scripts/check-size.mjs",
-    "lint": "eslint .",
-    "lint:i18n": "node scripts/check-i18n.mjs",
-    "check:package": "publint --strict && rm -rf .pack && pnpm pack --pack-destination .pack && attw .pack/*.tgz",
-    "smoke": "node scripts/smoke-packed.mjs"
+    "size:wasm": "node scripts/check-wasm-size.mjs",
+    "size:report": "node scripts/check-size.mjs --report && node scripts/check-wasm-size.mjs --report",
+    "ci:size": "node scripts/check-size.mjs --report && node scripts/check-wasm-size.mjs --report"
   },
   "dependencies": {
-    "@lafiya/attestation-registry": "^0.1.0",
-    "@lafiya/attester-registry": "^0.1.0",
+    "@lafiya/attestation-registry": "file:../../bindings/attestation-registry",
+    "@lafiya/attester-registry": "file:../../bindings/attester-registry",
+    "@lafiya/qr-wasm": "file:../../bindings/qr-wasm",
     "buffer": "6.0.3"
   },
   "devDependencies": {

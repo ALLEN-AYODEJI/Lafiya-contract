@@ -30,6 +30,7 @@
 # Operate
 
 - [Runbook: contract upgrade](runbooks/contract-upgrade.md)
+- [Runbook: incentive-pool balance drift](runbooks/incentive-pool-drift.md)
 - [Runbook: RPC outage recovery](runbooks/rpc-outage-recovery.md)
 - [CLI reference: lafiya-cli](reference/cli/lafiya-cli.md)
 - [CLI reference: cargo xtask](reference/cli/xtask.md)
@@ -51,6 +52,7 @@
   - [ADR-0010: Release manifest and compatibility](adr/0010-release-manifest-and-compatibility.md)
   - [ADR-0011: RPC failover and transaction recovery](adr/0011-rpc-provider-failover-and-transaction-recovery.md)
   - [ADR-0012: Multi-jurisdiction deployment topology](adr/0012-multi-jurisdiction-deployment-topology.md)
+  - [ADR-0018: Incentive pool approver quorum](adr/0018-incentive-pool-approver-quorum.md)
   - [ADR template](adr/0000-template.md)
 - [Spike: contract interface conformance](spikes/0137-contract-interface-conformance.md)
 
