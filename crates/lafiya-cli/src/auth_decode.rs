@@ -42,7 +42,11 @@ fn param_names(function: &str) -> Option<&'static [&'static str]> {
         "initialize" => &["admin", "attester_registry"],
         "propose_admin" => &["new_admin"],
         "set_attester_registry" => &["new_registry"],
-        "attest" => &["attester", "record_hash"],
+        "attest" => &["attester", "patient", "record_hash"],
+        "attest_versioned" => &["attester", "patient", "record_hash", "commitment_version"],
+        "attest_version" => &["attester", "patient", "record_hash", "previous_record_hash"],
+        "anchor_batch" => &["attester", "root", "leaf_count"],
+        "withdraw_attestation" => &["attester", "record_hash"],
         "revoke_attestation" | "get_attestation" | "get_attestation_history" => &["record_hash"],
         "add_attester"
         | "remove_attester"
@@ -764,6 +768,25 @@ mod tests {
         assert_eq!(json["invocation"]["function"], "add_attester");
         assert_eq!(json["invocation"]["args"][0]["name"], "attester");
         assert_eq!(json["invocation"]["args"][0]["type"], "Address");
+    }
+
+    #[test]
+    fn attest_decoding_names_every_bound_argument() {
+        let args = vec![
+            ScVal::Address(contract(0x05)),
+            ScVal::Address(contract(0x06)),
+            ScVal::Bytes(ScBytes([0x11; 32].to_vec().try_into().unwrap())),
+        ];
+        let decoded =
+            decode_entry(&entry(call(contract(0x01), "attest", args, vec![])), &ctx()).unwrap();
+        let json = serde_json::to_value(&decoded).unwrap();
+        let names: Vec<_> = json["invocation"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["attester", "patient", "record_hash"]);
     }
 
     #[test]

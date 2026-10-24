@@ -24,6 +24,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from check_wasm_meta import meta_digest, read_meta
+
 Json = dict[str, Any]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,9 +63,10 @@ def storage_schema_version(crate_dir: str) -> int | None:
 def wasm_info(stem: str) -> Json:
     wasm_path = WASM_DIR / f"{stem}.wasm"
     if not wasm_path.is_file():
-        return {"target": "wasm32v1-none", "optimize": False, "sha256": None, "size_bytes": None}
+        return {"target": "wasm32v1-none", "optimize": False, "sha256": None, "size_bytes": None, "meta_digest": None}
     data = wasm_path.read_bytes()
     return {
+        "meta_digest": meta_digest(read_meta(data)) if data[:4] == b"\0asm" else None,
         "target": "wasm32v1-none",
         "optimize": False,
         "sha256": hashlib.sha256(data).hexdigest(),

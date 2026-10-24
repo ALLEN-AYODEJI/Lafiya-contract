@@ -49,7 +49,29 @@ or SEP-1 discovery, where the home domain's `stellar.toml` publishes
 
 Pass `chain: new OfflineChainReader(bundle)` to verify from a previously
 downloaded bundle of attestations and attester states instead of RPC.
-Results then report `source: "offline"`.
+Results then report `source: "offline"` and `staleAsOf` (the snapshot's
+capture time).
+
+Persist bundles with `SnapshotCache` over a pluggable store
+(`MemorySnapshotStore`, `FileSnapshotStore` for Node, `IndexedDbSnapshotStore`
+for browsers). Each saved snapshot is sealed with a SHA-256 hash chain over the
+bundle, ledger, and previous hash (plus an optional publisher signature
+checked by `verifySignature`); the cache refuses ledger rollbacks, and
+corrupt or unknown-schema records load as a miss.
+
+Staleness is governed by `staleness: { defaultMaxSeconds, byRiskClass, onStale }`
+(default: 24 hours, `"fail"`) and `verifyCard(..., { riskClass })`. A stale
+snapshot returns `unavailable` in `"fail"` mode; in `"warn"` mode negative
+verdicts are still reported and only a would-be `verified` becomes
+`unavailable`. See [Snapshot staleness](specs/verification-model.md#snapshot-staleness).
+
+### Router resolution (optional)
+
+`resolveContract(reader, store, routerId, name, { minInterfaceVersion })`
+resolves a contract id through the optional stable-address router
+([ADR-0018](adr/0018-stable-address-registry-router.md)), remembering the
+last-known state and rejecting rollbacks. Direct contract ids in trust anchors
+remain supported.
 
 ### Status-list sync
 

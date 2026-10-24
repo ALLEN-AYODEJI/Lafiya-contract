@@ -16,6 +16,26 @@ import {
 import type { TrustAnchors } from "./trust.js";
 import { VERDICTS, verdictOf, type Reason, type Verdict } from "./verdict.js";
 
+/**
+ * How old a snapshot-backed read may be. Applies only to readers that report
+ * `snapshotAt`; live RPC reads are never stale.
+ */
+export interface StalenessPolicy {
+  /** Maximum snapshot age in seconds when `riskClass` has no entry. */
+  defaultMaxSeconds: number;
+  /** Per-risk-class overrides, e.g. `{ emergency: 604800, routine: 86400 }`. */
+  byRiskClass?: Record<string, number>;
+  /**
+   * `"fail"`: a stale snapshot yields `unavailable` whatever it says.
+   * `"warn"`: negative verdicts are still reported (they err on the safe
+   * side); only a would-be `verified` becomes `unavailable`.
+   */
+  onStale: "fail" | "warn";
+}
+
+/** One day, hard-fail: the default for snapshot-backed readers. */
+export const DEFAULT_STALENESS: StalenessPolicy = { defaultMaxSeconds: 86_400, onStale: "fail" };
+
 export interface VerifierOptions {
   /** Network this verifier accepts cards for, e.g. `"testnet"`. */
   network: string;
@@ -31,6 +51,8 @@ export interface VerifierOptions {
   chain?: ChainReader;
   /** Clock override (tests, offline replays). */
   now?: () => Date;
+  /** Snapshot staleness limits; defaults to {@link DEFAULT_STALENESS}. */
+  staleness?: StalenessPolicy;
 }
 
 export interface VerifyOptions {
@@ -42,6 +64,8 @@ export interface VerifyOptions {
   disclosedFields?: readonly FieldValue[];
   /** Reject attestations older than this many days. */
   maxAgeDays?: number;
+  /** Selects the {@link StalenessPolicy.byRiskClass} limit. */
+  riskClass?: string;
 }
 
 export interface VerificationResult {
@@ -72,6 +96,8 @@ export interface VerificationResult {
   statusList?: { revoked: boolean; version: number };
   checkedAt: Date;
   source: "rpc" | "offline";
+  /** When the snapshot behind an offline verdict was captured. */
+  staleAsOf?: Date;
 }
 
 const DAY_SECONDS = 86_400n;
@@ -103,7 +129,21 @@ export class LafiyaVerifier {
   async verifyCard(qrPayload: string, opts: VerifyOptions = {}): Promise<VerificationResult> {
     const checkedAt = this.now();
     const reasons: Reason[] = [];
+    const policy = this.options.staleness ?? DEFAULT_STALENESS;
+    const snapshotAt = this.chain.snapshotAt;
+    const maxSeconds =
+      (opts.riskClass !== undefined ? policy.byRiskClass?.[opts.riskClass] : undefined) ??
+      policy.defaultMaxSeconds;
+    const age = snapshotAt === undefined ? 0 : Math.floor(checkedAt.getTime() / 1000) - snapshotAt;
+    // A snapshot dated in the future is as untrustworthy as an old one.
+    const stale = snapshotAt !== undefined && (age > maxSeconds || age < 0);
     const done = (extra: Partial<VerificationResult> = {}): VerificationResult => {
+      if (stale && (policy.onStale === "fail" || verdictOf(reasons) === "verified")) {
+        reasons.push({
+          code: "unavailable",
+          message: `offline snapshot from ${new Date(snapshotAt * 1000).toISOString()} is older than the ${maxSeconds}s limit`,
+        });
+      }
       const ordered = [...reasons].sort(
         (a, b) => VERDICTS.indexOf(a.code) - VERDICTS.indexOf(b.code),
       );
@@ -116,6 +156,7 @@ export class LafiyaVerifier {
             : ordered,
         checkedAt,
         source: this.chain.source,
+        ...(snapshotAt !== undefined ? { staleAsOf: new Date(snapshotAt * 1000) } : {}),
         ...extra,
       };
     };

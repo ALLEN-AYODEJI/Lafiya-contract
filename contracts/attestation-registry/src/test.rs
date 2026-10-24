@@ -360,6 +360,33 @@ fn attest_accepts_attester_authorization_entry_for_sponsored_submission() {
 }
 
 #[test]
+fn attester_auth_for_hash_a_cannot_authorize_hash_b() {
+    let (env, client, attester_registry, admin) = setup();
+    let attester = enroll(&env, &attester_registry, &admin);
+    let patient = Address::generate(&env);
+    let hash_a = hash(&env, 41);
+    let hash_b = hash(&env, 42);
+    let expires_at = env.ledger().timestamp() + 10_000;
+    client.consent_attestation(&patient, &attester, &hash_a, &expires_at);
+    client.consent_attestation(&patient, &attester, &hash_b, &expires_at);
+
+    // The attester signs only for hash A.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attester,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "attest",
+            args: (attester.clone(), patient.clone(), hash_a.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    assert!(client.try_attest(&attester, &patient, &hash_b).is_err());
+    assert_eq!(client.get_attestation(&hash_b), None);
+    assert!(client.try_attest(&attester, &patient, &hash_a).is_ok());
+}
+
+#[test]
 fn attest_before_initialize_fails() {
     // A contract registered without constructor arguments has no configuration.
     let env = Env::default();
