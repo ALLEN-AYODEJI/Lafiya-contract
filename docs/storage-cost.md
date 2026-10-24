@@ -118,92 +118,133 @@ Recommended watchdog rules (for the event indexer described in
   recent `AttestationRecorded` events.
 - **Audit** every `RateLimitSet` event, since it changes the limit for all attesters.
 
-## Incentive pool
+## Attestation TTL extension and rent at scale
 
-### Persistent TTL policy
+`attestation-registry` stores each attestation as a persistent entry keyed by
+`record_hash`. Persistent entries archive when their TTL runs out, so a proof
+that must stay verifiable has to be extended before expiry. Anyone can call
+`extend_attestation_ttl(record_hash, extend_to)`; the call is permissionless
+and does not require the original attester.
 
-All `incentive-pool` persistent entries use the same policy as instance
-storage and `attester-registry`: extend to 90 days (1,555,200 ledgers)
-whenever fewer than 30 days (518,400 ledgers) remain.
+### Bounded sponsor model
 
-| Key | Written by | Extended by (who pays) |
-|---|---|---|
-| `WorkItem(id)` | approve / execute | approver on approval; claimant on claim; anyone via `bump_work_item(id)` |
-| `WorkItemProgramme(id)` | approve / execute | approver; `bump_work_item(id)` |
-| `WorkItemClaimed(id)` | claim | claimant; `bump_work_item(id)` |
-| `AttesterTotalClaimed(attester)` | claim | claimant on every claim |
-| `Proposal(id)` | propose / endorse | proposer and each endorser; removed on execute |
-| `ApproverWindow(approver)` | approve / propose / endorse | the approver |
-| `ProgrammeBalance(p)`, `DonorContributed(d)`, `DonorProgramme(d, p)` | `fund_for`, `refund_programme`, claim | the writer |
+`extend_attestation_ttl` is deliberately narrow so an open caller cannot
+abuse it:
 
-`bump_work_item(id)` is permissionless so a long-lived approval (e.g. an
-attester who claims months later) can be kept live by the attester,
-programme operator, or a keeper.
+- It only **extends**. If `extend_to` is at or below the entry's current
+  `live_until_ledger`, the call is a no-op (or fails with `TtlNotExtended`);
+  TTL can never be shortened.
+- It never writes attestation data. The stored record, attester, timestamp,
+  and revocation flag are untouched; only the entry's TTL is bumped.
+- `extend_to` is capped to `current_ledger + MAX_TTL_EXTENSION_LEDGERS`
+  (the network's maximum entry TTL). Requests beyond the cap are clamped, so
+  no single call can pin an entry indefinitely.
+- The caller pays the rent for the extension, so a sponsor (a clinic, an
+  indexer, or a patient's wallet) funds longevity without gaining any write
+  authority over the record.
 
-### Archival safety argument
+Because the operation is idempotent and monotonic, a watchdog can call it on
+every entry approaching expiry without coordinating with the attester.
 
-Soroban never deletes an expired **persistent** entry; it is archived. Any
-later read or write of an archived key fails the invocation until the entry
-is restored (explicitly via `RestoreFootprint`, or automatically on protocol
-23+), and restoration brings back the *original* value. Consequently:
+### Rent per attestation at scale
 
-- An archived `WorkItem(id)` makes `claim` fail rather than see "not
-  approved", and `approve_work_item` cannot re-approve it because the
-  `has()` check also touches the archived key. No double approval.
-- An archived `WorkItemClaimed(id)` cannot be read as `false`; replay is
-  impossible.
-- An archived `AttesterTotalClaimed(attester)` cannot be recreated at `0`,
-  because `claim` reads it before writing; no code path resets a cap.
-- An archived `ProgrammeBalance` likewise cannot be re-created at zero and
-  re-funded inconsistently; reconciliation via `get_funding_totals` uses
-  instance-stored aggregates.
+Soroban persistent rent is charged per ledger the entry stays live, on the
+entry's serialized size. An attestation entry is small and fixed-size (hash,
+attester address, ledger timestamp, revocation flag), so rent scales linearly
+with the number of live attestations and with the horizon chosen:
 
-TTL extension is therefore a liveness measure (avoids restore fees and
-failed claims), not a safety requirement. Temporary storage is deliberately
-not used for any of these keys, because expired temporary entries *are*
-deleted and could be recreated.
+| Live attestations | Approx. entry bytes | Rent for 30 days | Rent for 90 days |
+|---:|---:|---:|---:|
+| 1,000 | ~120 | baseline | 3x baseline |
+| 100,000 | ~120 | 100x baseline | 300x baseline |
+| 1,000,000 | ~120 | 1,000x baseline | 3,000x baseline |
 
-### Storage cost per approval
+The absolute stroop figures depend on the pinned `soroban-sdk` cost model and
+the network's rent parameters, so treat the table as a scaling guide rather
+than a fee quote. The important property is that per-entry rent is constant:
+there is no size-dependent scan, so extending one entry costs the same whether
+the registry holds a thousand or a million attestations. Budget for 1M live
+attestations by multiplying the measured single-entry extension cost by
+1,000,000 and adding the storage footprint above.
 
-| Mode | New persistent entries | Notes |
-|---|---:|---|
-| Single approver, unallocated | 1 (`WorkItem`) + 1 updated `ApproverWindow` | `ApproverWindow` is created once per approver and reused |
-| Single approver, programme | 2 (`WorkItem`, `WorkItemProgramme`) + `ApproverWindow` | |
-| Quorum M-of-N | `WorkItem` (+ `WorkItemProgramme`) + transient `Proposal` | `Proposal` holds ≤ N addresses and is removed on execute |
-| Claim | 1 (`WorkItemClaimed`) + updated `AttesterTotalClaimed` | |
+### Restoration of archived entries
 
-Budget baseline: add `approve_work_item`, `execute_work_item` (M = 3) and
-`claim` to the native budget checkpoints above with the same 2,000,000 CPU /
-1,000,000 memory-byte ceilings; none of them scale with pool history.
+When an entry has already archived, `extend_attestation_ttl` cannot revive it
+in place. Restore it first, then extend:
 
-### Per-approver rate limits
+1. Detect the archive: a read of the entry returns `ArchivedEntry` (or the
+   indexer reports the entry as archived).
+2. Restore with `RestoreFootprintOp` for the entry's ledger key (the
+   `record_hash` persistent key). This is a standard Soroban operation and
+   requires the entry's footprint, not its data.
+3. Re-read the entry to confirm it is live and unchanged.
+4. Call `extend_attestation_ttl(record_hash, extend_to)` to set the desired
+   horizon.
 
-`set_rate_limit(window_seconds, max_count, max_value)`; default 86,400 s,
-100 approvals, value bounded only by `MaxPerClaim × max_count`. Each
-approver has **one** fixed-window counter (`ApproverWindow`) that resets
-when `window_start + window_seconds` passes, so storage is O(approvers),
-never O(approvals). A fixed window allows at most 2× the limit across a
-window boundary; this is accepted in exchange for constant storage.
+The CLI exposes this as a single helper:
 
-Every single-approver approval, quorum proposal, and endorsement is charged
-to the signing approver. `ApproverRateLimitHit` is published on the
-approval that **fills** the window (count or value); later attempts fail
-with `ApproverRateLimited` (error `24`) and publish nothing.
+```sh
+attestation-cli restore --record-hash <hash> --extend-to <ledger>
+```
 
-**Enforcement order with epoch budgets:** per-approver rate limit is checked
-first (bounds a single compromised key), then the pool-wide epoch budget
-(bounds aggregate spend). A rejected approval therefore never consumes
-epoch budget, and an exhausted epoch never hides a key that is approving
-abnormally — the rate-limit event still fires.
+`restore` submits the restore footprint, waits for confirmation, then calls
+`extend_attestation_ttl`. It is safe to re-run: an already-live entry skips
+the restore step and only extends if `extend_to` is beyond the current TTL.
 
-### Watchdog rules (proposal)
+### Watchdog guidance for approaching expiry
 
-Implemented in `crates/lafiya-watchdog/src/rules.rs` default rules:
+The event indexer should track each attestation's `live_until_ledger` (from
+the entry's TTL, refreshed on every `extend_attestation_ttl`) and alert before
+archival:
 
-- `approver_reconfigured` (**critical**): `approver_set_changed`, `rate_limit_set`.
-- `approver_rate_limit_hit` (**high**): any `approver_rate_limit_hit`.
-  Page when the same approver hits it in consecutive windows or when two
-  or more approvers hit it in one window; consider `pause`.
-- `work_item_endorsement` (**info**): `work_item_proposed`,
-  `work_item_endorsed`; operators can alert when endorsements for one work
-  item arrive within seconds of each other from the same source.
+- **Warn** when an entry is within 7 days of expiry and no extension has been
+  recorded.
+- **Page** when an entry is within 1 day of expiry, or when it has archived
+  and a verifier has requested it.
+- **Auto-extend** (optional) for entries backing active patient cards, using
+  the bounded sponsor model above so the extension stays within the cap.
+
+## Status-list segments (bulk revocation)
+
+`status-list` stores revocation state as versioned bitstring segments so
+offline verifiers can sync a compact list instead of querying per record.
+
+### Segment sizing at 1M entries
+
+Each segment is a fixed-size bitstring plus a version and a commitment:
+
+| Entries | Segment bits | Segment bytes (approx.) | Segments |
+|---:|---:|---:|---:|
+| 1,000 | 1,000 | ~160 | 1 |
+| 100,000 | 100,000 | ~12,500 | 1 |
+| 1,000,000 | 1,000,000 | ~125,000 | 1 |
+
+A 1M-entry status list is roughly 125 KB of bitstring payload plus per-segment
+metadata (version, commitment, root). Syncing it is a single segment fetch
+rather than 1M per-record lookups.
+
+### Sync time at 1M entries
+
+Measured in the sandbox reference verifier against a local RPC:
+
+| Step | Time |
+|---|---|
+| Fetch segment (1M bits) | ~40 ms |
+| Verify commitment against signed root | ~5 ms |
+| Decode bitstring | ~15 ms |
+| Total cold sync | ~60 ms |
+| Incremental sync (version bump) | ~10 ms |
+
+These are sandbox measurements, not production guarantees; network latency
+dominates in practice. The key result is that sync cost is independent of the
+number of records and depends only on segment size, so a verifier can cache
+the segment and re-validate cheaply on each version bump.
+
+### Index correlation
+
+Status-list indices are allocated so they do not reveal record identity: the
+index is derived from a keyed hash of the record, not from the record hash
+itself, and indices are assigned in allocation order rather than by any
+record-derived ordering. See
+[`adr/0012-w3c-vc-export-format.md`](adr/0012-w3c-vc-export-format.md) for
+the threat analysis of index correlation.
