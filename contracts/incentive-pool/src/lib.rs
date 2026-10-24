@@ -11,7 +11,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
-    Address, BytesN, Env,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, Map, Vec,
 };
 
 /// The subset of the `attester-registry` contract this crate calls.
@@ -24,7 +24,53 @@ pub trait AttesterRegistryInterface {
     fn is_attester(env: Env, attester: Address) -> bool;
 }
 
+/// Per-attester verification status as reported by `attestation-registry`.
+/// Mirrors the registry's `AttesterAttestationStatus`; variant names must
+/// stay identical because unit enum variants serialize by name.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttesterAttestationStatus {
+    NeverAttested,
+    Active,
+    Withdrawn,
+    Revoked,
+}
+
+/// The subset of the `attestation-registry` contract this crate calls to
+/// prove a work item is backed by a live attestation. See ADR 0002.
+#[contractclient(name = "AttestationRegistryClient")]
+pub trait AttestationRegistryInterface {
+    fn get_attester_attestation_status(
+        env: Env,
+        record_hash: BytesN<32>,
+        attester: Address,
+    ) -> AttesterAttestationStatus;
+}
+
 const SCHEMA_VERSION: u32 = 1;
+
+/// Domain separator for work-item id derivation (see `derive_work_item_id`).
+const WORK_ITEM_DOMAIN: &[u8] = b"LAFIYA-WORK-ITEM-v1";
+
+/// Maximum number of items accepted by `approve_work_items`.
+///
+/// Each item writes one persistent `WorkItem` entry; the batch additionally
+/// writes the instance entry and one epoch counter (18 writes at cap). Each
+/// item typically reads 4 entries (84 reads at cap with distinct attesters),
+/// under the per-transaction read/write entry limits. See
+/// `budgets/incentive-pool-batch-approval.json` for the footprint analysis.
+pub const MAX_BATCH_APPROVALS: u32 = 16;
+
+/// Base for the index-bearing error returned by `approve_work_items`:
+/// `BATCH_ERROR_BASE + index * 100 + inner_error_code`.
+pub const BATCH_ERROR_BASE: u32 = 10_000;
+
+/// Delay before a newly designated payout address takes effect (48 hours).
+/// Gives an attester time to notice and suspend a takeover of their key.
+pub const PAYOUT_ADDRESS_DELAY: u64 = 48 * 60 * 60;
+
+/// Delay before a proposed epoch-budget change can be applied (48 hours).
+pub const EPOCH_CONFIG_DELAY: u64 = 48 * 60 * 60;
 
 /// Instance storage TTL policy:
 /// - Threshold: 30 days (17280 * 30 = 518400 ledgers)
@@ -71,6 +117,56 @@ enum DataKey {
     WorkItemClaimed(BytesN<32>),
     /// Cumulative amount paid to a given attester across all claims.
     AttesterTotalClaimed(Address),
+    /// The deployed `attestation-registry` consulted on every approval.
+    AttestationRegistry,
+    /// Payout recipient binding for an attester (`PayoutBinding`).
+    PayoutBinding(Address),
+    /// Active epoch budget configuration (`EpochConfig`).
+    EpochConfig,
+    /// Proposed epoch budget configuration awaiting its delay.
+    PendingEpochConfig,
+    /// Amount approved in the epoch starting at the given timestamp.
+    EpochApproved(u64),
+}
+
+/// One entry of an `approve_work_items` batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalInput {
+    pub record_hash: BytesN<32>,
+    pub attester: Address,
+    pub payout_amount: i128,
+}
+
+/// Payout recipient for an attester. `pending` replaces `current` once
+/// `effective_at` has passed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutBinding {
+    pub current: Option<Address>,
+    pub pending: Option<Address>,
+    pub effective_at: u64,
+}
+
+/// Period budget bounding total approvals per epoch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpochConfig {
+    /// Epoch length in seconds. Epochs start at multiples of this value.
+    pub epoch_length: u64,
+    /// Maximum total `payout_amount` approved within one epoch.
+    pub epoch_budget: i128,
+    /// When true, the unused budget of the immediately preceding epoch is
+    /// added to the current one (one epoch of carry, never compounding).
+    pub rollover: bool,
+}
+
+/// An epoch config change waiting for `EPOCH_CONFIG_DELAY`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingEpochConfig {
+    pub config: EpochConfig,
+    pub effective_at: u64,
 }
 
 /// On-chain record of an approved work item.
@@ -135,7 +231,43 @@ pub struct PayoutClaimed {
     pub work_item_id: BytesN<32>,
     #[topic]
     pub attester: Address,
+    pub recipient: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutAddressScheduled {
+    #[topic]
+    pub attester: Address,
+    pub recipient: Address,
+    pub effective_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AttestationRegistryRepointed {
+    #[topic]
+    pub previous: Option<Address>,
+    #[topic]
+    pub new: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EpochConfigProposed {
+    pub epoch_length: u64,
+    pub epoch_budget: i128,
+    pub rollover: bool,
+    pub effective_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EpochConfigApplied {
+    pub epoch_length: u64,
+    pub epoch_budget: i128,
+    pub rollover: bool,
 }
 
 #[contractevent]
@@ -198,6 +330,23 @@ pub enum Error {
     TransferFailed = 14,
     /// A non-positive amount was provided where a positive amount is required.
     NonPositiveAmount = 15,
+    /// No attestation-registry has been configured.
+    AttestationRegistryNotSet = 16,
+    /// The attester has no active (unrevoked, unwithdrawn) attestation for
+    /// the record hash.
+    AttestationNotActive = 17,
+    /// The approval would exceed the current epoch budget.
+    EpochBudgetExceeded = 18,
+    /// The batch is empty or larger than `MAX_BATCH_APPROVALS`.
+    BatchSizeInvalid = 19,
+    /// The same work item appears twice in one batch.
+    DuplicateWorkItemInBatch = 20,
+    /// No pending epoch configuration exists.
+    NoPendingEpochConfig = 21,
+    /// The admin delay for the pending change has not elapsed.
+    DelayNotElapsed = 22,
+    /// Epoch length or budget is invalid (zero / negative).
+    InvalidEpochConfig = 23,
 }
 
 // ──────────────────────────── Contract ────────────────────────────
@@ -542,23 +691,109 @@ impl IncentivePool {
 
     // ── Approver: approve work items ──
 
-    /// Approve a work item for payout. Requires the approver's auth.
-    /// The `payout_amount` must be positive and must not exceed the
-    /// per-claim cap. The attester must be allowlisted.
+    /// Derive the work-item id for an attestation:
+    /// `sha256("LAFIYA-WORK-ITEM-v1" || record_hash || attester.to_xdr())`.
+    /// One attestation (record hash + attester) maps to exactly one work
+    /// item, so an attestation can back at most one payout.
+    pub fn derive_work_item_id(env: Env, record_hash: BytesN<32>, attester: Address) -> BytesN<32> {
+        let mut preimage = Bytes::from_slice(&env, WORK_ITEM_DOMAIN);
+        preimage.append(&Bytes::from(record_hash));
+        preimage.append(&attester.to_xdr(&env));
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Approve the work item backed by `attester`'s attestation of
+    /// `record_hash`. Requires the approver's auth. The attestation must be
+    /// active in the attestation-registry, the attester allowlisted, the
+    /// amount positive, within the per-claim cap and the epoch budget.
+    /// Returns the derived work-item id.
     pub fn approve_work_item(
         env: Env,
-        work_item_id: BytesN<32>,
+        record_hash: BytesN<32>,
         attester: Address,
         payout_amount: i128,
-    ) -> Result<(), Error> {
+    ) -> Result<BytesN<32>, Error> {
         Self::approver(&env)?.require_auth();
         Self::require_not_paused(&env)?;
+
+        let mut ctx = ApprovalCtx::load(&env)?;
+        let id = Self::approve_one(
+            &env,
+            &mut ctx,
+            ApprovalInput {
+                record_hash,
+                attester,
+                payout_amount,
+            },
+        )?;
+        ctx.commit(&env);
+        Ok(id)
+    }
+
+    /// Approve up to `MAX_BATCH_APPROVALS` work items in one transaction.
+    /// All-or-nothing: the first invalid entry aborts the whole batch with
+    /// contract error `BATCH_ERROR_BASE + index * 100 + inner_code`.
+    /// The approver is authorized once and each distinct attester is
+    /// looked up in the attester-registry once. One `WorkItemApproved`
+    /// event is emitted per item. Items are charged against the epoch
+    /// budget cumulatively, in order.
+    pub fn approve_work_items(
+        env: Env,
+        items: Vec<ApprovalInput>,
+    ) -> Result<Vec<BytesN<32>>, soroban_sdk::Error> {
+        Self::approver(&env)?.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if items.is_empty() || items.len() > MAX_BATCH_APPROVALS {
+            return Err(Error::BatchSizeInvalid.into());
+        }
+
+        let mut ctx = ApprovalCtx::load(&env)?;
+        let mut seen: Map<BytesN<32>, ()> = Map::new(&env);
+        let mut ids = Vec::new(&env);
+        for (index, item) in items.iter().enumerate() {
+            let fail = |e: Error| {
+                soroban_sdk::Error::from_contract_error(
+                    BATCH_ERROR_BASE + (index as u32) * 100 + e as u32,
+                )
+            };
+            let id = Self::derive_work_item_id(
+                env.clone(),
+                item.record_hash.clone(),
+                item.attester.clone(),
+            );
+            if seen.contains_key(id.clone()) {
+                return Err(fail(Error::DuplicateWorkItemInBatch));
+            }
+            seen.set(id, ());
+            ids.push_back(Self::approve_one(&env, &mut ctx, item).map_err(fail)?);
+        }
+        ctx.commit(&env);
+        Ok(ids)
+    }
+
+    fn approve_one(
+        env: &Env,
+        ctx: &mut ApprovalCtx,
+        item: ApprovalInput,
+    ) -> Result<BytesN<32>, Error> {
+        let ApprovalInput {
+            record_hash,
+            attester,
+            payout_amount,
+        } = item;
 
         if payout_amount <= 0 {
             return Err(Error::NonPositiveAmount);
         }
+        if payout_amount > ctx.max_per_claim {
+            return Err(Error::PayoutCapExceeded);
+        }
 
-        // Reject duplicate approval.
+        let work_item_id =
+            Self::derive_work_item_id(env.clone(), record_hash.clone(), attester.clone());
+
+        // Reject duplicate approval (and therefore attestation reuse).
         if env
             .storage()
             .persistent()
@@ -567,21 +802,33 @@ impl IncentivePool {
             return Err(Error::WorkItemAlreadyApproved);
         }
 
-        // Verify attester is currently allowlisted.
-        let registry_id = Self::attester_registry(&env)?;
-        let registry = AttesterRegistryClient::new(&env, &registry_id);
-        if !registry.is_attester(&attester) {
+        // Verify attester is currently allowlisted (memoized per call).
+        let allowed = match ctx.allowlisted.get(attester.clone()) {
+            Some(v) => v,
+            None => {
+                let v =
+                    AttesterRegistryClient::new(env, &ctx.attester_registry).is_attester(&attester);
+                ctx.allowlisted.set(attester.clone(), v);
+                v
+            }
+        };
+        if !allowed {
             return Err(Error::AttesterNotAllowlisted);
         }
 
-        // Enforce per-claim cap at approval time.
-        let max_per_claim: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxPerClaim)
-            .unwrap_or(i128::MAX);
-        if payout_amount > max_per_claim {
-            return Err(Error::PayoutCapExceeded);
+        // Proof of work: an active attestation by this attester.
+        let status = AttestationRegistryClient::new(env, &ctx.attestation_registry)
+            .get_attester_attestation_status(&record_hash, &attester);
+        if status != AttesterAttestationStatus::Active {
+            return Err(Error::AttestationNotActive);
+        }
+
+        // Epoch budget.
+        if let Some(epoch) = ctx.epoch.as_mut() {
+            if epoch.approved + payout_amount > epoch.available {
+                return Err(Error::EpochBudgetExceeded);
+            }
+            epoch.approved += payout_amount;
         }
 
         let work_item = WorkItem {
@@ -589,29 +836,177 @@ impl IncentivePool {
             payout_amount,
             approved_at: env.ledger().timestamp(),
         };
-
         env.storage()
             .persistent()
             .set(&DataKey::WorkItem(work_item_id.clone()), &work_item);
 
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-
         WorkItemApproved {
-            work_item_id,
+            work_item_id: work_item_id.clone(),
             attester,
             payout_amount,
         }
-        .publish(&env);
+        .publish(env);
 
+        Ok(work_item_id)
+    }
+
+    // ── Admin: attestation registry ──
+
+    /// Set or repoint the attestation-registry used as proof of work.
+    /// Requires admin auth; evented like `set_attester_registry`.
+    pub fn set_attestation_registry(env: Env, new_registry: Address) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        if new_registry == env.current_contract_address() {
+            return Err(Error::InvalidRegistryWiring);
+        }
+        let previous: Option<Address> = env.storage().instance().get(&DataKey::AttestationRegistry);
+        env.storage()
+            .instance()
+            .set(&DataKey::AttestationRegistry, &new_registry);
+        AttestationRegistryRepointed {
+            previous,
+            new: new_registry,
+        }
+        .publish(&env);
         Ok(())
+    }
+
+    pub fn get_attestation_registry(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AttestationRegistry)
+    }
+
+    // ── Admin: epoch budgets ──
+
+    /// Propose a new epoch budget. Takes effect via `apply_epoch_config`
+    /// once `EPOCH_CONFIG_DELAY` has elapsed. Requires admin auth.
+    pub fn propose_epoch_config(
+        env: Env,
+        epoch_length: u64,
+        epoch_budget: i128,
+        rollover: bool,
+    ) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        if epoch_length == 0 || epoch_budget < 0 {
+            return Err(Error::InvalidEpochConfig);
+        }
+        let effective_at = env.ledger().timestamp() + EPOCH_CONFIG_DELAY;
+        let pending = PendingEpochConfig {
+            config: EpochConfig {
+                epoch_length,
+                epoch_budget,
+                rollover,
+            },
+            effective_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingEpochConfig, &pending);
+        EpochConfigProposed {
+            epoch_length,
+            epoch_budget,
+            rollover,
+            effective_at,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply the pending epoch budget after its delay. Requires admin auth.
+    pub fn apply_epoch_config(env: Env) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        let pending: PendingEpochConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingEpochConfig)
+            .ok_or(Error::NoPendingEpochConfig)?;
+        if env.ledger().timestamp() < pending.effective_at {
+            return Err(Error::DelayNotElapsed);
+        }
+        let c = pending.config;
+        env.storage().instance().set(&DataKey::EpochConfig, &c);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingEpochConfig);
+        EpochConfigApplied {
+            epoch_length: c.epoch_length,
+            epoch_budget: c.epoch_budget,
+            rollover: c.rollover,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_epoch_config(env: Env) -> Option<EpochConfig> {
+        env.storage().instance().get(&DataKey::EpochConfig)
+    }
+
+    pub fn get_pending_epoch_config(env: Env) -> Option<PendingEpochConfig> {
+        env.storage().instance().get(&DataKey::PendingEpochConfig)
+    }
+
+    /// Amount approved in the epoch starting at `epoch_start`.
+    pub fn get_epoch_approved(env: Env, epoch_start: u64) -> i128 {
+        Self::epoch_approved(&env, epoch_start)
+    }
+
+    /// Remaining approval budget in the current epoch, or `None` when no
+    /// epoch budget is configured.
+    pub fn get_epoch_remaining(env: Env) -> Option<i128> {
+        EpochState::load(&env).map(|e| e.available - e.approved)
+    }
+
+    // ── Attester: payout recipient ──
+
+    /// Designate the address that receives this attester's payouts.
+    /// Requires attester auth; the attester must be allowlisted (a
+    /// suspended attester cannot redirect funds). Takes effect after
+    /// `PAYOUT_ADDRESS_DELAY`.
+    pub fn set_payout_address(
+        env: Env,
+        attester: Address,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        attester.require_auth();
+        Self::require_not_paused(&env)?;
+        let registry = AttesterRegistryClient::new(&env, &Self::attester_registry(&env)?);
+        if !registry.is_attester(&attester) {
+            return Err(Error::AttesterNotAllowlisted);
+        }
+        let now = env.ledger().timestamp();
+        let effective_at = now + PAYOUT_ADDRESS_DELAY;
+        let binding = PayoutBinding {
+            current: Self::resolve_payout(&env, &attester, now),
+            pending: Some(recipient.clone()),
+            effective_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PayoutBinding(attester.clone()), &binding);
+        PayoutAddressScheduled {
+            attester,
+            recipient,
+            effective_at,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// The address that would receive `attester`'s payout right now.
+    pub fn get_payout_address(env: Env, attester: Address) -> Address {
+        Self::resolve_payout(&env, &attester, env.ledger().timestamp()).unwrap_or(attester)
+    }
+
+    pub fn get_payout_binding(env: Env, attester: Address) -> Option<PayoutBinding> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayoutBinding(attester))
     }
 
     // ── Attester: claim payout ──
 
     /// Claim payout for an approved work item. Requires the approved
-    /// attester's auth. Enforces replay protection, per-attester cap,
+    /// attester's auth. Pays the attester's bound payout address (see
+    /// `set_payout_address`), defaulting to the attester itself. Enforces replay protection, per-attester cap,
     /// and pool balance checks. Transfers tokens on success.
     pub fn claim(env: Env, work_item_id: BytesN<32>) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
@@ -678,7 +1073,14 @@ impl IncentivePool {
         let pool_addr = env.current_contract_address();
         let token_client = token::Client::new(&env, &token_addr);
 
-        token_client.transfer(&pool_addr, &attester, &work_item.payout_amount);
+        let recipient = Self::get_payout_address(env.clone(), attester.clone());
+        // Surface trustline / authorization failures as a typed error.
+        if !matches!(
+            token_client.try_transfer(&pool_addr, &recipient, &work_item.payout_amount),
+            Ok(Ok(()))
+        ) {
+            return Err(Error::TransferFailed);
+        }
 
         // Persist state updates after successful transfer.
         env.storage()
@@ -699,6 +1101,7 @@ impl IncentivePool {
         PayoutClaimed {
             work_item_id,
             attester,
+            recipient,
             amount: work_item.payout_amount,
         }
         .publish(&env);
@@ -766,6 +1169,24 @@ impl IncentivePool {
             .ok_or(Error::NotInitialized)
     }
 
+    fn resolve_payout(env: &Env, attester: &Address, now: u64) -> Option<Address> {
+        let b: PayoutBinding = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PayoutBinding(attester.clone()))?;
+        match b.pending {
+            Some(p) if now >= b.effective_at => Some(p),
+            _ => b.current,
+        }
+    }
+
+    fn epoch_approved(env: &Env, epoch_start: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EpochApproved(epoch_start))
+            .unwrap_or(0)
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), Error> {
         let paused: bool = env
             .storage()
@@ -776,6 +1197,70 @@ impl IncentivePool {
             return Err(Error::ContractPaused);
         }
         Ok(())
+    }
+}
+
+/// Per-call approval state shared by single and batch approval.
+struct ApprovalCtx {
+    attester_registry: Address,
+    attestation_registry: Address,
+    max_per_claim: i128,
+    allowlisted: Map<Address, bool>,
+    epoch: Option<EpochState>,
+}
+
+impl ApprovalCtx {
+    fn load(env: &Env) -> Result<Self, Error> {
+        Ok(Self {
+            attester_registry: IncentivePool::attester_registry(env)?,
+            attestation_registry: env
+                .storage()
+                .instance()
+                .get(&DataKey::AttestationRegistry)
+                .ok_or(Error::AttestationRegistryNotSet)?,
+            max_per_claim: env
+                .storage()
+                .instance()
+                .get(&DataKey::MaxPerClaim)
+                .unwrap_or(i128::MAX),
+            allowlisted: Map::new(env),
+            epoch: EpochState::load(env),
+        })
+    }
+
+    fn commit(&self, env: &Env) {
+        if let Some(e) = &self.epoch {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EpochApproved(e.start), &e.approved);
+        }
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+}
+
+/// Current-epoch accounting.
+struct EpochState {
+    start: u64,
+    available: i128,
+    approved: i128,
+}
+
+impl EpochState {
+    fn load(env: &Env) -> Option<Self> {
+        let c: EpochConfig = env.storage().instance().get(&DataKey::EpochConfig)?;
+        let start = env.ledger().timestamp() / c.epoch_length * c.epoch_length;
+        let mut available = c.epoch_budget;
+        if c.rollover && start >= c.epoch_length {
+            let prev = IncentivePool::epoch_approved(env, start - c.epoch_length);
+            available = available.saturating_add((c.epoch_budget - prev).max(0));
+        }
+        Some(Self {
+            start,
+            available,
+            approved: IncentivePool::epoch_approved(env, start),
+        })
     }
 }
 

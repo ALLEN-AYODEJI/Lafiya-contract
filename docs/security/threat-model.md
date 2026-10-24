@@ -32,6 +32,7 @@ will map each leaf below to a regression test.
 | A5 | **Upgrade authority** | `attester-registry::upgrade` replaces the code outright. It is the most powerful admin action. |
 | A6 | **Patient privacy**: commitment unlinkability and hiding | Record hashes are public. They must reveal nothing about the record (e.g. genotype) and must not link one patient's records across time or sites. |
 | A7 | **CHW privacy** | Attester addresses, activity, and `AttesterInfo` (`license_hash`, `region`) are public and can profile or target individual health workers. |
+| A8 | **Incentive-pool funds** (`incentive-pool`) | Escrowed USDC paid per approved work item. Theft or mis-direction of payouts harms donors and CHWs. |
 
 ## 2. Actors and trust levels
 
@@ -142,6 +143,30 @@ Everything else relies on off-chain controls.
 | R | No record of which signers approved what | open ([#360](https://github.com/Lafiya-xyz/Lafiya-contract/issues/360)) |
 | D | Quorum lost (keys lost), so admin is frozen forever | open ([#358](https://github.com/Lafiya-xyz/Lafiya-contract/issues/358), [#355](https://github.com/Lafiya-xyz/Lafiya-contract/issues/355)) |
 | I | Signer set not introspectable, which hides misconfiguration | open ([#359](https://github.com/Lafiya-xyz/Lafiya-contract/issues/359)) |
+
+### `incentive-pool`
+
+Asset flow (A8): donor → `fund` → pool → `claim` → **bound payout address**
+(`set_payout_address`, default: the attester key itself).
+
+- **Spoofing / tampering**: approvals require an active attestation in
+  `attestation-registry` by the same attester; the work-item id is
+  `sha256("LAFIYA-WORK-ITEM-v1" || record_hash || attester.to_xdr())`, so an
+  attestation can back at most one payout. Revoked/withdrawn attestations
+  are rejected (`AttestationNotActive`).
+- **Elevation (approver compromise)**: total approvals per epoch are bounded
+  by `epoch_budget`; changes to it are timelocked (`EPOCH_CONFIG_DELAY`).
+  Batch approvals are capped at `MAX_BATCH_APPROVALS` and charged against
+  the same budget.
+- **Device-key theft (CHW)**: payouts go to a custody address designated by
+  the attester. Changes are delayed by `PAYOUT_ADDRESS_DELAY` (48h) and
+  evented (`PayoutAddressScheduled`) so a takeover can be noticed and the
+  attester suspended. Suspended attesters can neither redirect funds nor
+  claim. Trustline/authorization failures on the recipient return
+  `TransferFailed` instead of trapping.
+- **Residual**: an attacker holding the device key for longer than the delay
+  can redirect future payouts; monitoring of `PayoutAddressScheduled` is
+  required (see [`chw-key-custody.md`](chw-key-custody.md)).
 
 ### CLI, scripts, and config
 
