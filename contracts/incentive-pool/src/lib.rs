@@ -262,6 +262,28 @@ pub struct WorkItemApproved {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct PayoutRateProposed {
+    #[topic]
+    pub work_type: u32,
+    #[topic]
+    pub region_class: u32,
+    pub amount: i128,
+    pub eta: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutRateApplied {
+    #[topic]
+    pub work_type: u32,
+    #[topic]
+    pub region_class: u32,
+    pub amount: i128,
+    pub version: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct PayoutClaimed {
     #[topic]
     pub work_item_id: BytesN<32>,
@@ -854,6 +876,134 @@ impl IncentivePool {
         items: Vec<ApprovalInput>,
     ) -> Result<Vec<BytesN<32>>, soroban_sdk::Error> {
         Self::approver(&env)?.require_auth();
+        Self::admin(&env)?.require_auth();
+        Self::approve_internal(&env, work_item_id, attester, payout_amount, 0)
+    }
+
+    /// Approve a work item priced from the payout schedule entry for
+    /// (`work_type`, `region_class`). Requires the approver's auth. The
+    /// schedule version used is recorded against the work item.
+    pub fn approve_scheduled_work_item(
+        env: Env,
+        work_item_id: BytesN<32>,
+        attester: Address,
+        work_type: u32,
+        region_class: u32,
+    ) -> Result<(), Error> {
+        Self::approver(&env)?.require_auth();
+        let rate = Self::get_payout_rate(env.clone(), work_type, region_class)
+            .ok_or(Error::ScheduleEntryNotFound)?;
+        Self::approve_internal(&env, work_item_id, attester, rate.amount, rate.version)
+    }
+
+    /// Schedule version used to price a work item (`0` = override path or
+    /// approved before the schedule existed).
+    pub fn get_work_item_schedule_version(env: Env, work_item_id: BytesN<32>) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WorkItemScheduleVersion(work_item_id))
+            .unwrap_or(0)
+    }
+
+    // ── Admin: payout schedule (timelocked) ──
+
+    /// Propose a payout amount for (`work_type`, `region_class`). Takes
+    /// effect only after `SCHEDULE_TIMELOCK_SECS` via `apply_payout_rate`.
+    /// Requires admin auth. Emits `PayoutRateProposed`.
+    pub fn propose_payout_rate(
+        env: Env,
+        work_type: u32,
+        region_class: u32,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::admin(&env)?.require_auth();
+        if amount <= 0 {
+            return Err(Error::NonPositiveAmount);
+        }
+        let eta = env.ledger().timestamp() + SCHEDULE_TIMELOCK_SECS;
+        env.storage().persistent().set(
+            &DataKey::PendingPayoutRate(work_type, region_class),
+            &PendingPayoutRate { amount, eta },
+        );
+        PayoutRateProposed {
+            work_type,
+            region_class,
+            amount,
+            eta,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Apply a pending payout-schedule change once its timelock elapsed.
+    /// Callable by anyone. Bumps the schedule version and emits
+    /// `PayoutRateApplied`.
+    pub fn apply_payout_rate(env: Env, work_type: u32, region_class: u32) -> Result<u32, Error> {
+        let key = DataKey::PendingPayoutRate(work_type, region_class);
+        let pending: PendingPayoutRate = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoPendingScheduleChange)?;
+        if env.ledger().timestamp() < pending.eta {
+            return Err(Error::TimelockNotElapsed);
+        }
+        let version = Self::get_schedule_version(env.clone()) + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduleVersion, &version);
+        env.storage().persistent().remove(&key);
+        env.storage().persistent().set(
+            &DataKey::PayoutRate(work_type, region_class),
+            &PayoutRate {
+                amount: pending.amount,
+                version,
+            },
+        );
+        PayoutRateApplied {
+            work_type,
+            region_class,
+            amount: pending.amount,
+            version,
+        }
+        .publish(&env);
+        Ok(version)
+    }
+
+    /// Active schedule entry for (`work_type`, `region_class`), if any.
+    pub fn get_payout_rate(env: Env, work_type: u32, region_class: u32) -> Option<PayoutRate> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayoutRate(work_type, region_class))
+    }
+
+    /// Pending (timelocked) schedule change for the pair, if any.
+    pub fn get_pending_payout_rate(
+        env: Env,
+        work_type: u32,
+        region_class: u32,
+    ) -> Option<PendingPayoutRate> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingPayoutRate(work_type, region_class))
+    }
+
+    /// Current payout-schedule version (`0` before any change is applied).
+    pub fn get_schedule_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ScheduleVersion)
+            .unwrap_or(0)
+    }
+
+    fn approve_internal(
+        env: &Env,
+        work_item_id: BytesN<32>,
+        attester: Address,
+        payout_amount: i128,
+        schedule_version: u32,
+    ) -> Result<(), Error> {
+        let env = env.clone();
         Self::require_not_paused(&env)?;
 
         if items.is_empty() || items.len() > MAX_BATCH_APPROVALS {
@@ -1260,6 +1410,21 @@ impl IncentivePool {
         Ok(())
     }
 
+    /// Preflight: whether `address` can currently receive the pool token.
+    /// For Stellar Asset Contracts this checks that a trustline exists and
+    /// is authorized by the issuer. For other tokens, falls back to whether
+    /// a balance can be read for the address.
+    pub fn can_receive(env: Env, address: Address) -> Result<bool, Error> {
+        let token_addr = Self::token(&env)?;
+        match token::StellarAssetClient::new(&env, &token_addr).try_authorized(&address) {
+            Ok(Ok(authorized)) => Ok(authorized),
+            _ => Ok(matches!(
+                token::Client::new(&env, &token_addr).try_balance(&address),
+                Ok(Ok(_))
+            )),
+        }
+    }
+
     /// Whether the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
@@ -1598,3 +1763,11 @@ impl EpochState {
     clippy::arithmetic_side_effects
 )]
 mod test;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod stateful_test;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod fuzz_test;
