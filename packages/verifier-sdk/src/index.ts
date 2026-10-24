@@ -31,10 +31,12 @@ export {
 } from "./chain.js";
 export { BindingsChainReader } from "./rpc.js";
 export {
-  resolveContract,
-  RouterError,
-  type Resolution,
-  type RouterEntry,
-  type RouterReader,
-  type RouterState,
-} from "./router.js";
+  StatusListClient,
+  StatusListError,
+  verifyInclusion,
+  type StatusListSegment,
+  type StatusListRoot,
+  type StatusListSyncResult,
+  type StatusListClientOptions,
+  type InclusionProof,
+} from "./status-list.js";

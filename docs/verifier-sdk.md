@@ -14,7 +14,10 @@ place, so consumers cannot get a step subtly wrong:
 4. Read the attester's **current** status from `attester-registry`
    (ADR-0006).
 5. Apply revocation, supersession, and maximum-age rules.
-6. Return a single UI-ready verdict with ordered reasons.
+6. Aggregate co-attestations against the record class's quorum policy
+   (distinct attesters only) and surface the count and policy result.
+7. Surface any patient-initiated `Disputed` overlay for the record.
+8. Return a single UI-ready verdict with ordered reasons.
 
 ## Usage
 
@@ -70,6 +73,29 @@ resolves a contract id through the optional stable-address router
 last-known state and rejecting rollbacks. Direct contract ids in trust anchors
 remain supported.
 
+### Status-list sync
+
+For bandwidth-constrained or offline verifiers, revocation can be checked
+against the compact bitstring status list instead of per-record RPC calls.
+The SDK syncs the list, validates its versioned commitment against the
+signed root, and caches it:
+
+```ts
+import { StatusListSync } from "@lafiya/verifier";
+
+const sync = new StatusListSync({ network: "testnet", trust });
+await sync.refresh();                       // fetch + verify signed root
+const revoked = sync.isRevoked(recordHash); // local bitstring lookup
+```
+
+`refresh()` throws `TrustError` if the signed root does not match the
+fetched segments. Pass `statusList: sync` to `LafiyaVerifier` to use the
+cached list for revocation checks; results then report
+`source: "status-list"`. The list never reveals record identity — indices
+are allocated independently of record hashes — so a status-list hit must
+still be confirmed against `attestation-registry` before showing `revoked`
+to a user.
+
 ## Verdicts
 
 The verdict set is finite and ordered by precedence; when several reasons
@@ -86,10 +112,39 @@ apply, the highest-precedence one wins. All reasons are still returned.
 | `superseded` | A newer attestation exists than the one on the card. |
 | `attester_removed` | The attesting health worker is no longer on the allowlist. |
 | `attester_suspended` | The attesting health worker is currently suspended. |
+| `disputed` | The patient has flagged this record as disputed. |
+| `quorum_not_met` | Fewer distinct attesters than the record class's quorum policy requires. |
 | `expired` | The attestation is older than `maxAgeDays`. |
-| `verified` | Attested by a currently trusted health worker. |
+| `verified` | Attested by a currently trusted health worker (and quorum met, if required). |
 
 Only `verified` should be shown to a user as a pass.
+
+### Quorum fields
+
+When the record class has a quorum policy, the result includes:
+
+```ts
+result.quorum // { required: number, distinctAttesters: number, satisfied: boolean }
+```
+
+`distinctAttesters` counts unique attester addresses only; a repeated
+co-attestation from the same attester does not increase the count. Quorum
+is evaluated after revocation and supersession, so revoking one attester's
+co-attestation can drop a record below quorum and flip the verdict to
+`quorum_not_met`. `quorum` is `undefined` for record classes without a
+policy.
+
+### Disputed records
+
+A `disputed` verdict means the patient signed a dispute over the record
+commitment. Disputes are an overlay: they never delete the attestation and
+are cleared only by an attester or admin. The result includes
+`result.dispute // { disputedAt, clearedAt? }` when present. Responder
+guidance: treat `disputed` as a soft failure — do not delete the record,
+but require re-verification by a health worker before relying on it.
+Disputes are a linkability signal (they tie a patient signature to a
+record), so do not log or display dispute metadata beyond what the UI
+needs.
 
 ## Example app
 
@@ -114,3 +169,6 @@ pnpm typecheck && pnpm test && pnpm build && pnpm size
   `LAFIYA_IT_ATTESTER_REGISTRY`, and `LAFIYA_IT_RECORD_HASH` are set, and is
   skipped otherwise.
 - `pnpm size` enforces the gzipped bundle budget (8 KiB) in CI.
+- `test/status-list.test.ts` covers signed-root validation and cached
+  bitstring lookups; `test/quorum.test.ts` covers distinct-attester
+  counting and quorum monotonicity under revocation.

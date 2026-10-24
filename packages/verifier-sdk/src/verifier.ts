@@ -1,7 +1,18 @@
-import type { AttesterState, ChainReader, OnChainAttestation } from "./chain.js";
+import type {
+  AttesterState,
+  ChainReader,
+  OnChainAttestation,
+  QuorumStatus,
+  StatusListCheck,
+} from "./chain.js";
 import { commitV1, type FieldValue } from "./commitment.js";
 import { parseQrPayload, QrPayloadError, type QrPayload } from "./qr.js";
 import { BindingsChainReader } from "./rpc.js";
+import {
+  verifyForeignAttestation,
+  type FederationTrustAnchors,
+  type ForeignVerificationFailure,
+} from "./trust.js";
 import type { TrustAnchors } from "./trust.js";
 import { VERDICTS, verdictOf, type Reason, type Verdict } from "./verdict.js";
 
@@ -29,6 +40,13 @@ export interface VerifierOptions {
   /** Network this verifier accepts cards for, e.g. `"testnet"`. */
   network: string;
   trust: TrustAnchors;
+  /**
+   * Trust anchors for other deployments, keyed by jurisdiction code. When a
+   * card names a foreign jurisdiction, verification is delegated to
+   * `verifyForeignAttestation` instead of the local chain reader. Omit to
+   * behave exactly as a single-deployment verifier.
+   */
+  federation?: FederationTrustAnchors;
   /** Defaults to reading over RPC with the generated bindings. */
   chain?: ChainReader;
   /** Clock override (tests, offline replays). */
@@ -57,6 +75,25 @@ export interface VerificationResult {
   payload?: QrPayload;
   attestation?: OnChainAttestation & { attestedAt: Date };
   attester?: { address: string; status: "active" | "suspended" | "removed"; region?: string };
+  /**
+   * Quorum progress for records whose class requires N distinct attesters.
+   * Only aggregate counts are exposed; co-attester identities are never leaked.
+   */
+  quorum?: {
+    /** Distinct attesters counted toward the policy (public aggregate). */
+    distinctAttesters: number;
+    /** Policy threshold for this record class. */
+    required: number;
+    /** Whether the policy is currently satisfied. */
+    satisfied: boolean;
+  };
+  /**
+   * Patient-initiated dispute overlay. `true` when a valid patient signature
+   * has flagged this record; verifiers must surface this to the user.
+   */
+  disputed?: boolean;
+  /** Status-list based revocation check, when the chain reader supports it. */
+  statusList?: { revoked: boolean; version: number };
   checkedAt: Date;
   source: "rpc" | "offline";
   /** When the snapshot behind an offline verdict was captured. */
@@ -64,6 +101,20 @@ export interface VerificationResult {
 }
 
 const DAY_SECONDS = 86_400n;
+
+/** Map a federation failure onto the shared verdict vocabulary. */
+function federationReason(failure: ForeignVerificationFailure): Reason {
+  switch (failure.code) {
+    case "unknown_jurisdiction":
+      return { code: "untrusted_contract", message: failure.message };
+    case "stale_anchor":
+      return { code: "untrusted_contract", message: failure.message };
+    case "signature_mismatch":
+      return { code: "commitment_mismatch", message: failure.message };
+    case "foreign_registry_unavailable":
+      return { code: "unavailable", message: failure.message };
+  }
+}
 
 export class LafiyaVerifier {
   private readonly chain: ChainReader;
@@ -119,6 +170,32 @@ export class LafiyaVerifier {
       reasons.push({ code: "invalid_payload", message });
       return done();
     }
+    // 1a. Foreign jurisdiction: delegate to the federation trust-anchor check.
+    if (payload.jurisdiction !== undefined && payload.jurisdiction !== this.options.network) {
+      const federation = this.options.federation;
+      if (!federation) {
+        reasons.push({
+          code: "untrusted_contract",
+          message: `card is for jurisdiction "${payload.jurisdiction}", which this verifier does not federate with`,
+        });
+        return done({ payload });
+      }
+      const foreign = await verifyForeignAttestation(federation, payload, {
+        now: checkedAt,
+        ...(opts.disclosedFields ? { disclosedFields: opts.disclosedFields } : {}),
+        ...(opts.maxAgeDays !== undefined ? { maxAgeDays: opts.maxAgeDays } : {}),
+      });
+      if (!foreign.ok) {
+        reasons.push(federationReason(foreign.failure));
+        return done({ payload });
+      }
+      return done({
+        payload,
+        attestation: foreign.attestation,
+        attester: foreign.attester,
+      });
+    }
+
     const trust = this.options.trust[this.options.network];
     if (payload.network !== this.options.network || !trust) {
       reasons.push({
@@ -147,11 +224,15 @@ export class LafiyaVerifier {
       }
     }
 
-    // 3-4. Read the attestation and the attester's *current* status.
+    // 3-4. Read the attestation, the attester's *current* status, quorum,
+    // dispute overlay, and status-list revocation.
     let history: OnChainAttestation[];
     let latest: OnChainAttestation | null;
     let revoked = false;
     let attesterState: AttesterState | null = null;
+    let quorum: QuorumStatus | null = null;
+    let disputed = false;
+    let statusList: StatusListCheck | null = null;
     try {
       [latest, history] = await Promise.all([
         this.chain.getAttestation(trust, payload.recordHash),
@@ -160,12 +241,21 @@ export class LafiyaVerifier {
       if (!latest) {
         revoked = (await this.chain.isRevoked?.(trust, payload.recordHash)) ?? false;
       } else {
-        attesterState = await this.chain.getAttesterStatus(trust, latest.attester);
+        [attesterState, quorum, disputed, statusList] = await Promise.all([
+          this.chain.getAttesterStatus(trust, latest.attester),
+          this.chain.getQuorumStatus?.(trust, payload.recordHash) ?? Promise.resolve(null),
+          this.chain.isDisputed?.(trust, payload.recordHash) ?? Promise.resolve(false),
+          this.chain.checkStatusList?.(trust, payload.recordHash) ?? Promise.resolve(null),
+        ]);
       }
     } catch (err) {
       reasons.push({ code: "unavailable", message: `chain read failed: ${String(err)}` });
       return done({ payload });
     }
+
+    const statusListResult = statusList
+      ? { revoked: statusList.revoked, version: statusList.version }
+      : undefined;
 
     if (!latest) {
       reasons.push(
@@ -173,7 +263,16 @@ export class LafiyaVerifier {
           ? { code: "revoked", message: "the attestation was revoked" }
           : { code: "not_found", message: "no attestation for this record" },
       );
-      return done({ payload });
+      return done({ payload, ...(statusListResult ? { statusList: statusListResult } : {}) });
+    }
+
+    // Status-list revocation is authoritative for bulk revocation; a revoked
+    // bit means the record must not be reported as verified.
+    if (statusList?.revoked) {
+      reasons.push({
+        code: "revoked",
+        message: "the record is revoked per the status list",
+      });
     }
 
     // 5. Supersession, attester status, and age.
@@ -199,6 +298,23 @@ export class LafiyaVerifier {
       }
     }
 
+    // 5b. Quorum: a record class may require N distinct attesters. Only the
+    // aggregate count is surfaced; individual co-attesters stay private.
+    if (quorum && !quorum.satisfied) {
+      reasons.push({
+        code: "quorum_not_met",
+        message: `record requires ${quorum.required} distinct attesters, has ${quorum.distinctAttesters}`,
+      });
+    }
+
+    // 5c. Patient dispute overlay: verifiers must surface, never suppress.
+    if (disputed) {
+      reasons.push({
+        code: "disputed",
+        message: "the patient has flagged this record as disputed",
+      });
+    }
+
     // 6. UI-ready result.
     return done({
       payload,
@@ -208,6 +324,17 @@ export class LafiyaVerifier {
         status: !attesterState ? "removed" : attesterState.suspended ? "suspended" : "active",
         ...(attesterState?.region ? { region: attesterState.region } : {}),
       },
+      ...(quorum
+        ? {
+            quorum: {
+              distinctAttesters: quorum.distinctAttesters,
+              required: quorum.required,
+              satisfied: quorum.satisfied,
+            },
+          }
+        : {}),
+      ...(disputed ? { disputed: true } : {}),
+      ...(statusListResult ? { statusList: statusListResult } : {}),
     });
   }
 }

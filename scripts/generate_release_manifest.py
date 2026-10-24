@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = {
     "attester-registry": ("contracts/attester-registry", "attester_registry"),
     "attestation-registry": ("contracts/attestation-registry", "attestation_registry"),
+    "incentive-pool": ("contracts/incentive-pool", "incentive_pool"),
     "multisig-account": ("contracts/multisig-account", "multisig_account"),
 }
 

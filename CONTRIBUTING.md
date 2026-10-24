@@ -18,42 +18,30 @@ See [Local Setup > Prerequisites](#prerequisites) for the tools you'll need befo
 
 ## Local Setup
 
-The core development environment requires Rust and the Soroban SDK.
-For the quick-start commands, see the [Getting Started](README.md#getting-started) section in the `README.md`.
+Run one command from a fresh clone:
 
-### Recommended: devcontainer / Codespaces
+```bash
+make first-run
+```
 
-The recommended setup is the devcontainer in [`.devcontainer/`](.devcontainer/).
-Open the repository in VS Code with the Dev Containers extension ("Reopen in
-Container") or create a GitHub Codespace. It provides, with every version
-pinned and every download checksum-verified:
+It checks prerequisites (Rust, the `wasm32v1-none` target, `stellar-cli`, Node 22 + pnpm, Python 3), prints the exact
+install command for anything missing, then smoke-builds and tests one contract (`attester-registry`) and one
+TypeScript package (`verifier-sdk`). It is exercised weekly on a clean devcontainer and a fresh Ubuntu runner by the
+`Devcontainer` workflow, which also logs the elapsed seconds (`first_run_seconds=`, anonymous) so setup time can be tracked.
+The easiest path is the devcontainer in [`.devcontainer/`](.devcontainer/) ("Reopen in Container" or a Codespace); it
+has every tool pinned and preinstalled, and `make first-run` works there with no extra steps.
 
-- the Rust channel from `rust-toolchain.toml` with `wasm32v1-none`, `rustfmt`,
-  `clippy`, plus nightly for `cargo-fuzz`;
-- `stellar-cli`, `cargo-nextest`, `cargo-mutants`, `cargo-fuzz`, `just`;
-- Python 3.12 with `jsonschema`, and Node 22 LTS with pnpm;
-- sidecars: `stellar/quickstart --local` (Soroban RPC on port 8000, with a
-  health check) and `postgres` for the indexer.
+### Troubleshooting
 
-On creation it builds the contract wasm, adds the `local` network to
-`stellar-cli`, and creates and funds a `dev` identity. After that, `make check`
-and `make test-integration` work with no manual steps.
+| Symptom | Fix |
+| --- | --- |
+| `MISSING stellar` | `cargo install --locked stellar-cli --features opt` |
+| `MISSING wasm32v1-none target` | `rustup target add wasm32v1-none` |
+| `MISSING pnpm` | `corepack enable && corepack prepare pnpm@latest --activate` |
+| Wrong Rust version | `rustup show` in the repo root; `rust-toolchain.toml` pins the channel |
+| `pnpm install` lockfile error | run from `packages/verifier-sdk`; do not use `--no-frozen-lockfile` on a clean tree |
 
-**Codespaces prebuilds:** maintainers enable them under *Settings → Codespaces
-→ Prebuild configurations* for `main`, using `.devcontainer/devcontainer.json`.
-The image build and `onCreateCommand` (wasm build) run in the prebuild, so a
-new codespace is ready in about two minutes. The `Devcontainer` workflow
-builds the container and runs `make check` inside it so the setup can't rot.
-
-If you would rather set up your machine by hand, install the prerequisites below.
-
-### Prerequisites
-- **Rust (stable)**: Install via [rustup](https://rustup.rs).
-- **Wasm target**: `rustup target add wasm32v1-none` (pinned via `rust-toolchain.toml`).
-- **Stellar CLI**: Needed for deploying and interacting with the testnet. Install it via Cargo:
-  ```bash
-  cargo install --locked stellar-cli --features opt
-  ```
+Each failure message from the script names the command that fixes it.
 
 ---
 
